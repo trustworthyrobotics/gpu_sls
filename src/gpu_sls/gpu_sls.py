@@ -352,7 +352,7 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
 
         w   = lax.select(warm_flag, w, jnp.zeros_like(w))
         y   = lax.select(warm_flag, y, jnp.zeros_like(y))
-        rho = lax.select(warm_flag, rho, jnp.array(30.0, dtype=rho.dtype))
+        rho = lax.select(warm_flag, rho, jnp.array(cfg.initial_rho, dtype=rho.dtype))
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )
