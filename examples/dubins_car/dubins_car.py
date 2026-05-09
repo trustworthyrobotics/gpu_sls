@@ -13,7 +13,7 @@ import numpy as np
 
 from gpu_sls.gpu_admm import ADMMConfig
 from gpu_sls.gpu_sls import SLSConfig
-from gpu_sls.sqp import SQPConfig
+from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints
 from gpu_sls.utils.sls_visual import get_trajectory_tubes
@@ -140,6 +140,7 @@ def dubins_step_with_disturbance(
         w = jnp.array([-0.577, -0.577, -0.577], dtype=x.dtype)
 
     # Additive disturbance
+    w = w
     x_next = x_nom + E @ w
     return key, x_next, w
 
@@ -284,10 +285,11 @@ def main():
     # -----------------------------
     admm_cfg = ADMMConfig(
         eps_abs=1e-2,
-        eps_rel=0,
+        eps_rel=1e-2,
         rho_max=1e5,
         max_iterations=1000,
         rho_update_frequency=25,
+        initial_rho=30.0,
     )
 
     sls_cfg = SLSConfig(
@@ -296,7 +298,7 @@ def main():
         enable_fastsls=True,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
-        warm_start=True,
+        warm_start=False,
         rti=False,
     )
 
@@ -305,7 +307,7 @@ def main():
         warm_start=False,
         feas_tol=0.01,
         step_tol=0.0001,
-        line_search=True
+        line_search=False
     )
 
     controller = GenericMPC(
