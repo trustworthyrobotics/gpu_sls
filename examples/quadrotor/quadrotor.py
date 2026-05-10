@@ -367,11 +367,11 @@ def main():
     )
 
     sqp_cfg = SQPConfig(
-        max_sqp_iterations=10,
-        warm_start=True,
+        max_sqp_iterations=100,
+        warm_start=False,
         feas_tol=0.01,
         step_tol=0.0001,
-        line_search=True,
+        line_search=False,
     )
 
     controller = GenericMPC(
