@@ -1,7 +1,7 @@
 # Clone Instructions
 
 ```
-git clone --recurse-submodules https://github.com/Jeff300fang/gpu_sls.git
+git clone --recurse-submodules https://github.com/trustworthyrobotics/gpu_sls
 ```
 
 # Environment Setup
