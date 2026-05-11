@@ -19,7 +19,7 @@ from gpu_sls.utils.constraint_utils import combine_constraints
 from gpu_sls.utils.sls_visual import get_trajectory_tubes
 from visualize_experiment import plot_rollouts_tubes_centers, plot_tube_graph
 
-config.update("jax_enable_x64", True)
+config.update("jax_enable_x64", False)
 
 # -----------------------------
 # Goal stopping config
@@ -209,6 +209,38 @@ def make_state_box_constraints(
 
     return constraints
 
+def make_straight_line_reference(
+    x_start: jnp.ndarray,
+    x_goal: jnp.ndarray,
+    N: int,
+    dt: float,
+    v: float,
+) -> jnp.ndarray:
+    delta = x_goal[:2] - x_start[:2]
+    dist = jnp.linalg.norm(delta)
+    direction = delta / (dist + 1e-8)
+    theta_ref = jnp.arctan2(direction[1], direction[0])
+
+    times = jnp.arange(N + 1) * dt
+    traveled = jnp.minimum(v * times, dist)
+
+    xy_ref = x_start[:2][None, :] + traveled[:, None] * direction[None, :]
+
+    theta_vec = jnp.full((N + 1,), theta_ref)
+
+    reference = jnp.column_stack(
+        (
+            xy_ref[:, 0],
+            xy_ref[:, 1],
+            theta_vec,
+        )
+    )
+    reached = traveled >= dist
+    reference = reference.at[reached, :2].set(x_goal[:2])
+    reference = reference.at[reached, 2].set(theta_ref)
+
+    return reference
+
 def make_constant_disturbance(
     n: int,
     alpha: float,
@@ -233,7 +265,7 @@ def main():
     nu = 1     # [omega]
 
     # Horizon and dt
-    N = 110
+    N = 90
     dt = 0.1
 
     # Weights: (x, y, theta, omega)
@@ -266,15 +298,21 @@ def main():
     n_obs = obstacles.shape[0]
     nc = 2 * nu + 2 * n + n_obs
 
-    E_mag = 0.03
+    E_mag = 0.01
     alpha_sim = E_mag * dt
     disturbance = make_constant_disturbance(n=n, alpha=alpha_sim)
 
     x0 = jnp.array([-0.75, -0.75, 0.0], dtype=jnp.float64)
     x_goal = jnp.array([1.0, 0.6, 0.0], dtype=jnp.float64)
 
-    X_ref = jnp.tile(x_goal[None, :], (N + 1, 1))
-    reference = X_ref
+    reference = make_straight_line_reference(
+        x_start=x0,
+        x_goal=x_goal,
+        N=N,
+        dt=dt,
+        v=V_CONST,
+    )
+    X_ref = reference
     T_steps = N
 
     key = jax.random.PRNGKey(0)
@@ -289,7 +327,7 @@ def main():
         rho_max=1e5,
         max_iterations=1000,
         rho_update_frequency=25,
-        initial_rho=30.0,
+        initial_rho=1.0,
     )
 
     sls_cfg = SLSConfig(
@@ -305,8 +343,8 @@ def main():
     sqp_cfg = SQPConfig(
         max_sqp_iterations=100,
         warm_start=False,
-        feas_tol=0.01,
-        step_tol=0.0001,
+        feas_tol=1e-10,
+        step_tol=1e-5,
         line_search=False
     )
 
@@ -322,7 +360,7 @@ def main():
         num_constraints=nc,
         disturbance=disturbance,
         shift=1,
-        X_in=jnp.zeros((cfg.N + 1, cfg.n), dtype=jnp.float64),
+        X_in=X_ref,
         U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float64),
     )
 

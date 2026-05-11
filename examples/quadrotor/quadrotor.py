@@ -32,9 +32,6 @@ config.update(
 # -----------------------------
 GOAL_TOL = 0.25  # meters in xyz
 
-def wrap_to_pi(a: jnp.ndarray) -> jnp.ndarray:
-    return (a + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-
 
 def reached_goal_xyz(x: jnp.ndarray, x_goal: jnp.ndarray, tol: float = GOAL_TOL) -> jnp.bool_:
     dpos = x[:3] - x_goal[:3]
@@ -105,10 +102,6 @@ def rigid_body_3d_step(x: jnp.ndarray, u: jnp.ndarray, dt: float) -> jnp.ndarray
     x_dot = jnp.concatenate([pos_dot, euler_dot, v_dot, omega_dot], axis=0)
     x_next = x + dt * x_dot
 
-    x_next = x_next.at[3].set(wrap_to_pi(x_next[3]))  # phi
-    x_next = x_next.at[4].set(wrap_to_pi(x_next[4]))  # theta
-    x_next = x_next.at[5].set(wrap_to_pi(x_next[5]))  # psi
-
     return x_next
 
 def quadrotor_step_with_disturbance(
@@ -151,10 +144,9 @@ def quadrotor_step_with_disturbance(
     if start == 30:
         w = -jnp.ones((12,), dtype=x.dtype) / jnp.sqrt(jnp.asarray(12.0, dtype=x.dtype))
 
-    x_next = x_nom + E @ w
-    x_next = x_next.at[3].set(wrap_to_pi(x_next[3]))
-    x_next = x_next.at[4].set(wrap_to_pi(x_next[4]))
-    x_next = x_next.at[5].set(wrap_to_pi(x_next[5]))
+    # Account for linearization error
+    w = w * 0.9
+    x_next = x_nom + E @ w 
     return key, x_next, w
 
 def dynamics(x: jnp.ndarray, u: jnp.ndarray, t: jnp.ndarray, *, parameter: Any) -> jnp.ndarray:
@@ -181,7 +173,7 @@ def cost(W, reference, x, u, t):
     xref = reference[t]
 
     dpos = x[:3] - xref[:3]
-    dang = wrap_to_pi(x[3:6] - xref[3:6])
+    dang = x[3:6] - xref[3:6]
     dvel = x[6:9] - xref[6:9]
     drates = x[9:12] - xref[9:12]
 
@@ -230,8 +222,8 @@ def build_piecewise_reference(x0: jnp.ndarray, x_goal: jnp.ndarray, N: int, dt: 
     pos = (1.0 - t[:, None]) * x0[:3] + t[:, None] * x_goal[:3]
 
     # Shortest-path yaw interpolation
-    dpsi = wrap_to_pi(x_goal[5] - x0[5])
-    psi = wrap_to_pi(x0[5] + t * dpsi)
+    dpsi = x_goal[5] - x0[5]
+    psi = x0[5] + t * dpsi
 
     X_ref = jnp.zeros((N + 1, 12), dtype=jnp.float64)
 
@@ -352,7 +344,7 @@ def main():
         eps_rel=1e-2,
         rho_max=1e6,
         max_iterations=400,
-        rho_update_frequency=20,
+        rho_update_frequency=25,
         initial_rho=1.0,
     )
 
@@ -367,7 +359,7 @@ def main():
     )
 
     sqp_cfg = SQPConfig(
-        max_sqp_iterations=100,
+        max_sqp_iterations=50,
         warm_start=False,
         feas_tol=0.01,
         step_tol=0.0001,
@@ -386,7 +378,7 @@ def main():
         num_constraints=nc,
         disturbance=disturbance,
         shift=1,
-        X_in=jnp.zeros((cfg.N + 1, cfg.n), dtype=jnp.float64),
+        X_in=X_ref,
         U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float64).at[:, 0].set(T_hover),
     )
 
@@ -421,9 +413,6 @@ def main():
             key, x, w = quadrotor_step_with_disturbance(key, x, u, E_sim, dt, i)
 
             err = np.abs(np.asarray(X_pred[k + 1] - x))
-            err[3] = np.abs(np.asarray(wrap_to_pi(X_pred[k + 1, 3] - x[3])))
-            err[4] = np.abs(np.asarray(wrap_to_pi(X_pred[k + 1, 4] - x[4])))
-            err[5] = np.abs(np.asarray(wrap_to_pi(X_pred[k + 1, 5] - x[5])))
 
             disturbed[i, k, :] = err
             disturbance_history.append(w)

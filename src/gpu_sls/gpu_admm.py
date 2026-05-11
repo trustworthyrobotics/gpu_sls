@@ -299,7 +299,7 @@ def adaptive_rho_update(rp_norm, rd_norm, rho,
     # scale = jnp.sqrt(rp_norm / rd_eff)
     scale = jnp.sqrt(rp_norm / rd_eff)
     # scale = rp_norm / rd_eff
-    scale = jnp.clip(scale, 0.5, 2.0)
+    # scale = jnp.clip(scale, 0.5, 2.0)
     rho_new = jnp.clip(rho * scale, rho_min, rho_max)
     updated = rho_new != rho
     return rho_new, updated
@@ -464,11 +464,13 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
         def no_update_fn(_):
             return rho, y_new, jnp.array(False)
+        
+        rho_new, y_new, rho_updated = lax.cond(do_rho_update, update_fn, no_update_fn, operand=None)
+        tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
+            Q, q, R, r, M, C, D, w_new, y_new, rho_new
+        )
 
         def cache_update(_):
-            tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
-                Q, q, R, r, M, C, D, w_new, y_new, rho_new
-            )
             Tp1 = Q.shape[0]
             n   = Q.shape[1]
 
@@ -486,7 +488,6 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         #     "ADMM: it={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e})",
         #     it, rho, rp_norm, eps_pri, rd_norm, eps_dual
         # )
-        rho_new, y_new, rho_updated = lax.cond(do_rho_update, update_fn, no_update_fn, operand=None)
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, cache_new, BRinv, MRinv, P, K = lax.cond(rho_updated, cache_update, no_cache_update, operand=None)
 
         return (it + 1, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, x_bar, u_bar, y_new, w_new,
