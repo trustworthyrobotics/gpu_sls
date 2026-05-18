@@ -34,7 +34,6 @@ class SQPConfig:
     def tree_unflatten(cls, aux, children):
         return cls(*children)
 
-# TODO: Add constraints to this?
 def lagrangian(cost, dynamics, x0):
     def fun(x, u, t, v, v_prev):
         c1 = cost(x, u, t)
