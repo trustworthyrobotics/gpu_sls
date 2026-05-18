@@ -10,7 +10,7 @@ from jax import jit, lax, vmap
 
 from gpu_sls.gpu_admm import constrained_solve, ADMMConfig
 from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlqr_gpu
-from gpu_sls.gpu_sls import SLSConfig, get_etas, primal_convergence_metric, add_obstacle_tightenings, calculate_cost
+from gpu_sls.gpu_sls import SLSConfig, get_etas, primal_convergence_metric, add_obstacle_tightenings, calculate_cost, get_constraint_tightenings
 
 @jax.jit
 def calculate_phis_state(A: jnp.ndarray, B: jnp.ndarray, Cx: jnp.ndarray, Cxu: jnp.ndarray, Cu: jnp.ndarray):
@@ -45,6 +45,7 @@ def calculate_phis_state(A: jnp.ndarray, B: jnp.ndarray, Cx: jnp.ndarray, Cxu: j
     F  = A[:, None, :, :] + BK
 
     I = jnp.eye(nx, dtype=A.dtype)
+    I_horiz = jnp.broadcast_to(I, (Tp1, nx, nx))
     F = F.at[:, T].set(I)
 
     t_idx = jnp.arange(T)[:, None]
@@ -56,8 +57,7 @@ def calculate_phis_state(A: jnp.ndarray, B: jnp.ndarray, Cx: jnp.ndarray, Cxu: j
         return jnp.einsum("...ab,...bc->...ac", r, l)
 
     P = lax.associative_scan(compose, elems, axis=0)
-    I = jnp.eye(nx)
-    Phix_1toT = jnp.einsum("tjab,jbn->tjan", P, I)
+    Phix_1toT = jnp.einsum("tjab,jbn->tjan", P, I_horiz)
     Phi_x = jnp.concatenate(
         [jnp.zeros((1, Tp1, nx, nx), dtype=A.dtype), Phix_1toT],
         axis=0
@@ -102,47 +102,73 @@ def get_controller_state(Q: jnp.ndarray, R: jnp.ndarray, A: jnp.ndarray, B: jnp.
     return Phi_x, Phi_u
 
 @jax.jit
-def get_observer_gains(A: jnp.ndarray, C: jnp.ndarray, E: jnp.ndarray, F: jnp.ndarray):
+def get_observer_gains(
+    A: jnp.ndarray,
+    C: jnp.ndarray,
+    E: jnp.ndarray,
+    F: jnp.ndarray,
+    Xi: jnp.ndarray,
+):
     T = A.shape[0]
     nx = A.shape[1]
     ny = C.shape[1]
     Tp1 = T + 1
-
-    zeros_q = jnp.zeros((Tp1, nx), dtype=A.dtype)
-    zeros_r = jnp.zeros((T, ny), dtype=A.dtype)
-    zeros_c = jnp.zeros((T, nx), dtype=A.dtype)
+    dtype = A.dtype
 
     A_dual = jnp.swapaxes(A, -1, -2)
-    B_dual = jnp.swapaxes(C, -1, -2)
+    B_dual = jnp.swapaxes(C[:T], -1, -2)
 
-    Q_dual = jnp.einsum("knw,kmw->knm", E, E)
-    R_dual = jnp.einsum("knv,kmv->knm", F[:-1], F[:-1])
-    M_dual = jnp.zeros((T, nx, ny), dtype=A.dtype)
+    Q_dual = jnp.einsum("knw,kmw->knm", E[:T], E[:T])
+    R_dual = jnp.einsum("knw,kmw->knm", F[:T], F[:T])
 
-    def solve_one_j(j):
-        K_dual, _, _, _ = tvlqr_gpu(
-            Q_dual,
+    M_dual = jnp.zeros((T, nx, ny), dtype=dtype)
+
+    zeros_q = jnp.zeros((Tp1, nx), dtype=dtype)
+    zeros_r = jnp.zeros((T, ny), dtype=dtype)
+    zeros_c = jnp.zeros((T, nx), dtype=dtype)
+
+    Pi0 = Xi @ Xi.T
+    I_y = jnp.eye(ny, dtype=dtype)
+
+    A_rev = A_dual[::-1]
+    B_rev = B_dual[::-1]
+    Q_rev = Q_dual[::-1]
+    R_rev = R_dual[::-1]
+    M_rev = M_dual[::-1]
+
+    def solve_one_k(k):
+        active_orig = jnp.arange(T) >= k
+
+        active_rev = active_orig[::-1]
+
+        Q_roll = jnp.where(active_rev[:, None, None], Q_rev, jnp.zeros_like(Q_rev))
+        R_roll = jnp.where(active_rev[:, None, None], R_rev, I_y[None, :, :])
+        M_roll = jnp.where(active_rev[:, None, None], M_rev, jnp.zeros_like(M_rev))
+
+        Q_full = jnp.concatenate([Q_roll, Pi0[None, :, :]], axis=0)
+
+        K_rev, _, _, _ = tvlqr_gpu(
+            Q_full,
             zeros_q,
-            R_dual,
+            R_roll,
             zeros_r,
-            M_dual,
-            A_dual,
-            B_dual,
+            M_roll,
+            A_rev,
+            B_rev,
             zeros_c,
         )
-        return K_dual
 
-    K_all = jax.vmap(solve_one_j)(jnp.arange(Tp1))
-    L_core = jnp.swapaxes(K_all, 0, 1)
+        L_forward = K_rev[::-1]
+        valid_orig = active_orig
+        L_forward = L_forward * valid_orig[:, None, None]
 
-    L0 = jnp.zeros((1, Tp1, ny, nx), dtype=A.dtype)
-    L_kj = jnp.concatenate([L0, L_core], axis=0)
+        L_row = jnp.zeros((Tp1, ny, nx), dtype=dtype)
+        L_row = L_row.at[1:].set(L_forward)
+        return L_row
 
-    k_idx = jnp.arange(Tp1)[:, None]
-    j_idx = jnp.arange(Tp1)[None, :]
-    valid = (k_idx <= j_idx) & (k_idx > 0)
-
-    return L_kj * valid[:, :, None, None]
+    L_core = jax.vmap(solve_one_k)(jnp.arange(T))
+    L_last = jnp.zeros((1, Tp1, ny, nx), dtype=dtype)
+    return jnp.concatenate([L_core, L_last], axis=0)
 
 @jax.jit
 def calculate_observer_phis(A: jnp.ndarray, C: jnp.ndarray, L_kj: jnp.ndarray):
@@ -153,8 +179,11 @@ def calculate_observer_phis(A: jnp.ndarray, C: jnp.ndarray, L_kj: jnp.ndarray):
     dtype = A.dtype
 
     I = jnp.eye(nx, dtype=dtype)
-
-    Aobs = A[:, None, :, :] + jnp.einsum("tjyn,tym->tjnm", L_kj[1:], C)
+    Aobs = A[:, None, :, :] + jnp.einsum(
+        "tjyn,tym->tjnm",
+        L_kj[1:],   # (T, T+1, ny, nx)
+        C[1:],      # (T, ny, nx)
+    )
     Aobs_rev = Aobs[::-1]
 
     t_rev = jnp.arange(T)[:, None]
@@ -193,8 +222,8 @@ def calculate_observer_phis(A: jnp.ndarray, C: jnp.ndarray, L_kj: jnp.ndarray):
     return Phi_x_o, Phi_y_o
 
 @jax.jit
-def get_controller_obs(A: jnp.ndarray, C_obs: jnp.ndarray, E: jnp.ndarray, F: jnp.ndarray):
-    L = get_observer_gains(A, C_obs, E, F)
+def get_controller_obs(A: jnp.ndarray, C_obs: jnp.ndarray, E: jnp.ndarray, F: jnp.ndarray, Xi: jnp.ndarray):
+    L = get_observer_gains(A, C_obs, E, F, Xi)
     Phi_x_o, Phi_y_o = calculate_observer_phis(A, C_obs, L)
     return Phi_x_o, Phi_y_o
 
@@ -248,43 +277,60 @@ def assemble_output_feedback_phis(A: jnp.ndarray, Phi_x_f: jnp.ndarray, Phi_u_f:
     return Phi_xw, Phi_uw, Phi_xe, Phi_ue
 
 @jax.jit
-def get_betas_output_feedback(C: jnp.ndarray, D: jnp.ndarray, Phi_xw: jnp.ndarray, Phi_uw: jnp.ndarray,
-                              Phi_xe: jnp.ndarray, Phi_ue: jnp.ndarray, E: jnp.ndarray, F: jnp.ndarray):
-    T = D.shape[0]
-    Tp1 = T + 1
+def get_betas_output_feedback(
+    C: jnp.ndarray,
+    D: jnp.ndarray,
+    Phi_xw: jnp.ndarray,
+    Phi_uw: jnp.ndarray,
+    Phi_xe: jnp.ndarray,
+    Phi_ue: jnp.ndarray,
+    E: jnp.ndarray,
+    F: jnp.ndarray,
+):
+    Tp1 = Phi_xw.shape[0]
+    T = Phi_uw.shape[0]
+
+    C_stage = C[:T]
+    D_stage = D[:T]
+    C_term = C[T]
+
+    E_all = E[:Tp1]
+    F_all = F[:Tp1]
 
     proc_stage = (
-        jnp.einsum("kcx,kjxn,jnw->kjcw", C[:-1], Phi_xw[:-1], E)
-        + jnp.einsum("kcu,kjun,jnw->kjcw", D, Phi_uw, E)
+        jnp.einsum("kcx,kjxn,jnw->kjcw", C_stage, Phi_xw[:T], E_all)
+        + jnp.einsum("kcu,kjun,jnw->kjcw", D_stage, Phi_uw, E_all)
     )
 
     meas_stage = (
-        jnp.einsum("kcx,kjxy,jyv->kjcv", C[:-1], Phi_xe[:-1], F)
-        + jnp.einsum("kcu,kjuy,jyv->kjcv", D, Phi_ue, F)
+        jnp.einsum("kcx,kjxy,jyv->kjcv", C_stage, Phi_xe[:T], F_all)
+        + jnp.einsum("kcu,kjuy,jyv->kjcv", D_stage, Phi_ue, F_all)
     )
 
     proc_terminal = jnp.einsum(
         "cx,jxn,jnw->jcw",
-        C[-1],
-        Phi_xw[-1],
-        E,
+        C_term,
+        Phi_xw[T],
+        E_all,
     )
 
     meas_terminal = jnp.einsum(
         "cx,jxy,jyv->jcv",
-        C[-1],
-        Phi_xe[-1],
-        F,
+        C_term,
+        Phi_xe[T],
+        F_all,
     )
 
-    proc_norm_stage = jnp.linalg.norm(proc_stage, axis=-1)
-    meas_norm_stage = jnp.linalg.norm(meas_stage, axis=-1)
+    proc_stage_norm = jnp.linalg.norm(proc_stage, axis=-1)
+    meas_stage_norm = jnp.linalg.norm(meas_stage, axis=-1)
 
-    proc_norm_terminal = jnp.linalg.norm(proc_terminal, axis=-1)
-    meas_norm_terminal = jnp.linalg.norm(meas_terminal, axis=-1)
+    proc_terminal_norm = jnp.linalg.norm(proc_terminal, axis=-1)
+    meas_terminal_norm = jnp.linalg.norm(meas_terminal, axis=-1)
 
-    beta_stage = proc_norm_stage + meas_norm_stage
-    beta_terminal = proc_norm_terminal + meas_norm_terminal
+    # beta convention: beta stores squared tightening contribution.
+    # get_constraint_tightenings later takes sqrt(beta).
+    beta_stage = (proc_stage_norm + meas_stage_norm) ** 2
+    beta_terminal = (proc_terminal_norm + meas_terminal_norm) ** 2
 
     beta = jnp.concatenate(
         [beta_stage, beta_terminal[None, :, :]],
@@ -293,21 +339,11 @@ def get_betas_output_feedback(C: jnp.ndarray, D: jnp.ndarray, Phi_xw: jnp.ndarra
 
     k_idx = jnp.arange(Tp1)[:, None]
     j_idx = jnp.arange(Tp1)[None, :]
-
     valid = k_idx >= j_idx
-    beta = beta * valid[:, :, None]
 
-    return beta
+    return beta * valid[:, :, None]
 
-@jax.jit
-def get_constraint_tightenings(betas: jnp.ndarray, eps_beta=1e-6):
-    s = jnp.sqrt(jnp.maximum(betas, 0.0))
-    h_ct = jnp.sum(s, axis=1)
-    h_ct = h_ct + eps_beta
-    return h_ct
 
-# TODO: Remove Phi_x_ws and Phi_u_ws
-# I dont think these are actually used
 @partial(jit, static_argnums=(0, 15))
 def sls_of_solve_gpu(cfg: ADMMConfig, Q: jnp.ndarray, q: jnp.ndarray, R: jnp.ndarray, r: jnp.ndarray, M: jnp.ndarray,
                      A: jnp.ndarray, B: jnp.ndarray, c: jnp.ndarray,
@@ -316,7 +352,7 @@ def sls_of_solve_gpu(cfg: ADMMConfig, Q: jnp.ndarray, q: jnp.ndarray, R: jnp.nda
                      sls_config: SLSConfig, E: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
                      obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
                      beta_ws: jnp.ndarray, mu_ws: jnp.ndarray,
-                     C_output: jnp.ndarray, F: jnp.ndarray):
+                     C_output: jnp.ndarray, F: jnp.ndarray, Xi: jnp.ndarray):
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
@@ -339,9 +375,12 @@ def sls_of_solve_gpu(cfg: ADMMConfig, Q: jnp.ndarray, q: jnp.ndarray, R: jnp.nda
 
     h_ct0 = h_ct_ws
     carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_xw0, Phi_uw0, Phi_xe0, Phi_ue0, mu_ws)
-
+    Phi_x_o, Phi_y_o = get_controller_obs(A, C_output, E, F, Xi)
+    # Phi_x_o0 = jnp.ones((Tp1, Tp1, nx, nx)) * 2
+    # Phi_y_o0 = jnp.ones((Tp1, Tp1, nx, nx)) * 2
+    # jax.debug.print("{}, {}", Phi_x_o.shape, Phi_y_o.shape)
     def cond_fn(carry):
-        i, _, _, _, _, _, _, _, converged, _, _, _, _, _ = carry
+        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _ = carry
         return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
 
     def body_fn(carry):
@@ -378,11 +417,8 @@ def sls_of_solve_gpu(cfg: ADMMConfig, Q: jnp.ndarray, q: jnp.ndarray, R: jnp.nda
         eta_stage, eta_f = get_etas(mu_nominal, beta)
         C_box = C[:, :num_regular_constraints, :]
         D_box = D[:, :num_regular_constraints, :]
-        Phi_x_f, Phi_u_f = get_controller_state(Q_bar, R_bar, A, B, C_box, D_box, E, eta_stage, eta_f)
-        Phi_x_o, Phi_y_o = get_controller_obs(A, C_output, E, F)
-
+        Phi_x_f, Phi_u_f = get_controller_state(Q_bar, R_bar, A, B, C_box, D_box, eta_stage, eta_f)
         Phi_xw, Phi_uw, Phi_xe, Phi_ue = assemble_output_feedback_phis(A, Phi_x_f, Phi_u_f, Phi_x_o, Phi_y_o)
-
         beta = get_betas_output_feedback(C_box, D_box, Phi_xw, Phi_uw, Phi_xe, Phi_ue, E, F)
         h_ct = get_constraint_tightenings(beta)
         rho = jnp.asarray(rho, dtype=prev_rho.dtype)

@@ -113,7 +113,7 @@ def compute_search_direction(
     x0, X, U, V, c,
     w, y, rho,
     h_ct_ws, beta_ws, mu_ws,
-    sqp_iteration
+    sqp_iteration, Xi
 ):
     T = U.shape[0]
     Tp1 = T + 1
@@ -198,7 +198,7 @@ def compute_search_direction(
             C_all, D_all, f_all, w, y, rho,
             sls_config,
             E, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws,
-            C_output, F,
+            C_output, F, Xi,
         )
 
         return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x_temp, Phi_u_temp, Phi_xw, Phi_uw, Phi_xe, Phi_ue, betaN, muN
@@ -239,7 +239,7 @@ def sqp(
     x0, X_in, U_in, V_in,
     w, y, rho,
     obstacles,
-    h_ct_ws, beta_ws, mu_ws
+    h_ct_ws, beta_ws, mu_ws, Xi
 ):
     _cost = partial(cost, W, reference)
     if hessian_approx is not None:
@@ -272,7 +272,7 @@ def sqp(
                 obstacles,
                 x0, X_curr, U_curr, V_curr, c,
                 w0, y0, rho0,
-                h_ct_ws, beta_ws, mu_ws, i
+                h_ct_ws, beta_ws, mu_ws, i, Xi
             )
 
             step = jnp.maximum(
@@ -326,8 +326,8 @@ def sqp(
     Tp1 = T + 1
     nx = X_in.shape[1]
     nu = U_in.shape[1]
-    y_temp = output_equation(X_in)
-    ny = y_temp.shpe[1]
+    y_temp = output_equation(X_in, U_in, 0)
+    ny = y_temp.shape[1]
     Phi_x_temp   = jnp.zeros((T + 1, T + 1, nx, nx))
     Phi_u_temp   = jnp.zeros((T, T + 1, nu, nx))
 
