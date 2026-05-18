@@ -16,6 +16,7 @@ class SLSConfig:
     max_sls_iterations: int = 2
     sls_primal_tol: float = 1e-2
     enable_fastsls: bool = True
+    enable_output_feedback: bool = False
     warm_start: bool = True
     rti: bool = False
     initialize_nominal: bool = True

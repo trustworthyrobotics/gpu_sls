@@ -15,6 +15,7 @@ from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.optimizers import (
 )
 from gpu_sls.gpu_admm import ADMMConfig, constrained_solve
 from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu
+from gpu_sls.gpu_sls_of import sls_of_solve_gpu
 
 
 @register_pytree_node_class
@@ -78,11 +79,11 @@ def merit_function_factory(rho_merit):
         return g + jnp.sum(V * c) + 0.5 * rho_merit * jnp.sum(c * c)
     return merit_fn
 
-@partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6))
+@partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8))
 def compute_search_direction(
     sls_config: SLSConfig, admm_config: ADMMConfig,
-    cost, dynamics, hessian_approx,
-    constraints, disturbance,
+    cost, dynamics, hessian_approx, output_equation,
+    constraints, disturbance, output_uncertainty,
     obstacles,
     x0, X, U, V, c,
     w, y, rho,
@@ -90,6 +91,7 @@ def compute_search_direction(
     sqp_iteration
 ):
     T = U.shape[0]
+    Tp1 = T + 1
     nx = X.shape[1]
     nu = U.shape[1]
     nc = w.shape[1]
@@ -121,21 +123,31 @@ def compute_search_direction(
     C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
     E = disturbance(X)
 
+    C_output, _ = linearize(output_equation)(X, U_pad, t)
+    ny = C_output.shape[-1]
+    F = output_uncertainty(X)
+
     Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[1]), Q.shape)
     R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]), R.shape)
 
     n_obs = obstacles.shape[0]
+
+    Phi_x_temp   = jnp.zeros((T + 1, T + 1, nx, nx))
+    Phi_u_temp   = jnp.zeros((T, T + 1, nu, nx))
+
+    Phi_xw_temp = jnp.zeros((Tp1, Tp1, nx, nx))
+    Phi_uw_temp = jnp.zeros((T, Tp1, nu, nx))
+    Phi_xe_temp = jnp.zeros((Tp1, Tp1, nx, ny))
+    Phi_ue_temp = jnp.zeros((T, Tp1, nu, ny))
 
     def run_nominal(_):
         dX, dU, dV, w1, y1, rho1, _, converged_admm = constrained_solve(
             admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho
         )
         backoffs = jnp.zeros((T + 1, nc - n_obs))
-        Phi_x   = jnp.zeros((T + 1, T + 1, nx, nx))
-        Phi_u   = jnp.zeros((T, T + 1, nu, nx))
         betaN   = jnp.ones((T + 1, T + 1, nc - n_obs)) * 1e-10
         muN     = jnp.zeros((T + 1, nc))
-        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN
+        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x_temp, Phi_u_temp, Phi_xw_temp, Phi_uw_temp, Phi_xe_temp, Phi_ue_temp, betaN, muN
 
     def run_sls(_):
         dX, dU, dV, w1, y1, rho1, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN = sls_solve_gpu(
@@ -144,7 +156,19 @@ def compute_search_direction(
             C_all, D_all, f_all, w, y, rho, sls_config,
             E, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws
         )
-        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN
+        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, Phi_xw_temp, Phi_uw_temp, Phi_xe_temp, Phi_ue_temp, betaN, muN
+
+    def run_sls_of(_):
+        dX, dU, dV, w1, y1, rho1, converged, converged_admm, backoffs, Phi_xw, Phi_uw, Phi_xe, Phi_ue, betaN, muN = sls_of_solve_gpu(
+            admm_config,
+            Q, q, R, r, M, A, B, c,
+            C_all, D_all, f_all, w, y, rho,
+            sls_config,
+            E, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws,
+            C_output, F,
+        )
+
+        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x_temp, Phi_u_temp, Phi_xw, Phi_uw, Phi_xe, Phi_ue, betaN, muN
 
     use_nominal = jnp.logical_or(
         jnp.logical_not(sls_config.enable_fastsls),
