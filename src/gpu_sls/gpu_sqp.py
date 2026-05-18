@@ -35,12 +35,37 @@ class SQPConfig:
     def tree_unflatten(cls, aux, children):
         return cls(*children)
 
-def lagrangian(cost, dynamics, x0):
-    def fun(x, u, t, v, v_prev):
+def lagrangian(cost, dynamics, constraints, x0, obstacles, backoffs):
+    def fun(x, u, t, v, v_prev, lam):
         c1 = cost(x, u, t)
+
         c2 = jnp.dot(v, dynamics(x, u, t))
         c3 = jnp.dot(v_prev, lax.select(t == 0, x0 - x, -x))
-        return c1 + c2 + c3
+
+        g_base = constraints(x, u, t)
+        n_base = g_base.shape[0]
+
+        g_base_tight = g_base + backoffs[t, :n_base]
+
+        centers = obstacles[:, :2]
+        radii = obstacles[:, 2]
+
+        pos = x[:2]
+        diff = pos[None, :] - centers
+        dist = jnp.linalg.norm(diff, axis=-1) + 1e-6
+        n = diff / dist[:, None]
+
+        hx = jnp.abs(backoffs[t, 0])
+        hy = jnp.abs(backoffs[t, 1])
+
+        obs_backoff = jnp.abs(n[:, 0]) * hx + jnp.abs(n[:, 1]) * hy
+        g_obs_tight = radii - dist + obs_backoff
+
+        g_all = jnp.concatenate([g_base_tight, g_obs_tight], axis=0)
+
+        c4 = jnp.dot(lam, g_all)
+
+        return c1 + c2 + c3 + c4
 
     return fun
 
@@ -106,10 +131,18 @@ def compute_search_direction(
     R = R_pad[:-1]
     M = M_pad[:-1]
 
-    linearizer = linearize(lagrangian(cost, dynamics, x0), argnums=5)
-    dynamics_linearizer = linearize(dynamics)
-    q, r_pad = linearizer(X, pad(U), jnp.arange(T + 1), pad(V[1:]), V)
+    linearizer = linearize(
+        lagrangian(cost, dynamics, constraints, x0, obstacles, h_ct_ws),
+        argnums=6,
+    )
+    q, r_pad = linearizer(
+        X, pad(U), jnp.arange(T + 1),
+        pad(V[1:]), V,
+        y,
+    )
+
     r = r_pad[:-1]
+    dynamics_linearizer = linearize(dynamics)
     A_pad, B_pad = dynamics_linearizer(X, pad(U), jnp.arange(T + 1))
     A = A_pad[:-1]
     B = B_pad[:-1]
