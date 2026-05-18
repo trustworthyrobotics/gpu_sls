@@ -305,7 +305,7 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
                        w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
                        sls_config: SLSConfig, E: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
                        obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
-                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray):
+                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray):
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
@@ -326,7 +326,9 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
     h_ct0 = h_ct_ws
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws)
+    Phi_x0   = jnp.zeros((T + 1, T + 1, nx, nx))
+    Phi_u0   = jnp.zeros((T, T + 1, nu, nx))
+    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x0, Phi_u0, mu_ws)
 
     def cond_fn(carry):
         i, _, _, _, _, _, _, _, converged, _, _, _, _, _ = carry
@@ -366,8 +368,6 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C_box, D_box, E, eta_stage, eta_f)
         beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
-        rho = jnp.maximum(jnp.minimum(rho, 1e4) * 0.9, 0.1)
-        y = prev_rho / rho * y
         rho = jnp.asarray(rho, dtype=prev_rho.dtype)
         w   = jnp.asarray(w,   dtype=w.dtype)
         y   = jnp.asarray(y,   dtype=y.dtype)

@@ -30,6 +30,7 @@ class GenericMPC:
         disturbance,
         X_in, U_in,
         shift: int = 1,
+        output_equation = None, output_uncertainty = None
     ):
         self.sls_config = sls_config
         self.sqp_config = sqp_config
@@ -41,8 +42,6 @@ class GenericMPC:
         self.h_ct_ws = jnp.zeros((config.N + 1, num_constraints - num_obstacles))
         self.beta_ws = jnp.ones((config.N + 1, config.N + 1, num_constraints - num_obstacles)) * 1e-10
         self.mu_ws = jnp.zeros((config.N + 1, num_constraints))
-        self.Phi_x_ws = jnp.zeros((config.N + 1, config.N + 1, config.n, config.n))
-        self.Phi_u_ws = jnp.zeros((config.N, config.N + 1, config.nu, config.n))
 
         self.U0 = U_in
         self.X0 = X_in
@@ -57,24 +56,32 @@ class GenericMPC:
         self.cost = cost
         self.disturbance = disturbance
 
+
+        self.output_equation = output_equation
+        self.output_uncertainty = output_uncertainty
+        if output_equation is None or output_uncertainty is None:
+            self.output_equation = lambda x, u, t: jnp.zeros_like(x)
+            self.output_uncertainty = lambda x: jnp.zeros((x.shape[0], x.shape[0]))
+
         work = partial(
             gpu_sls.gpu_sqp.sqp,
             self.sls_config, self.sqp_config, self.admm_config,
             cost, dynamics,
             None,
-            constraints, disturbance,
+            constraints, disturbance, output_equation, output_uncertainty
         )
         self._solve = jax.jit(work)
 
     def run(self, x0: jnp.ndarray, reference: jnp.ndarray, parameter: Any):
-        X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, betaN, muN = self._solve(
+        (X, U, V, w, y, rho, backoffs, Phi_x,
+         Phi_u, Phi_xw, Phi_uw, Phi_xe, Phi_ue, betaN, muN) = self._solve(
             reference,
             parameter,
             self.config.W,
             x0, self.X0, self.U0, self.V0,
             self.w, self.y, self.rho,
             self.obstacles,
-            self.h_ct_ws, self.beta_ws, self.mu_ws, self.Phi_x_ws, self.Phi_u_ws
+            self.h_ct_ws, self.beta_ws, self.mu_ws
         )
 
         s = self.shift
@@ -178,18 +185,4 @@ class GenericMPC:
             operand=None,
         )
 
-        self.Phi_x_ws = jax.lax.cond(
-            invalid,
-            lambda _: jnp.zeros_like(self.Phi_x_ws),
-            lambda _: Phi_x,
-            operand=None,
-        )
-
-        self.Phi_u_ws = jax.lax.cond(
-            invalid,
-            lambda _: jnp.zeros_like(self.Phi_u_ws),
-            lambda _: Phi_u,
-            operand=None,
-        )
-
-        return U[0], X, U, V, backoffs, Phi_x, Phi_u
+        return U[0], X, U, V, backoffs, Phi_x, Phi_u, Phi_xw, Phi_uw, Phi_xe, Phi_ue
