@@ -72,7 +72,9 @@ class GenericMPC:
         )
         self._solve = jax.jit(work)
 
-    def run(self, x0: jnp.ndarray, reference: jnp.ndarray, Xi: jnp.ndarray, parameter: Any):
+    def run(self, x0: jnp.ndarray, reference: jnp.ndarray, parameter: Any, Xi=None):
+        if Xi is None:
+            Xi = jnp.zeros((x0.shape[0], x0.shape[0]))
         (X, U, V, w, y, rho, backoffs, Phi_x,
          Phi_u, Phi_xw, Phi_uw, Phi_xe, Phi_ue, betaN, muN) = self._solve(
             reference,
