@@ -13,7 +13,7 @@ from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlq
 
 @dataclass(frozen=True)
 class SLSConfig:
-    max_sls_iterations: int = 2
+    max_sls_iterations: int = 1
     sls_primal_tol: float = 1e-2
     enable_fastsls: bool = True
     warm_start: bool = True
@@ -279,6 +279,9 @@ def add_obstacle_tightenings(
     idx_py: int = 1,
     eps: float = 1e-6,
 ):
+    if obstacles.shape[0] == 0:
+        return tightened_constraints
+
     pos = primal_pos[:, :2]
     centers = obstacles[:, :2]
     radii = obstacles[:, 2]
@@ -333,8 +336,6 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
 
     def body_fn(carry):
         i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, _, _, mu = carry
-
-        prev_rho = rho
         x_prev = x_curr
         u_prev = u_curr
         if sls_config.rti:
@@ -356,6 +357,7 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )
+        prev_rho = rho
 
         metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
         mu_nominal = mu[: , :num_regular_constraints]
@@ -365,7 +367,6 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C_box, D_box, E, eta_stage, eta_f)
         beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
-        rho = jnp.maximum(jnp.minimum(rho, 1e4) * 0.9, 0.1)
         y = prev_rho / rho * y
         rho = jnp.asarray(rho, dtype=prev_rho.dtype)
         w   = jnp.asarray(w,   dtype=w.dtype)

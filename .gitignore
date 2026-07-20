@@ -5,3 +5,4 @@ build/
 # Bytecode
 __pycache__/
 *.pyc
+jax_cache/

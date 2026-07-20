@@ -46,19 +46,22 @@ def lagrangian(cost, dynamics, constraints, x0, obstacles, backoffs):
 
         g_base_tight = g_base + backoffs[t, :n_base]
 
-        centers = obstacles[:, :2]
-        radii = obstacles[:, 2]
+        if obstacles.shape[0] == 0:
+            g_obs_tight = jnp.empty((0,), dtype=g_base.dtype)
+        else:
+            centers = obstacles[:, :2]
+            radii = obstacles[:, 2]
 
-        pos = x[:2]
-        diff = pos[None, :] - centers
-        dist = jnp.linalg.norm(diff, axis=-1) + 1e-6
-        n = diff / dist[:, None]
+            pos = x[:2]
+            diff = pos[None, :] - centers
+            dist = jnp.linalg.norm(diff, axis=-1) + 1e-6
+            n = diff / dist[:, None]
 
-        hx = jnp.abs(backoffs[t, 0])
-        hy = jnp.abs(backoffs[t, 1])
+            hx = jnp.abs(backoffs[t, 0])
+            hy = jnp.abs(backoffs[t, 1])
 
-        obs_backoff = jnp.abs(n[:, 0]) * hx + jnp.abs(n[:, 1]) * hy
-        g_obs_tight = radii - dist + obs_backoff
+            obs_backoff = jnp.abs(n[:, 0]) * hx + jnp.abs(n[:, 1]) * hy
+            g_obs_tight = radii - dist + obs_backoff
 
         g_all = jnp.concatenate([g_base_tight, g_obs_tight], axis=0)
 
@@ -224,7 +227,7 @@ def sqp(
 
             w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
-            # TODO: Make the defualt rho a parameter
+            jax.debug.print("rho entering: {}", rho)
             rho0 = lax.select(warm_flag, rho, jnp.asarray(admm_config.initial_rho, dtype=rho.dtype))
             h_ct_ws = backoffs
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN = compute_search_direction(
@@ -285,8 +288,6 @@ def sqp(
             w_next = lax.select(converged1, w, w1)
             y_next = lax.select(converged1, y, y1)
             rho_next = lax.select(converged1, rho, rho1)
-            rho_next = jnp.minimum(rho, admm_config.initial_rho)
-            y_next = rho / rho_next * y_next
             backoffs_next = lax.select(converged1, backoffs, backoffs1)
             Phi_x_next = lax.select(converged1, Phi_x, Phi_x1)
             Phi_u_next = lax.select(converged1, Phi_u, Phi_u1)

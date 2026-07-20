@@ -19,6 +19,7 @@ dependencies = [
     "numpy",
     "scipy",
     "matplotlib",
+    "mpx @ git+https://github.com/iit-DLSLab/mpx.git",
 ]
 
 [tool.setuptools.packages.find]
