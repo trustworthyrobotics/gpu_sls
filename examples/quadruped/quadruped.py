@@ -19,7 +19,7 @@ import numpy as np
 
 from pathlib import Path
 import mpx
-import mpx.config.config_aliengo as config
+import config_go2 as config
 import mpx.utils.sim as sim_utils
 
 import gpu_sls.legged_mpc as mpc_wrapper
@@ -64,12 +64,12 @@ def _build_solve_fn(mpc):
     return solve_mpc
 
 
-def main(headless=False, steps=500, scene="flat"):
+def main(headless=False, steps=500):
 
     mpx_root = Path(mpx.__file__).parent
 
     model = mujoco.MjModel.from_xml_path(
-        str(mpx_root / "data" / "aliengo" / f"scene_{scene}.xml")
+        str(mpx_root / "data" / "go2" / f"scene_mjx.xml")
     )
 
     data = mujoco.MjData(model)
@@ -78,7 +78,7 @@ def main(headless=False, steps=500, scene="flat"):
 
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
 
-    obstacle_center = np.array([1.0, 0.0])
+    obstacle_center = np.array([1.0, 0.1])
     obstacle_radius = 0.43
     obstacle_visual_radius = 0.15
     obstacle_visual_half_height = 1.0
@@ -210,11 +210,9 @@ def main(headless=False, steps=500, scene="flat"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--scene", type=str, default="flat")
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
     main(
         headless=args.headless,
         steps=args.steps,
-        scene=args.scene,
     )
