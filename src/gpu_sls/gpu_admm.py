@@ -271,7 +271,8 @@ def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
     w_norm = jnp.linalg.norm(w.reshape(-1), ord=jnp.inf)
     y_norm = jnp.linalg.norm(y.reshape(-1), ord=jnp.inf)
 
-    eps_pri = eps_abs + eps_rel * jnp.maximum(z_norm, w_norm)
+    # eps_pri = eps_abs + eps_rel * jnp.maximum(z_norm, w_norm)
+    eps_pri = eps_abs
     eps_dual = eps_abs + eps_rel * (rho * y_norm)
 
     return r_norm, s_norm, eps_pri, eps_dual
@@ -431,7 +432,27 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         b, p = associative_scan_use_cache_cp_jax(c0, p0, T + 1, cache, reverse=True)
         k = get_k(tilde_R, tilde_r, B, P, p, c[1:])
 
-        x_bar, u_stage = rollout_gpu(K, k, c[0], A, B, c[1:])
+        dx0 = c[0, :-1]
+
+        P0 = P[0]
+        p0 = p[0]
+
+        P_Tx = P0[-1, :-1]
+        P_TT = P0[-1, -1]
+        p_T = p0[-1]
+
+        delta_T = -(P_Tx @ dx0 + p_T) / P_TT
+
+        dx0_aug = c[0].at[-1].set(delta_T)
+
+        x_bar, u_stage = rollout_gpu(
+            K,
+            k,
+            dx0_aug,
+            A,
+            B,
+            c[1:],
+        )
         u_bar = jnp.pad(u_stage, ((0, 1), (0, 0)))
 
         z_bar = (

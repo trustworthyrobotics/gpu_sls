@@ -150,12 +150,20 @@ def plot_rollouts_tubes_centers(
     if show_plan and plans_xy is not None:
         step_idx = int(step_idx if step_idx is not None else 0)
         step_idx = max(0, min(step_idx, plans_xy.shape[0] - 1))
+
+        plan = plans_xy[step_idx]
+
         ax.plot(
-            plans_xy[step_idx, :, 0],
-            plans_xy[step_idx, :, 1],
+            plan[:, 0],
+            plan[:, 1],
             linestyle="--",
             linewidth=2,
-            label="Planned (open-loop)",
+            marker="o",
+            markersize=4,
+            markerfacecolor="white",
+            markeredgewidth=1.2,
+            label="Planned nodes",
+            zorder=4,
         )
 
     # rollouts (nan-padded -> line breaks automatically)

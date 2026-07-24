@@ -17,7 +17,6 @@ class MPCConfig:
     N: int
     W: jnp.ndarray
     u_ref: jnp.ndarray
-    dt: float
 
 
 class GenericMPC:
@@ -44,6 +43,8 @@ class GenericMPC:
         self.Phi_x_ws = jnp.zeros((config.N + 1, config.N + 1, config.n, config.n))
         self.Phi_u_ws = jnp.zeros((config.N, config.N + 1, config.nu, config.n))
 
+        self.converged_admm = False
+
         self.U0 = U_in
         self.X0 = X_in
         self.V0 = jnp.zeros((config.N + 1, config.n))
@@ -67,17 +68,19 @@ class GenericMPC:
         self._solve = jax.jit(work)
 
     def run(self, x0: jnp.ndarray, reference: jnp.ndarray, parameter: Any):
-        X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, betaN, muN = self._solve(
+        X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, betaN, muN, converged_admm = self._solve(
             reference,
             parameter,
             self.config.W,
             x0, self.X0, self.U0, self.V0,
             self.w, self.y, self.rho,
             self.obstacles,
-            self.h_ct_ws, self.beta_ws, self.mu_ws, self.Phi_x_ws, self.Phi_u_ws
+            self.h_ct_ws, self.beta_ws, self.mu_ws, self.Phi_x_ws, self.Phi_u_ws, self.converged_admm
         )
 
         s = self.shift
+
+        self.converged_admm = converged_admm
 
         invalid = (
             jnp.any(~jnp.isfinite(U)) |

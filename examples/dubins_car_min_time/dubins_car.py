@@ -146,33 +146,38 @@ def dubins_step_with_disturbance(
 
 def dynamics(x: jnp.ndarray, u: jnp.ndarray, t: jnp.ndarray, *, parameter: Any) -> jnp.ndarray:
     """Discrete-time dynamics required by your model evaluator."""
-    dt = parameter
-    px, py, th = x[0], x[1], x[2]
-    om = u[0]
-    px_next = px + dt * V_CONST * jnp.cos(th)
-    py_next = py + dt * V_CONST * jnp.sin(th)
+    dtau = parameter
+    px, py, th, T = x[0], x[1], x[2], x[3]
+    v, om = u
+    dt = dtau * T
+    px_next = px + dt * v * jnp.cos(th)
+    py_next = py + dt * v * jnp.sin(th)
     th_next = th + dt * om
-    return jnp.array([px_next, py_next, th_next], dtype=x.dtype)
+    return jnp.array([px_next, py_next, th_next, T], dtype=x.dtype)
 
 def cost(W, reference, x, u, t):
     """
-    W = [wx, wy, wtheta, womega]
+    W = [wx, wy, wtheta, womega, wT]
     """
-    wx, wy, wtheta, womega = W
+    wx, wy, wtheta, wvel, womega, wT = W
     xref = reference[t]
 
     dx = x[0] - xref[0]
     dy = x[1] - xref[1]
     dth = x[2] - xref[2]
     theta_cost = 1 - jnp.cos(dth)
+    time_cost = wT * x[3]
 
-    om = u[0]
+    v = u[0]
+    om = u[1]
 
     return (
         wx * (dx * dx)
         + wy * (dy * dy)
         + wtheta * theta_cost
+        + wvel * (v * v)
         + womega * (om * om)
+        + time_cost
     )
 
 def make_control_box_constraints(
@@ -189,6 +194,39 @@ def make_control_box_constraints(
 
     def constraints(x: jnp.ndarray, u: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
         return jnp.concatenate([u - u_max, u_min - u], axis=0)
+
+    return constraints
+
+def make_terminal_set_constraint(
+    alpha: jnp.ndarray,
+    beta: jnp.ndarray,
+    N: int,
+):
+    """
+    Enforces at t = N, elementwise:
+
+        |x[:2] - alpha| <= beta
+
+    Returns 4 scalar inequalities:
+        x[:2] - alpha - beta <= 0
+        alpha - x[:2] - beta <= 0
+    """
+    alpha = jnp.asarray(alpha)
+    beta = jnp.asarray(beta)
+
+    def constraints(x, u, t):
+        terminal_constraint = jnp.concatenate([
+            x[:2] - alpha - beta,
+            alpha - x[:2] - beta,
+        ])
+
+        inactive_constraint = -jnp.ones_like(terminal_constraint)
+
+        return jnp.where(
+            t == N,
+            terminal_constraint,
+            inactive_constraint,
+        )
 
     return constraints
 
@@ -213,45 +251,40 @@ def make_straight_line_reference(
     x_start: jnp.ndarray,
     x_goal: jnp.ndarray,
     N: int,
-    dt: float,
-    v: float,
 ) -> jnp.ndarray:
+    # Evenly spaced interpolation parameter
+    alpha = jnp.linspace(0.0, 1.0, N + 1)
+
+    # Straight-line interpolation in x-y
+    xy_ref = (
+        (1.0 - alpha)[:, None] * x_start[:2]
+        + alpha[:, None] * x_goal[:2]
+    )
+
+    # Constant heading pointing toward the goal
     delta = x_goal[:2] - x_start[:2]
-    dist = jnp.linalg.norm(delta)
-    direction = delta / (dist + 1e-8)
-    theta_ref = jnp.arctan2(direction[1], direction[0])
-
-    times = jnp.arange(N + 1) * dt
-    traveled = jnp.minimum(v * times, dist)
-
-    xy_ref = x_start[:2][None, :] + traveled[:, None] * direction[None, :]
-
+    theta_ref = jnp.arctan2(delta[1], delta[0])
     theta_vec = jnp.full((N + 1,), theta_ref)
 
-    reference = jnp.column_stack(
-        (
-            xy_ref[:, 0],
-            xy_ref[:, 1],
-            theta_vec,
-        )
-    )
-    reached = traveled >= dist
-    reference = reference.at[reached, :2].set(x_goal[:2])
-    reference = reference.at[reached, 2].set(theta_ref)
-
-    return reference
+    return jnp.column_stack((
+        xy_ref[:, 0],
+        xy_ref[:, 1],
+        theta_vec,
+        jnp.ones(N + 1) * 2.0
+    ))
 
 def make_constant_disturbance(
     n: int,
-    alpha: float,
+    E_mag: float,
 ) -> Callable[[jnp.ndarray], jnp.ndarray]:
     """
     Returns a constant disturbance E with shape (T, n, n),
-    where E[t] = alpha * I for all t.
+    where E[t] = mag * I for all t.
     """
     def disturbance(X_prefix: jnp.ndarray) -> jnp.ndarray:
         T = X_prefix.shape[0]
-        E0 = alpha * jnp.eye(n, n, dtype=X_prefix.dtype)  # (n, n)
+        MIN_T = X_prefix[0, -1]
+        E0 = MIN_T / T * E_mag * jnp.eye(n, n, dtype=X_prefix.dtype)  # (n, n)
         return jnp.broadcast_to(E0, (T, n, n))
 
     return disturbance
@@ -261,15 +294,14 @@ def make_constant_disturbance(
 # -----------------------------
 def main():
     # Dimensions
-    n = 3      # [px, py, theta]
-    nu = 1     # [omega]
+    n = 4      # [px, py, theta, T]
+    nu = 2     # [omega]
 
     # Horizon and dt
     N = 90
-    dt = 0.1
 
-    # Weights: (x, y, theta, omega)
-    W = jnp.array([25.0, 10.0, 0.01, 0.01], dtype=jnp.float64)
+    # Weights: (x, y, theta, v, omega, T)
+    W = jnp.array([0.1, 0.1, 0.1, 0.1, 0.1, 1.0], dtype=jnp.float64)
 
     cfg = MPCConfig(
         n=n,
@@ -277,46 +309,48 @@ def main():
         N=N,
         W=W,
         u_ref=jnp.zeros((nu,), dtype=jnp.float64),
-        dt=dt,
     )
 
-    parameter = dt
+    parameter = 1 / N
 
+    v_max = 2.0
     om_max = 4.0
-    u_min = jnp.array([-om_max], dtype=jnp.float64)
-    u_max = jnp.array([om_max], dtype=jnp.float64)
+    u_min = jnp.array([-v_max, -om_max], dtype=jnp.float64)
+    u_max = jnp.array([v_max, om_max], dtype=jnp.float64)
 
     constraints_u = make_control_box_constraints(u_min, u_max)
 
-    x_max = jnp.array([15.0, 15.0, jnp.inf], dtype=jnp.float64)
-    x_min = -x_max
+    x_min = jnp.array([-15.0, -15.0, -jnp.inf, 0.0], dtype=jnp.float64)
+    x_max = jnp.array([15.0, 15.0, jnp.inf, 10.0], dtype=jnp.float64)
     constraints_x = make_state_box_constraints(x_min, x_max)
+    term_constraint = make_terminal_set_constraint(
+        alpha=jnp.array([0.5, 0.6]),
+        beta=jnp.array([0.1, 0.1]),
+        N=N
+    )
 
     constraints_all = combine_constraints(constraints_x, constraints_u)
+    constraints_all = combine_constraints(constraints_all, term_constraint)
+
 
     obstacles = jnp.array([[0.0, 0.0, 0.3]], dtype=jnp.float64)
     n_obs = obstacles.shape[0]
-    nc = 2 * nu + 2 * n + n_obs
-
+    nc = 2 * nu + 2 * n + n_obs + 4
     E_mag = 0.01
-    alpha_sim = E_mag * dt
-    disturbance = make_constant_disturbance(n=n, alpha=alpha_sim)
+    disturbance = make_constant_disturbance(n=n, E_mag=E_mag)
 
-    x0 = jnp.array([-0.75, -0.75, 0.0], dtype=jnp.float64)
-    x_goal = jnp.array([1.0, 0.6, 0.0], dtype=jnp.float64)
+    x0 = jnp.array([-0.75, -0.75, 0.0, 0.0], dtype=jnp.float64)
+    x_goal = jnp.array([0.5, 0.6, 0.0, 0.0], dtype=jnp.float64)
 
     reference = make_straight_line_reference(
         x_start=x0,
         x_goal=x_goal,
         N=N,
-        dt=dt,
-        v=V_CONST,
     )
     X_ref = reference
     T_steps = N
 
     key = jax.random.PRNGKey(0)
-    E_sim = alpha_sim * jnp.eye(3, dtype=jnp.float64)
 
     # -----------------------------
     # Update configs for robust run
@@ -331,9 +365,9 @@ def main():
     )
 
     sls_cfg = SLSConfig(
-        max_sls_iterations=2,
+        max_sls_iterations=1,
         sls_primal_tol=1e-2,
-        enable_fastsls=True,
+        enable_fastsls=False,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
         warm_start=False,
@@ -342,10 +376,10 @@ def main():
 
     sqp_cfg = SQPConfig(
         max_sqp_iterations=100,
-        warm_start=False,
+        warm_start=True,
         feas_tol=1e-10,
         step_tol=1e-5,
-        line_search=False
+        line_search=True,
     )
 
     controller = GenericMPC(
@@ -369,7 +403,7 @@ def main():
     u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
         x0=x0, reference=reference, parameter=parameter
     )
-
+    print("Computed Min Time:", X_pred[0, -1])
     # -----------------------------
     # Rollout simulations with early stopping
     # -----------------------------
@@ -377,28 +411,28 @@ def main():
     disturbed = np.full((N_ROLLOUTS, T_steps, 3), np.nan, dtype=np.float64)
     stop_steps = np.full((N_ROLLOUTS,), T_steps, dtype=np.int32)
 
-    for i in range(N_ROLLOUTS):
-        disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
-        x = x0
-        jax.debug.print(f"Rolling out iteration {i}")
-        for k in range(T_steps):
-            if bool(reached_goal_xy(x, x_goal, GOAL_TOL)):
-                stop_steps[i] = k
-                break
+    # for i in range(N_ROLLOUTS):
+    #     disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
+    #     x = x0
+    #     jax.debug.print(f"Rolling out iteration {i}")
+    #     for k in range(T_steps):
+    #         if bool(reached_goal_xy(x, x_goal, GOAL_TOL)):
+    #             stop_steps[i] = k
+    #             break
 
-            disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
-            for j in range(k + 1):
-                disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
+    #         disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
+    #         for j in range(k + 1):
+    #             disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
 
-            u = U_pred[k] + disturbance_feedback
+    #         u = U_pred[k] + disturbance_feedback
 
-            key, x, w = dubins_step_with_disturbance(key, x, u, E_sim, dt, i)
+    #         key, x, w = dubins_step_with_disturbance(key, x, u, E_sim, dt, i)
 
-            disturbed[i, k, :2] = np.abs(np.asarray(X_pred[k + 1, :2] - x[:2]))
-            disturbed[i, k, 2]  = np.abs(np.asarray(wrap_to_pi(X_pred[k + 1, 2] - x[2])))
+    #         disturbed[i, k, :2] = np.abs(np.asarray(X_pred[k + 1, :2] - x[:2]))
+    #         disturbed[i, k, 2]  = np.abs(np.asarray(wrap_to_pi(X_pred[k + 1, 2] - x[2])))
 
-            disturbance_history.append(w)
-            xs[i, k] = np.asarray(x)
+    #         disturbance_history.append(w)
+    #         xs[i, k] = np.asarray(x)
             
     plans_xy = []
     lowers_xy = []
@@ -422,7 +456,7 @@ def main():
         step_idx=0,
         tube_stride=1,
         filename="rollouts_tubes_centers.png",
-        show_plan=False,
+        show_plan=True,
         tube_alpha=0.1,
         margin=0.2,
         rollout_alpha=0.5,
@@ -430,7 +464,7 @@ def main():
     plot_tube_graph(
         disturbed=disturbed,
         tube=tube,
-        dt=dt,
+        dt=X_pred[0, -1] / N
     )
 
 
