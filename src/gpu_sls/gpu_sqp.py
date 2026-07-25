@@ -8,7 +8,7 @@ from jax.tree_util import register_pytree_node_class
 from trajax.optimizers import linearize, quadratize, vectorize
 
 from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.optimizers import (
-    line_search,
+    parallel_filter_line_search,
     merit_rho,
     slope,
 )
@@ -51,6 +51,30 @@ def model_evaluator_helper_min_time(cost, dynamics,x0, X, U):
     ])
 
     return g, c
+
+def filter_model_evaluator_factory(model_evaluator, constraints, backoffs):
+    # TODO: Might need to add the fact that we inflate obstalces by 1e-2
+    def filter_model_evaluator(X, U):
+        cost, c_dyn = model_evaluator(X, U)
+
+        T = U.shape[0]
+        U_pad = jnp.pad(U, ((0, 1), (0, 0)))
+        t = jnp.arange(T + 1)
+
+        g_base = vectorize(constraints)(X, U_pad, t)
+        g_base_tight = g_base + backoffs
+
+        g_all = g_base_tight
+        g_viol = jnp.maximum(g_all, 0.0)
+
+        c_filter = jnp.concatenate([
+            c_dyn.reshape(-1),
+            g_viol.reshape(-1),
+        ])
+
+        return cost, c_filter
+
+    return filter_model_evaluator
 
 def lagrangian(cost, dynamics, constraints, x0, obstacles, backoffs):
     def fun(x, u, t, v, v_prev, lam):
@@ -271,9 +295,12 @@ def sqp(
             step_ok = step <= sqp_config.step_tol * (1.0 + z_norm)
             # jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
             converged1 = jnp.logical_and(feas_ok, step_ok)
-            X_next = lax.select(converged1, X_curr, X_curr + dX)
-            U_next = lax.select(converged1, U_curr, U_curr + dU)
-            V_next = lax.select(converged1, V_curr, V_curr + dV)
+            filter_model_evaluator = filter_model_evaluator_factory(
+                model_evaluator,
+                constraints,
+                backoffs1,
+            )
+            current_cost, current_c_filter = filter_model_evaluator(X_curr, U_curr)
 
             g, c = model_evaluator(X_curr, U_curr)
 
@@ -283,18 +310,13 @@ def sqp(
             merit_slope = slope(dX, dU, dV, c, q, r, rho_merit)
             last_iter = (i == (sqp_config.max_sqp_iterations + sls_config.max_initial_sqp_iterations - 1))
             do_ls = jnp.logical_and(jnp.array(bool(sqp_config.line_search)), jnp.logical_not(last_iter))
-
             def ls_branch(_):
-                Xn, Un, Vn, g_new, c_new, ok = line_search(
-                    merit_fn, model_evaluator,
-                    X_curr, U_curr, V_curr,
-                    dX, dU, dV,
-                    current_merit, g, c,
-                    merit_slope,
-                    armijo_factor=1e-4,
-                    alpha_0=1.0,
-                    alpha_mult=0.5,
-                    alpha_min=1e-6,
+                Xn, Un, Vn = parallel_filter_line_search(
+                    filter_model_evaluator, X_curr, U_curr, V_curr, dX, dU, dV,
+                    current_cost, current_c_filter,
+                    q, r,
+                    alpha_min=1e-4, theta_max=1e-2, theta_min=1e-6, eta=1e-4,
+                    gamma_phi=1e-6, gamma_theta=1e-6, gamma_alpha=0.5,
                 )
                 return Xn, Un, Vn
 

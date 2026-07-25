@@ -18,6 +18,8 @@ PALETTE = {
     "tube_edge": "#1b7f1b",   # darker green edge
     "obs_face":  "#7f7f7f",   # gray
     "obs_edge":  "#4d4d4d",   # dark gray edge
+    "goal_face": "#9467bd",   # purple
+    "goal_edge": "#5e3c99",   # darker purple edge
 }
 
 mpl.rcParams.update({
@@ -43,6 +45,8 @@ def plot_rollouts_tubes_centers(
     plans_xy=None,
     lowers_xy=None,
     uppers_xy=None,
+    goal_center=None,
+    goal_half_width=None,
     step_idx: int | None = 0,
     tube_stride: int = 2,
     tube_alpha: float = 0.15,
@@ -62,15 +66,17 @@ def plot_rollouts_tubes_centers(
       uppers_xy: (n_steps, N+1, 2)  (optional)
       centers:   (K, 2)             (optional)
       radii:     (K,)               (optional)
+      goal_center:     (2,)          (optional)
+      goal_half_width: (2,)          (optional)
     """
     xs = np.asarray(xs)
 
     # Normalize xs to (n_rollouts, T, 3)
-    if xs.ndim == 2 and xs.shape[1] == 3:
+    if xs.ndim == 2 and xs.shape[1] == 4:
         xs = xs[None, :, :]
-    elif xs.ndim == 2 and xs.shape[1] != 3:
+    elif xs.ndim == 2 and xs.shape[1] != 4:
         raise ValueError(f"xs has shape {xs.shape}. Expected last dim=3.")
-    elif xs.ndim == 3 and xs.shape[2] != 3:
+    elif xs.ndim == 3 and xs.shape[2] != 4:
         raise ValueError(f"xs has shape {xs.shape}. Expected xs[...,2] to be theta.")
     elif xs.ndim != 3:
         raise ValueError(f"xs has shape {xs.shape}. Expected 2D or 3D array.")
@@ -90,6 +96,14 @@ def plot_rollouts_tubes_centers(
             centers = centers[None, :]
     if radii is not None:
         radii = np.asarray(radii).reshape(-1)
+    if goal_center is not None:
+        goal_center = np.asarray(goal_center).reshape(2)
+    if goal_half_width is not None:
+        goal_half_width = np.asarray(goal_half_width).reshape(2)
+        if np.any(goal_half_width < 0.0):
+            raise ValueError("goal_half_width must be nonnegative.")
+    if (goal_center is None) != (goal_half_width is None):
+        raise ValueError("goal_center and goal_half_width must be provided together.")
 
     # pick tube/plan frame
     if lowers_xy is not None and uppers_xy is not None:
@@ -115,6 +129,15 @@ def plot_rollouts_tubes_centers(
     if centers is not None and centers.size:
         all_x.append(centers[:, 0].ravel())
         all_y.append(centers[:, 1].ravel())
+    if goal_center is not None:
+        all_x.extend([
+            np.array([goal_center[0] - goal_half_width[0]]),
+            np.array([goal_center[0] + goal_half_width[0]]),
+        ])
+        all_y.extend([
+            np.array([goal_center[1] - goal_half_width[1]]),
+            np.array([goal_center[1] + goal_half_width[1]]),
+        ])
 
     all_x = np.concatenate(all_x) if len(all_x) else np.array([0.0])
     all_y = np.concatenate(all_y) if len(all_y) else np.array([0.0])
@@ -134,6 +157,22 @@ def plot_rollouts_tubes_centers(
     if centers is not None and centers.size and radii is not None and radii.size == centers.shape[0]:
         for c, r in zip(centers, radii):
             ax.add_patch(plt.Circle((float(c[0]), float(c[1])), float(r), alpha=0.5, color="tab:red"))
+
+    # terminal goal set: |x[:2] - goal_center| <= goal_half_width
+    if goal_center is not None:
+        goal_lower = goal_center - goal_half_width
+        goal_size = 2.0 * goal_half_width
+        ax.add_patch(Rectangle(
+            goal_lower,
+            goal_size[0],
+            goal_size[1],
+            facecolor=PALETTE["goal_face"],
+            edgecolor=PALETTE["goal_edge"],
+            linewidth=2.0,
+            alpha=0.25,
+            label="Goal terminal set",
+            zorder=2,
+        ))
 
     # tubes
     if lo is not None and up is not None:

@@ -60,14 +60,14 @@ def dubins_step_with_disturbance(
 
     Returns (key_next, x_next, w).
     """
-    px, py, th = x
-    om = u[0]
+    px, py, th, T = x
+    v, om = u[0], u[1]
 
     # Nominal Dubins step
-    px_next = px + dt * V_CONST * jnp.cos(th)
-    py_next = py + dt * V_CONST * jnp.sin(th)
+    px_next = px + dt * v * jnp.cos(th)
+    py_next = py + dt * v * jnp.sin(th)
     th_next = wrap_to_pi(th + dt * om)
-    x_nom = jnp.array([px_next, py_next, th_next], dtype=x.dtype)
+    x_nom = jnp.array([px_next, py_next, th_next, 0.0], dtype=x.dtype)
 
     # Stronger disturbance sampling
     key, key_dir, key_rad = jax.random.split(key, 3)
@@ -75,7 +75,7 @@ def dubins_step_with_disturbance(
     z = jax.random.normal(key_dir, (x.shape[0],), dtype=x.dtype)
     z = z / (jnp.linalg.norm(z) + jnp.asarray(1e-12, dtype=x.dtype))
 
-    n = jnp.asarray(x.shape[0], dtype=x.dtype)
+    n = jnp.asarray(x.shape[0] - 1, dtype=x.dtype)
     a = jnp.asarray(1.0, dtype=x.dtype)
     b = jnp.asarray(1.0, dtype=x.dtype)
 
@@ -87,61 +87,61 @@ def dubins_step_with_disturbance(
     # jax.debug.print("{}", w)
     start = i - NUM_RANDOM + 5
     if start == 5:
-        w = jnp.array([0.0, 1.0, 0.0], dtype=x.dtype)
+        w = jnp.array([0.0, 1.0, 0.0, 0.0], dtype=x.dtype)
     if start == 6:
-        w = jnp.array([0.0, -1.0, 0.0], dtype=x.dtype)
+        w = jnp.array([0.0, -1.0, 0.0, 0.0], dtype=x.dtype)
     if start == 7:
-        w = jnp.array([1.0, 0.0, 0.0], dtype=x.dtype)
+        w = jnp.array([1.0, 0.0, 0.0, 0.0], dtype=x.dtype)
     if start == 8:
-        w = jnp.array([-1.0, 0.0, 0.0], dtype=x.dtype)
+        w = jnp.array([-1.0, 0.0, 0.0, 0.0], dtype=x.dtype)
     if start == 9:
-        w = jnp.array([0.0, 0.0, 1.0], dtype=x.dtype)
+        w = jnp.array([0.0, 0.0, 1.0, 0.0], dtype=x.dtype)
     if start == 10:
-        w = jnp.array([0.0, 0.0, -1.0], dtype=x.dtype)
+        w = jnp.array([0.0, 0.0, -1.0, 0.0], dtype=x.dtype)
     if start == 11:
-        w = jnp.array([0.707, 0.707, 0.0], dtype=x.dtype)
+        w = jnp.array([0.707, 0.707, 0.0, 0.0], dtype=x.dtype)
     if start == 12:
-        w = jnp.array([-0.707, 0.707, 0.0], dtype=x.dtype)
+        w = jnp.array([-0.707, 0.707, 0.0, 0.0], dtype=x.dtype)
     if start == 13:
-        w = jnp.array([0.707, -0.707, 0.0], dtype=x.dtype)
+        w = jnp.array([0.707, -0.707, 0.0, 0.0], dtype=x.dtype)
     if start == 14:
-        w = jnp.array([-0.707, -0.707, 0.0], dtype=x.dtype)
+        w = jnp.array([-0.707, -0.707, 0.0, 0.0], dtype=x.dtype)
     if start == 15:
-        w = jnp.array([0.707, 0.0, 0.707], dtype=x.dtype)
+        w = jnp.array([0.707, 0.0, 0.707, 0.0], dtype=x.dtype)
     if start == 16:
-        w = jnp.array([-0.707, 0.0, 0.707], dtype=x.dtype)
+        w = jnp.array([-0.707, 0.0, 0.707, 0.0], dtype=x.dtype)
     if start == 17:
-        w = jnp.array([0.707, 0.0, -0.707], dtype=x.dtype)
+        w = jnp.array([0.707, 0.0, -0.707, 0.0], dtype=x.dtype)
     if start == 18:
-        w = jnp.array([-0.707, 0.0, -0.707], dtype=x.dtype)
+        w = jnp.array([-0.707, 0.0, -0.707, 0.0], dtype=x.dtype)
     if start == 19:
-        w = jnp.array([0.0, 0.707, 0.707], dtype=x.dtype)
+        w = jnp.array([0.0, 0.707, 0.707, 0.0], dtype=x.dtype)
     if start == 20:
-        w = jnp.array([0.0, -0.707, 0.707], dtype=x.dtype)
+        w = jnp.array([0.0, -0.707, 0.707, 0.0], dtype=x.dtype)
     if start == 21:
-        w = jnp.array([0.0, 0.707, -0.707], dtype=x.dtype)
+        w = jnp.array([0.0, 0.707, -0.707, 0.0], dtype=x.dtype)
     if start == 22:
-        w = jnp.array([0.0, -0.707, -0.707], dtype=x.dtype)
+        w = jnp.array([0.0, -0.707, -0.707, 0.0], dtype=x.dtype)
     if start == 23:
-        w = jnp.array([0.577, 0.577, 0.577], dtype=x.dtype)
+        w = jnp.array([0.577, 0.577, 0.577, 0.0], dtype=x.dtype)
     if start == 24:
-        w = jnp.array([-0.577, 0.577, 0.577], dtype=x.dtype)
+        w = jnp.array([-0.577, 0.577, 0.577, 0.0], dtype=x.dtype)
     if start == 25:
-        w = jnp.array([0.577, -0.577, 0.577], dtype=x.dtype)
+        w = jnp.array([0.577, -0.577, 0.577, 0.0], dtype=x.dtype)
     if start == 26:
-        w = jnp.array([0.577, 0.577, -0.577], dtype=x.dtype)
+        w = jnp.array([0.577, 0.577, -0.577, 0.0], dtype=x.dtype)
     if start == 27:
-        w = jnp.array([-0.577, -0.577, 0.577], dtype=x.dtype)
+        w = jnp.array([-0.577, -0.577, 0.577, 0.0], dtype=x.dtype)
     if start == 28:
-        w = jnp.array([0.577, -0.577, -0.577], dtype=x.dtype)
+        w = jnp.array([0.577, -0.577, -0.577, 0.0], dtype=x.dtype)
     if start == 29:
-        w = jnp.array([-0.577, 0.577, -0.577], dtype=x.dtype)
+        w = jnp.array([-0.577, 0.577, -0.577, 0.0], dtype=x.dtype)
     if start == 30:
-        w = jnp.array([-0.577, -0.577, -0.577], dtype=x.dtype)
+        w = jnp.array([-0.577, -0.577, -0.577, 0.0], dtype=x.dtype)
 
     # Additive disturbance
-    w = w
-    x_next = x_nom + E @ w
+    w = w.at[-1].set(0.0)
+    x_next = x_nom + E @ w * dt
     return key, x_next, w
 
 def dynamics(x: jnp.ndarray, u: jnp.ndarray, t: jnp.ndarray, *, parameter: Any) -> jnp.ndarray:
@@ -282,10 +282,11 @@ def make_constant_disturbance(
     where E[t] = mag * I for all t.
     """
     def disturbance(X_prefix: jnp.ndarray) -> jnp.ndarray:
-        T = X_prefix.shape[0]
+        TP1 = X_prefix.shape[0]
         MIN_T = X_prefix[0, -1]
-        E0 = MIN_T / T * E_mag * jnp.eye(n, n, dtype=X_prefix.dtype)  # (n, n)
-        return jnp.broadcast_to(E0, (T, n, n))
+        E0 = MIN_T / (TP1 - 1) * E_mag * jnp.eye(n, n, dtype=X_prefix.dtype)  # (n, n)
+        E0 = E0.at[-1, -1].set(0.0)
+        return jnp.broadcast_to(E0, (TP1, n, n))
 
     return disturbance
 
@@ -323,10 +324,12 @@ def main():
     x_min = jnp.array([-15.0, -15.0, -jnp.inf, 0.0], dtype=jnp.float64)
     x_max = jnp.array([15.0, 15.0, jnp.inf, 10.0], dtype=jnp.float64)
     constraints_x = make_state_box_constraints(x_min, x_max)
+    terminal_center = jnp.array([0.5, 0.6])
+    terminal_half_width = jnp.array([0.1, 0.1])
     term_constraint = make_terminal_set_constraint(
-        alpha=jnp.array([0.5, 0.6]),
-        beta=jnp.array([0.1, 0.1]),
-        N=N
+        alpha=terminal_center,
+        beta=terminal_half_width,
+        N=N,
     )
 
     constraints_all = combine_constraints(constraints_x, constraints_u)
@@ -336,11 +339,11 @@ def main():
     obstacles = jnp.array([[0.0, 0.0, 0.3]], dtype=jnp.float64)
     n_obs = obstacles.shape[0]
     nc = 2 * nu + 2 * n + n_obs + 4
-    E_mag = 0.01
+    E_mag = 0.1
     disturbance = make_constant_disturbance(n=n, E_mag=E_mag)
 
-    x0 = jnp.array([-0.75, -0.75, 0.0, 0.0], dtype=jnp.float64)
-    x_goal = jnp.array([0.5, 0.6, 0.0, 0.0], dtype=jnp.float64)
+    x0 = jnp.array([-0.75, -0.75, 0.0, 1.0], dtype=jnp.float64)
+    x_goal = jnp.array([0.5, 0.6, 0.0, 1.0], dtype=jnp.float64)
 
     reference = make_straight_line_reference(
         x_start=x0,
@@ -367,10 +370,10 @@ def main():
     sls_cfg = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1e-2,
-        enable_fastsls=False,
+        enable_fastsls=True,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
-        warm_start=False,
+        warm_start=True,
         rti=False,
     )
 
@@ -397,43 +400,43 @@ def main():
         X_in=X_ref,
         U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float64),
     )
-
+    E = jnp.identity(n) * E_mag
+    E = E.at[-1, -1].set(0.0)
     # robust plan (single call in your script)
     N_ROLLOUTS = NUM_RANDOM + NUM_ADV
     u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
         x0=x0, reference=reference, parameter=parameter
     )
-    print("Computed Min Time:", X_pred[0, -1])
+    min_time = X_pred[0, -1]
+    print("Computed Min Time:", min_time)
     # -----------------------------
     # Rollout simulations with early stopping
     # -----------------------------
-    xs = np.full((N_ROLLOUTS, T_steps, 3), np.nan, dtype=np.float64)
-    disturbed = np.full((N_ROLLOUTS, T_steps, 3), np.nan, dtype=np.float64)
+    xs = np.full((N_ROLLOUTS, T_steps, n), np.nan, dtype=np.float64)
+    disturbed = np.full((N_ROLLOUTS, T_steps, n), np.nan, dtype=np.float64)
     stop_steps = np.full((N_ROLLOUTS,), T_steps, dtype=np.int32)
 
-    # for i in range(N_ROLLOUTS):
-    #     disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
-    #     x = x0
-    #     jax.debug.print(f"Rolling out iteration {i}")
-    #     for k in range(T_steps):
-    #         if bool(reached_goal_xy(x, x_goal, GOAL_TOL)):
-    #             stop_steps[i] = k
-    #             break
+    dt = min_time / N
 
-    #         disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
-    #         for j in range(k + 1):
-    #             disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
+    for i in range(N_ROLLOUTS):
+        disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
+        x = x0
+        jax.debug.print(f"Rolling out iteration {i}")
+        for k in range(T_steps):
+            disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
+            for j in range(k + 1):
+                disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
 
-    #         u = U_pred[k] + disturbance_feedback
+            u = U_pred[k] + disturbance_feedback
 
-    #         key, x, w = dubins_step_with_disturbance(key, x, u, E_sim, dt, i)
+            key, x, w = dubins_step_with_disturbance(key, x, u, E, dt, i)
 
-    #         disturbed[i, k, :2] = np.abs(np.asarray(X_pred[k + 1, :2] - x[:2]))
-    #         disturbed[i, k, 2]  = np.abs(np.asarray(wrap_to_pi(X_pred[k + 1, 2] - x[2])))
+            disturbed[i, k, :2] = np.abs(np.asarray(X_pred[k + 1, :2] - x[:2]))
+            disturbed[i, k, 2]  = np.abs(np.asarray(wrap_to_pi(X_pred[k + 1, 2] - x[2])))
 
-    #         disturbance_history.append(w)
-    #         xs[i, k] = np.asarray(x)
-            
+            disturbance_history.append(w)
+            xs[i, k] = np.asarray(x)
+
     plans_xy = []
     lowers_xy = []
     uppers_xy = []
@@ -453,6 +456,8 @@ def main():
         plans_xy=np.asarray(plans_xy),
         lowers_xy=np.asarray(lowers_xy),
         uppers_xy=np.asarray(uppers_xy),
+        goal_center=np.asarray(terminal_center),
+        goal_half_width=np.asarray(terminal_half_width),
         step_idx=0,
         tube_stride=1,
         filename="rollouts_tubes_centers.png",

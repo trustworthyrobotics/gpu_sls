@@ -30,9 +30,18 @@ class ADMMConfig:
     eps_rel: float = 1e-2
     rho_max: int = 1e5
     initial_rho: int = 1.0
+    regularized_rho_update: bool = False
 
     def tree_flatten(self):
-        children = (self.rho_update_frequency, self.max_iterations, self.eps_abs, self.eps_rel, self.rho_max, self.initial_rho)
+        children = (
+            self.rho_update_frequency,
+            self.max_iterations,
+            self.eps_abs,
+            self.eps_rel,
+            self.rho_max,
+            self.initial_rho,
+            self.regularized_rho_update,
+        )
         return children, None
 
     @classmethod
@@ -271,62 +280,127 @@ def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
     w_norm = jnp.linalg.norm(w.reshape(-1), ord=jnp.inf)
     y_norm = jnp.linalg.norm(y.reshape(-1), ord=jnp.inf)
 
-    # eps_pri = eps_abs + eps_rel * jnp.maximum(z_norm, w_norm)
-    eps_pri = eps_abs
+    eps_pri = eps_abs + eps_rel * jnp.maximum(z_norm, w_norm)
+    # eps_pri = eps_abs
     eps_dual = eps_abs + eps_rel * (rho * y_norm)
 
     return r_norm, s_norm, eps_pri, eps_dual
 
-def adaptive_rho_update(rp_norm, rd_norm, rho,
-                        clip_min=0.2, clip_max=5,
-                        rho_min=1e-4, rho_max=1e5,
-                        eps=1e-12):
+def adaptive_rho_update_regularized(
+    rp_norm,
+    rd_norm,
+    eps_pri,
+    eps_dual,
+    rho,
+    *,
+    regularization=1e-2,
+    damping=0.5,
+    balance_tolerance=1.2,
+    clip_min=0.5,
+    clip_max=2.0,
+    rho_min=1e-4,
+    rho_max=1e5,
+    eps=1e-12,
+):
     """
-    Adaptive rho update using residual ratio directly as scaling,
-    clipped to a bounded range.
+    Balance rho using residuals normalized by their convergence thresholds.
+
+    primal_relative = rp_norm / eps_pri
+    dual_relative   = rd_norm / eps_dual
+
+    The normalized residuals are smoothly regularized, and the rho scale is
+    damped and clipped to avoid oscillatory or overly aggressive updates.
     """
+    eps_pri_safe = jnp.maximum(eps_pri, eps)
+    eps_dual_safe = jnp.maximum(eps_dual, eps)
 
-    # Residual ratio as scaling factor
-    # scale = rp_norm / (rd_norm + eps)
+    primal_relative = rp_norm / eps_pri_safe
+    dual_relative = rd_norm / eps_dual_safe
 
-    # # Clip scaling factor
-    # scale = jnp.clip(scale, clip_min, clip_max)
+    primal_regularized = jnp.sqrt(
+        primal_relative**2 + regularization**2
+    )
+    dual_regularized = jnp.sqrt(
+        dual_relative**2 + regularization**2
+    )
 
-    # # Update rho with hard bounds
-    # rho_new = jnp.clip(rho * scale, rho_min, rho_max)
+    relative_ratio = primal_regularized / dual_regularized
 
+    raw_scale = relative_ratio**damping
+    bounded_scale = jnp.clip(raw_scale, clip_min, clip_max)
 
-    rd_eff = jnp.maximum(rd_norm, 1e-10)
-    # scale = jnp.sqrt(rp_norm / rd_eff)
-    scale = jnp.sqrt(rp_norm / rd_eff)
-    # scale = rp_norm / rd_eff
-    # scale = jnp.clip(scale, 0.5, 2.0)
+    balanced = jnp.logical_and(
+        relative_ratio <= balance_tolerance,
+        relative_ratio >= 1.0 / balance_tolerance,
+    )
+    scale = jnp.where(balanced, 1.0, bounded_scale)
+
     rho_new = jnp.clip(rho * scale, rho_min, rho_max)
-    updated = rho_new != rho
+    updated = jnp.logical_not(jnp.isclose(rho_new, rho))
     return rho_new, updated
-    
-    
-# def adaptive_rho_update(rp, rd, rho,
-#                         mu=10.0, tau=5.0,
-#                         rho_min=1e-3, rho_max=1e5):
-#     inc = rp > mu * rd
-#     dec = rd > mu * rp
-#     rho_new = jnp.where(inc, rho * tau, rho)
-#     rho_new = jnp.where(dec, rho / tau, rho_new)
-#     rho_new = jnp.clip(rho_new, rho_min, rho_max)
-#     updated = rho_new != rho
-#     return rho_new, updated
 
 
-def rho_update_y(rp_norm, rd_norm, rho, y, rho_max):
-    rho_new, updated = adaptive_rho_update(rp_norm, rd_norm, rho, rho_max=rho_max)
+def adaptive_rho_update(
+    rp_norm,
+    rd_norm,
+    rho,
+    *,
+    rho_min=1e-4,
+    rho_max=1e5,
+    eps=1e-12,
+):
+    """Original residual-ratio rho update without threshold regularization."""
+    rd_safe = jnp.maximum(rd_norm, eps)
+    scale = jnp.sqrt(rp_norm / rd_safe)
+    rho_new = jnp.clip(rho * scale, rho_min, rho_max)
+    updated = jnp.logical_not(jnp.isclose(rho_new, rho))
+    return rho_new, updated
+
+
+def rho_update_y(
+    rp_norm,
+    rd_norm,
+    eps_pri,
+    eps_dual,
+    rho,
+    y,
+    rho_max,
+    regularized_rho_update,
+):
+    def regularized_update(_):
+        return adaptive_rho_update_regularized(
+            rp_norm,
+            rd_norm,
+            eps_pri,
+            eps_dual,
+            rho,
+            rho_max=rho_max,
+        )
+
+    def unregularized_update(_):
+        return adaptive_rho_update(
+            rp_norm,
+            rd_norm,
+            rho,
+            rho_max=rho_max,
+        )
+
+    rho_new, updated = lax.cond(
+        regularized_rho_update,
+        regularized_update,
+        unregularized_update,
+        operand=None,
+    )
+
+    # y is the scaled dual variable, so preserve mu = rho * y.
     y_new = lax.cond(
         updated,
         lambda _: (rho / rho_new) * y,
         lambda _: y,
-        operand=None
+        operand=None,
     )
     return rho_new, y_new, updated
+
 
 def generate_leaf(tilde_Q, tilde_R, tilde_M, A, B, reg=1e-8):
     T = tilde_Q.shape[0] - 1
@@ -478,8 +552,14 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
         def update_fn(_):
             rho_upd, y_upd, updated = rho_update_y(
-                rp_norm, rd_norm,
-                rho, y_new, rho_max
+                rp_norm,
+                rd_norm,
+                eps_pri,
+                eps_dual,
+                rho,
+                y_new,
+                rho_max,
+                cfg.regularized_rho_update,
             )
             return rho_upd, y_upd, updated
 

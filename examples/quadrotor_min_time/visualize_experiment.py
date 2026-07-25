@@ -3,6 +3,7 @@ import os
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.patches import Rectangle
 
 
@@ -15,6 +16,8 @@ PALETTE = {
     "tube_edge": "#1b7f1b",   # darker green edge
     "obs_face":  "#7f7f7f",   # gray
     "obs_edge":  "#4d4d4d",   # dark gray edge
+    "goal_face": "#9467bd",   # purple
+    "goal_edge": "#5e3c99",   # darker purple edge
 }
 
 mpl.rcParams.update({
@@ -51,6 +54,198 @@ def _normalize_plan_array(arr, name: str):
     return arr
 
 
+def _box_faces(lower, upper):
+    """Return the six faces of an axis-aligned 3D box."""
+    x0, y0, z0 = lower
+    x1, y1, z1 = upper
+    vertices = np.array([
+        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+    ])
+    return [
+        vertices[[0, 1, 2, 3]], vertices[[4, 5, 6, 7]],
+        vertices[[0, 1, 5, 4]], vertices[[2, 3, 7, 6]],
+        vertices[[1, 2, 6, 5]], vertices[[3, 0, 4, 7]],
+    ]
+
+
+def _set_axes_equal_3d(ax, points, margin):
+    """Set equal physical scale on all three axes."""
+    points = np.asarray(points)
+    finite = points[np.all(np.isfinite(points), axis=1)]
+    if finite.size == 0:
+        finite = np.array([[0.0, 0.0, 0.0]])
+    lower = finite.min(axis=0)
+    upper = finite.max(axis=0)
+    center = 0.5 * (lower + upper)
+    radius = max(0.5 * float(np.max(upper - lower)) + margin, margin)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_box_aspect((1, 1, 1))
+
+
+def plot_quadrotor_3d(
+    xs,
+    plan,
+    lower=None,
+    upper=None,
+    centers=None,
+    radii=None,
+    goal_center=None,
+    goal_half_width=None,
+    tube_stride: int = 1,
+    tube_alpha: float = 0.08,
+    rollout_alpha: float = 0.45,
+    obstacle_height: tuple[float, float] | None = None,  # deprecated; ignored for spheres
+    margin: float = 0.2,
+    filename: str | None = "quadrotor_3d_rollouts_tube.png",
+    dpi: int = 300,
+    title: str = "Minimum-Time Quadrotor: 3D Rollouts + Robust Tube",
+):
+    """Plot quadrotor trajectories, robust boxes, spherical obstacles, and goal in 3D."""
+    xs = np.asarray(xs)
+    plan = np.asarray(plan)
+    if xs.ndim == 2:
+        xs = xs[None, ...]
+    if xs.ndim != 3 or xs.shape[-1] < 3:
+        raise ValueError(f"xs has shape {xs.shape}. Expected (n_rollouts, T, n>=3).")
+    if plan.ndim != 2 or plan.shape[-1] < 3:
+        raise ValueError(f"plan has shape {plan.shape}. Expected (T, n>=3).")
+
+    lower = None if lower is None else np.asarray(lower)
+    upper = None if upper is None else np.asarray(upper)
+    if (lower is None) != (upper is None):
+        raise ValueError("lower and upper must be provided together.")
+    if lower is not None and (lower.shape != upper.shape or lower.ndim != 2 or lower.shape[1] < 3):
+        raise ValueError("lower and upper must have matching shape (T, n>=3).")
+
+    centers = None if centers is None else np.atleast_2d(np.asarray(centers))
+    radii = None if radii is None else np.asarray(radii).reshape(-1)
+    if centers is not None and (
+        centers.shape[1] != 3
+        or radii is None
+        or len(radii) != len(centers)
+    ):
+        raise ValueError("centers and radii must have shapes (K, 3) and (K,).")
+
+    fig = plt.figure(figsize=(9, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    if lower is not None:
+        for k in range(0, len(lower), max(1, int(tube_stride))):
+            lo, up = lower[k, :3], upper[k, :3]
+            if not np.all(np.isfinite([lo, up])) or np.any(up < lo):
+                continue
+            ax.add_collection3d(Poly3DCollection(
+                _box_faces(lo, up),
+                facecolor=PALETTE["tube_face"],
+                edgecolor=PALETTE["tube_edge"],
+                linewidth=0.35,
+                alpha=tube_alpha,
+            ))
+        ax.plot([], [], [], color=PALETTE["tube_edge"], alpha=0.5, label="Robust tube")
+
+    if goal_center is not None and goal_half_width is not None:
+        center = np.asarray(goal_center).reshape(3)
+        half_width = np.asarray(goal_half_width).reshape(3)
+        ax.add_collection3d(Poly3DCollection(
+            _box_faces(center - half_width, center + half_width),
+            facecolor=PALETTE["goal_face"],
+            edgecolor=PALETTE["goal_edge"],
+            linewidth=1.2,
+            alpha=0.3,
+        ))
+        ax.plot([], [], [], color=PALETTE["goal_edge"], linewidth=3, label="Goal terminal set")
+
+    extent_points = [plan[:, :3]]
+    finite_positions = xs[..., :3].reshape(-1, 3)
+    extent_points.append(finite_positions)
+    if lower is not None:
+        extent_points.extend([lower[:, :3], upper[:, :3]])
+
+    if centers is not None:
+        # Spherical coordinates:
+        #   x = cx + r sin(phi) cos(theta)
+        #   y = cy + r sin(phi) sin(theta)
+        #   z = cz + r cos(phi)
+        theta = np.linspace(0.0, 2.0 * np.pi, 64)
+        phi = np.linspace(0.0, np.pi, 32)
+        theta_grid, phi_grid = np.meshgrid(theta, phi)
+
+        for index, (center, radius) in enumerate(zip(centers, radii)):
+            cx, cy, cz = center
+            radius = float(radius)
+
+            sphere_x = cx + radius * np.sin(phi_grid) * np.cos(theta_grid)
+            sphere_y = cy + radius * np.sin(phi_grid) * np.sin(theta_grid)
+            sphere_z = cz + radius * np.cos(phi_grid)
+
+            ax.plot_surface(
+                sphere_x,
+                sphere_y,
+                sphere_z,
+                color=PALETTE["obs_face"],
+                edgecolor=PALETTE["obs_edge"],
+                linewidth=0.15,
+                alpha=0.32,
+                shade=True,
+                antialiased=True,
+            )
+
+            # Include the full sphere bounds when computing equal axis limits.
+            extent_points.append(np.array([
+                [cx - radius, cy, cz],
+                [cx + radius, cy, cz],
+                [cx, cy - radius, cz],
+                [cx, cy + radius, cz],
+                [cx, cy, cz - radius],
+                [cx, cy, cz + radius],
+            ]))
+
+            if index == 0:
+                ax.plot(
+                    [], [], [],
+                    color=PALETTE["obs_edge"],
+                    linewidth=4,
+                    alpha=0.5,
+                    label="Spherical obstacle",
+                )
+
+    ax.plot(
+        plan[:, 0], plan[:, 1], plan[:, 2],
+        linestyle="--", linewidth=2.5, color=PALETTE["plan"], label="Planned trajectory",
+    )
+    valid_rollouts = 0
+    for rollout in xs:
+        valid = np.all(np.isfinite(rollout[:, :3]), axis=1)
+        if np.any(valid):
+            ax.plot(
+                rollout[valid, 0], rollout[valid, 1], rollout[valid, 2],
+                color=PALETTE["random"], alpha=rollout_alpha, linewidth=1.2,
+            )
+            valid_rollouts += 1
+    if valid_rollouts:
+        ax.plot([], [], [], color=PALETTE["random"], alpha=rollout_alpha,
+                label=f"Rollouts (n={valid_rollouts})")
+
+    ax.scatter(*plan[0, :3], color=PALETTE["plan"], marker="o", s=45, label="Start")
+    _set_axes_equal_3d(ax, np.concatenate(extent_points), margin)
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_zlabel("z (m)")
+    ax.set_title(title)
+    ax.view_init(elev=24, azim=-58)
+    ax.grid(True, alpha=0.35)
+    ax.legend(loc="upper left", framealpha=0.9)
+    plt.tight_layout()
+    if filename is None:
+        plt.show()
+    else:
+        plt.savefig(filename, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+
+
 def plot_rollouts_tubes_centers(
     xs,
     centers=None,
@@ -58,6 +253,8 @@ def plot_rollouts_tubes_centers(
     plans_xy=None,
     lowers_xy=None,
     uppers_xy=None,
+    goal_center=None,
+    goal_half_width=None,
     step_idx: int | None = 0,
     tube_stride: int = 2,
     tube_alpha: float = 0.15,
@@ -81,6 +278,8 @@ def plot_rollouts_tubes_centers(
       uppers_xy: (n_steps, N+1, 2) OR (N+1, 2)  (optional)
       centers:   (K, 2)                         (optional)
       radii:     (K,)                           (optional)
+      goal_center:     (3,)                      (optional)
+      goal_half_width: (3,)                      (optional)
 
     Notes:
       - For the 3D quadrotor state:
@@ -127,6 +326,15 @@ def plot_rollouts_tubes_centers(
     if radii is not None:
         radii = np.asarray(radii).reshape(-1)
 
+    if goal_center is not None:
+        goal_center = np.asarray(goal_center).reshape(3)
+    if goal_half_width is not None:
+        goal_half_width = np.asarray(goal_half_width).reshape(3)
+        if np.any(goal_half_width < 0.0):
+            raise ValueError("goal_half_width must be nonnegative.")
+    if (goal_center is None) != (goal_half_width is None):
+        raise ValueError("goal_center and goal_half_width must be provided together.")
+
     # pick tube/plan frame
     if lowers_xy is not None and uppers_xy is not None:
         step_idx = int(step_idx if step_idx is not None else 0)
@@ -151,6 +359,15 @@ def plot_rollouts_tubes_centers(
     if centers is not None and centers.size:
         all_x.append(centers[:, 0].ravel())
         all_y.append(centers[:, 1].ravel())
+    if goal_center is not None:
+        all_x.extend([
+            np.array([goal_center[ax_i] - goal_half_width[ax_i]]),
+            np.array([goal_center[ax_i] + goal_half_width[ax_i]]),
+        ])
+        all_y.extend([
+            np.array([goal_center[ax_j] - goal_half_width[ax_j]]),
+            np.array([goal_center[ax_j] + goal_half_width[ax_j]]),
+        ])
 
     all_x = np.concatenate(all_x) if len(all_x) else np.array([0.0])
     all_y = np.concatenate(all_y) if len(all_y) else np.array([0.0])
@@ -176,6 +393,24 @@ def plot_rollouts_tubes_centers(
                 color="tab:red",
             )
             ax.add_patch(circ)
+
+    # projected terminal goal set: |position - goal_center| <= goal_half_width
+    if goal_center is not None:
+        goal_lower = (
+            goal_center[ax_i] - goal_half_width[ax_i],
+            goal_center[ax_j] - goal_half_width[ax_j],
+        )
+        ax.add_patch(Rectangle(
+            goal_lower,
+            2.0 * goal_half_width[ax_i],
+            2.0 * goal_half_width[ax_j],
+            facecolor=PALETTE["goal_face"],
+            edgecolor=PALETTE["goal_edge"],
+            linewidth=2.0,
+            alpha=0.25,
+            label="Goal terminal set",
+            zorder=2,
+        ))
 
     # tubes
     if lo is not None and up is not None:

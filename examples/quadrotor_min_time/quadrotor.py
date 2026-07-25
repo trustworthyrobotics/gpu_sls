@@ -14,9 +14,9 @@ from gpu_sls.gpu_admm import ADMMConfig
 from gpu_sls.gpu_sls import SLSConfig
 from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
-from gpu_sls.utils.constraint_utils import combine_constraints, make_control_box_constraints, make_state_box_constraints, make_constant_disturbance
+from gpu_sls.utils.constraint_utils import combine_constraints, make_control_box_constraints, make_state_box_constraints
 from gpu_sls.utils.sls_visual import get_trajectory_tubes
-from visualize_experiment import plot_rollouts_tubes_centers, plot_tube_graph_quadrotor
+from visualize_experiment import plot_quadrotor_3d, plot_tube_graph_quadrotor
 
 config.update("jax_enable_x64", False)
 config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
@@ -39,7 +39,7 @@ def reached_goal_xyz(x: jnp.ndarray, x_goal: jnp.ndarray, tol: float = GOAL_TOL)
 
 # -----------------------------
 # 3D quadrotor parameters
-# x = [px, py, pz, phi, theta, psi, vx, vy, vz, p, q, r]
+# x = [px, py, pz, phi, theta, psi, vx, vy, vz, p, q, r, T]
 # u = [T, tau_phi, tau_theta, tau_psi]
 # -----------------------------
 MASS = 1.0
@@ -79,7 +79,7 @@ def euler_angle_rates_matrix(phi: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarra
     ], dtype=jnp.float64)
 
 def rigid_body_3d_step(x: jnp.ndarray, u: jnp.ndarray, dt: float) -> jnp.ndarray:
-    px, py, pz, phi, theta, psi, vx, vy, vz, p, q, r = x
+    px, py, pz, phi, theta, psi, vx, vy, vz, p, q, r = x[:12]
     T, tau_phi, tau_theta, tau_psi = u
 
     v = jnp.array([vx, vy, vz], dtype=x.dtype)
@@ -100,15 +100,16 @@ def rigid_body_3d_step(x: jnp.ndarray, u: jnp.ndarray, dt: float) -> jnp.ndarray
     omega_dot = J_INV @ (tau - jnp.cross(omega, J @ omega))
 
     x_dot = jnp.concatenate([pos_dot, euler_dot, v_dot, omega_dot], axis=0)
-    x_next = x + dt * x_dot
-
-    return x_next
+    physical_next = x[:12] + dt * x_dot
+    if x.shape[0] == 13:
+        return jnp.concatenate([physical_next, x[12:13]])
+    return physical_next
 
 def quadrotor_step_with_disturbance(
     key: jax.Array,
-    x: jnp.ndarray,      # (12,)
+    x: jnp.ndarray,      # (13,)
     u: jnp.ndarray,      # (4,)
-    E: jnp.ndarray,      # (12,12)
+    E: jnp.ndarray,      # (13,13)
     dt: float,
     i: int
 ) -> tuple[jax.Array, jnp.ndarray, jnp.ndarray]:
@@ -120,38 +121,38 @@ def quadrotor_step_with_disturbance(
     # Random disturbance in unit ball
     key, key_dir, key_rad = jax.random.split(key, 3)
 
-    z = jax.random.normal(key_dir, (x.shape[0],), dtype=x.dtype)
+    z = jax.random.normal(key_dir, (12,), dtype=x.dtype)
     z = z / (jnp.linalg.norm(z) + jnp.asarray(1e-12, dtype=x.dtype))
 
-    n = jnp.asarray(x.shape[0], dtype=x.dtype)
+    n = jnp.asarray(12, dtype=x.dtype)
     a = jnp.asarray(0.0, dtype=x.dtype)
     b = jnp.asarray(1.0, dtype=x.dtype)
 
     uu = jax.random.uniform(key_rad, (), dtype=x.dtype)
     r = (a**n + (b**n - a**n) * uu) ** (1.0 / n)
-    w = r * z
+    w = jnp.concatenate([r * z, jnp.zeros((1,), dtype=x.dtype)])
 
     # Deterministic adversarial-ish directions
     start = i - NUM_RANDOM + 5
     if 5 <= start <= 16:
         idx = start - 5
-        w = jnp.zeros((12,), dtype=x.dtype).at[idx].set(1.0)
+        w = jnp.zeros((13,), dtype=x.dtype).at[idx].set(1.0)
     if 17 <= start <= 28:
         idx = start - 17
-        w = jnp.zeros((12,), dtype=x.dtype).at[idx].set(-1.0)
+        w = jnp.zeros((13,), dtype=x.dtype).at[idx].set(-1.0)
     if start == 29:
-        w = jnp.ones((12,), dtype=x.dtype) / jnp.sqrt(jnp.asarray(12.0, dtype=x.dtype))
+        w = jnp.concatenate([jnp.ones((12,), dtype=x.dtype) / jnp.sqrt(jnp.asarray(12.0, dtype=x.dtype)), jnp.zeros((1,), dtype=x.dtype)])
     if start == 30:
-        w = -jnp.ones((12,), dtype=x.dtype) / jnp.sqrt(jnp.asarray(12.0, dtype=x.dtype))
+        w = jnp.concatenate([-jnp.ones((12,), dtype=x.dtype) / jnp.sqrt(jnp.asarray(12.0, dtype=x.dtype)), jnp.zeros((1,), dtype=x.dtype)])
 
     # Account for linearization error
-    w = w * 0.9
-    x_next = x_nom + E @ w 
+    w = w.at[-1].set(0.0)
+    x_next = x_nom + E @ w * dt
     return key, x_next, w
 
 def dynamics(x: jnp.ndarray, u: jnp.ndarray, t: jnp.ndarray, *, parameter: Any) -> jnp.ndarray:
-    dt = parameter
-    return rigid_body_3d_step(x, u, dt)
+    dtau = parameter
+    return rigid_body_3d_step(x, u, dtau * x[-1])
 
 def cost(W, reference, x, u, t):
     """
@@ -160,14 +161,14 @@ def cost(W, reference, x, u, t):
      wphi, wtheta, wpsi,
      wvx, wvy, wvz,
      wp, wq, wr,
-     wT, wtau_phi, wtau_theta, wtau_psi]
+     wT, wtau_phi, wtau_theta, wtau_psi, wtime]
     """
     (
         wpx, wpy, wpz,
         wphi, wtheta, wpsi,
         wvx, wvy, wvz,
         wp, wq, wr,
-        wT, wtau_phi, wtau_theta, wtau_psi
+        wT, wtau_phi, wtau_theta, wtau_psi, wtime
     ) = W
 
     xref = reference[t]
@@ -206,9 +207,10 @@ def cost(W, reference, x, u, t):
         + wtau_phi * du[1] ** 2
         + wtau_theta * du[2] ** 2
         + wtau_psi * du[3] ** 2
+        + wtime * x[-1]
     )
 
-def build_piecewise_reference(x0: jnp.ndarray, x_goal: jnp.ndarray, N: int, dt: float) -> jnp.ndarray:
+def build_piecewise_reference(x0: jnp.ndarray, x_goal: jnp.ndarray, N: int, duration: float) -> jnp.ndarray:
     """
     Build a straight-line reference trajectory from x0 to x_goal.
 
@@ -225,39 +227,114 @@ def build_piecewise_reference(x0: jnp.ndarray, x_goal: jnp.ndarray, N: int, dt: 
     dpsi = x_goal[5] - x0[5]
     psi = x0[5] + t * dpsi
 
-    X_ref = jnp.zeros((N + 1, 12), dtype=jnp.float64)
+    X_ref = jnp.zeros((N + 1, 13), dtype=jnp.float64)
 
     X_ref = X_ref.at[:, :3].set(pos)
     X_ref = X_ref.at[:, 5].set(psi)
 
     # Optionally compute velocity reference from the line
-    vel = (x_goal[:3] - x0[:3]) / (N * dt)
+    vel = (x_goal[:3] - x0[:3]) / duration
     X_ref = X_ref.at[:, 6:9].set(vel)
+    X_ref = X_ref.at[:, -1].set(duration)
 
     return X_ref
+
+def make_terminal_set_constraint(center: jnp.ndarray, half_width: jnp.ndarray, N: int):
+    """Enforce |x[:3] - center| <= half_width at the terminal step."""
+    center = jnp.asarray(center)
+    half_width = jnp.asarray(half_width)
+
+    def constraints(x, u, t):
+        terminal = jnp.concatenate([
+            x[:3] - center - half_width,
+            center - x[:3] - half_width,
+        ])
+        return jnp.where(t == N, terminal, -jnp.ones_like(terminal))
+
+    return constraints
+
+
+def make_min_time_disturbance(n: int, E_mag: float):
+    """Scale physical-state uncertainty by the optimized integration step."""
+    def disturbance(X_prefix: jnp.ndarray) -> jnp.ndarray:
+        dt = X_prefix[0, -1] / (X_prefix.shape[0] - 1)
+        E0 = dt * E_mag * jnp.eye(n, dtype=X_prefix.dtype)
+        E0 = E0.at[-1, -1].set(0.0)
+        return jnp.broadcast_to(E0, (X_prefix.shape[0], n, n))
+
+    return disturbance
+
+def make_sphere_obstacle_constraint(
+    center: jnp.ndarray,
+    radius: float,
+    clearance: float = 0.0,
+):
+    """
+    Create a smooth 3D spherical obstacle-avoidance constraint.
+
+    The returned constraint follows the convention:
+        g(x, u, t) <= 0
+
+    and enforces:
+        ||x[:3] - center||_2 >= radius + clearance
+
+    Args:
+        center:
+            Sphere center [cx, cy, cz], shape (3,).
+        radius:
+            Physical obstacle radius.
+        clearance:
+            Additional safety distance around the obstacle.
+
+    Returns:
+        constraints(x, u, t), returning shape (1,).
+    """
+    center = jnp.asarray(center)
+    safe_radius = jnp.asarray(radius + clearance)
+
+    def constraints(
+        x: jnp.ndarray,
+        u: jnp.ndarray,
+        t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        del u, t
+
+        displacement = x[:3] - center
+
+        # <= 0 outside/on the sphere; > 0 inside the sphere.
+        sphere_constraint = (
+            safe_radius**2
+            - jnp.dot(displacement, displacement)
+        )
+
+        return jnp.reshape(sphere_constraint, (1,))
+
+    return constraints
 
 def main():
     # -----------------------------
     # Dimensions
     # -----------------------------
-    n = 12
+    n = 13
     nu = 4
 
     # -----------------------------
     # Horizon and dt
     # -----------------------------
     N = 110
-    dt = 0.03
+    parameter = 1.0 / N
+    initial_duration = 2.0
 
     # -----------------------------
     # Cost weights
     # -----------------------------
     W = jnp.array([
-        25.0, 25.0, 25.0,     # position
-        2.0, 2.0, 0.5,        # roll, pitch, yaw
+        0.0, 0.0, 0.0,     # position
+        0.1, 0.1, 0.1,        # roll, pitch, yaw
         0.5, 0.5, 0.5,        # velocities
         0.05, 0.05, 0.05,     # body rates
-        0.01, 0.01, 0.01, 0.01  # control
+        0.01, 0.01, 0.01, 0.01,  # control
+        20.0                         # total time
     ], dtype=jnp.float64)
 
     cfg = MPCConfig(
@@ -266,10 +343,7 @@ def main():
         N=N,
         W=W,
         u_ref=jnp.array([MASS * GRAVITY, 0.0, 0.0, 0.0], dtype=jnp.float64),
-        dt=dt,
     )
-
-    parameter = dt
 
     # -----------------------------
     # Control limits
@@ -291,26 +365,37 @@ def main():
         jnp.pi / 2.0,           # theta
         10.0 * jnp.pi,          # psi
         5.0, 5.0, 5.0,          # vx, vy, vz
-        8.0, 8.0, 8.0           # p, q, r
+        8.0, 8.0, 8.0,          # p, q, r
+        20.0                      # total time
     ], dtype=jnp.float64)
     x_min = -x_max
     x_min = x_min.at[2].set(-1.0)
+    x_min = x_min.at[-1].set(0.1)
 
     constraints_x = make_state_box_constraints(x_min, x_max)
-    constraints_all = combine_constraints(constraints_x, constraints_u)
+    terminal_center = jnp.array([1.0, 0.8, 0.5], dtype=jnp.float64)
+    terminal_half_width = jnp.array([0.1, 0.1, 0.1], dtype=jnp.float64)
+    terminal_constraint = make_terminal_set_constraint(
+        terminal_center, terminal_half_width, N
+    )
+    obstacle_constraint = make_sphere_obstacle_constraint(
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64), radius=0.4
+    )
+    constraints_all = combine_constraints(
+        constraints_x, constraints_u, terminal_constraint, obstacle_constraint
+    )
 
-    obstacles = jnp.array([
-        [0.0, 0.0, 0.35],
-    ], dtype=jnp.float64)
+    # obstacles = jnp.array([
+    #     [0.0, 0.0, 0.35],
+    # ], dtype=jnp.float64)
 
-    # obstacles = jnp.array([])
+    obstacles = jnp.zeros((0, 3))
 
     n_obs = obstacles.shape[0]
-    nc = 2 * nu + 2 * n + n_obs
+    nc = 2 * nu + 2 * n + n_obs + 6 + 1
 
-    E_mag = 0.03
-    alpha_sim = E_mag * dt
-    disturbance = make_constant_disturbance(n=n, alpha=alpha_sim)
+    E_mag = 0.1
+    disturbance = make_min_time_disturbance(n=n, E_mag=E_mag)
 
     # -----------------------------
     # Initial / goal
@@ -319,51 +404,55 @@ def main():
         -0.75, -0.75, 0.25,    # px, py, pz
         0.0, 0.0, 0.0,          # phi, theta, psi
         0.0, 0.0, 0.0,          # vx, vy, vz
-        0.0, 0.0, 0.0           # p, q, r
+        0.0, 0.0, 0.0,          # p, q, r
+        initial_duration             # total time
     ], dtype=jnp.float64)
 
     x_goal = jnp.array([
         1.0, 0.8, 0.5,          # px, py, pz
         0.0, 0.0, 0.0,          # phi, theta, psi
         0.0, 0.0, 0.0,          # vx, vy, vz
-        0.0, 0.0, 0.0           # p, q, r
+        0.0, 0.0, 0.0,          # p, q, r
+        initial_duration             # total time
     ], dtype=jnp.float64)
 
-    X_ref = build_piecewise_reference(x0, x_goal, N, dt)
+    X_ref = build_piecewise_reference(x0, x_goal, N, initial_duration)
     reference = X_ref
     T_steps = N
 
     key = jax.random.PRNGKey(0)
-    E_sim = alpha_sim * jnp.eye(n, dtype=jnp.float64)
+    E_sim = E_mag * jnp.eye(n, dtype=jnp.float64)
+    E_sim = E_sim.at[-1, -1].set(0.0)
 
     # -----------------------------
     # Solver configs
     # -----------------------------
     admm_cfg = ADMMConfig(
         eps_abs=1e-1,
-        eps_rel=1e-2,
+        eps_rel=1e-3,
         rho_max=1e6,
-        max_iterations=400,
+        max_iterations=1000,
         rho_update_frequency=25,
         initial_rho=1.0,
+        regularized_rho_update=False,
     )
 
     sls_cfg = SLSConfig(
-        max_sls_iterations=2,
+        max_sls_iterations=1,
         sls_primal_tol=1e-2,
         enable_fastsls=True,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
-        warm_start=False,
+        warm_start=True,
         rti=False,
     )
 
     sqp_cfg = SQPConfig(
         max_sqp_iterations=50,
-        warm_start=False,
-        feas_tol=0.01,
-        step_tol=0.0001,
-        line_search=False,
+        warm_start=True,
+        feas_tol=1e-10,
+        step_tol=1e-10,
+        line_search=True,
     )
 
     controller = GenericMPC(
@@ -389,6 +478,9 @@ def main():
     u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
         x0=x0, reference=reference, parameter=parameter
     )
+    min_time = X_pred[0, -1]
+    dt = min_time / N
+    print("Computed Min Time:", min_time)
 
     # -----------------------------
     # Rollout simulations
@@ -399,7 +491,7 @@ def main():
 
     for i in range(N_ROLLOUTS):
         disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
-        x = x0
+        x = x0.at[-1].set(min_time)
         jax.debug.print("Rolling out iteration {}", i)
 
         for k in range(T_steps):
@@ -418,46 +510,36 @@ def main():
             disturbance_history.append(w)
             xs[i, k] = np.asarray(x)
 
-            # if bool(reached_goal_xyz(x, x_goal, GOAL_TOL)):
-            #     stop_steps[i] = k
-            #     break
-
     # -----------------------------
-    # Tube visualization
-    # NOTE:
-    # plotting is still 2D, using xy projection
+    # 3D tube visualization
     # -----------------------------
-    plans_xy = []
-    lowers_xy = []
-    uppers_xy = []
-
     tube = get_trajectory_tubes(Phi_x)
+    lower = X_pred[:, :3] - tube[:, :3]
+    upper = X_pred[:, :3] + tube[:, :3]
 
-    plan_xy = X_pred[:, :2]       # (px, py)
-    lower = plan_xy - tube[:, :2]
-    upper = plan_xy + tube[:, :2]
+    obstacle_centers = jnp.array([
+        [0.0, 0.0, 0.0],
+    ], dtype=jnp.float64)
 
-    plans_xy.append(plan_xy)
-    lowers_xy.append(lower)
-    uppers_xy.append(upper)
+    obstacle_radii = jnp.array([
+        0.40,
+    ], dtype=jnp.float64)
 
-    plot_rollouts_tubes_centers(
-        xs=xs,   # updated plotting helper can take nx >= 2
-        centers=np.asarray(obstacles[:, :2]),
-        radii=np.asarray(obstacles[:, 2]),
-        plans_xy=np.asarray(plans_xy),
-        lowers_xy=np.asarray(lowers_xy),
-        uppers_xy=np.asarray(uppers_xy),
-        step_idx=0,
+    plot_quadrotor_3d(
+        xs=xs,
+        plan=np.asarray(X_pred),
+        lower=np.asarray(lower),
+        upper=np.asarray(upper),
+        centers=np.asarray(obstacle_centers),
+        radii=np.asarray(obstacle_radii),
+        goal_center=np.asarray(terminal_center),
+        goal_half_width=np.asarray(terminal_half_width),
         tube_stride=1,
-        filename="quadrotor_3d_rollouts_xy_projection.png",
-        show_plan=False,
-        tube_alpha=0.1,
+        filename="quadrotor_3d_rollouts_tube.png",
+        tube_alpha=0.08,
         margin=0.2,
         rollout_alpha=0.5,
-        x_label="x",
-        y_label="y",
-        title="3D Quadrotor: XY Projection of Rollouts + Tube",
+        title="Minimum-Time Quadrotor: 3D Spherical Obstacles",
     )
 
     plot_tube_graph_quadrotor(
