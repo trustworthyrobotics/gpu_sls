@@ -367,30 +367,36 @@ def rho_update_y(
     rho_max,
     regularized_rho_update,
 ):
-    def regularized_update(_):
-        return adaptive_rho_update_regularized(
+    # def regularized_update(_):
+    #     return adaptive_rho_update_regularized(
+    #         rp_norm,
+    #         rd_norm,
+    #         eps_pri,
+    #         eps_dual,
+    #         rho,
+    #         rho_max=rho_max,
+    #     )
+
+    # def unregularized_update(_):
+    #     return adaptive_rho_update(
+    #         rp_norm,
+    #         rd_norm,
+    #         rho,
+    #         rho_max=rho_max,
+    #     )
+
+    # rho_new, updated = lax.cond(
+    #     regularized_rho_update,
+    #     regularized_update,
+    #     unregularized_update,
+    #     operand=None,
+    # )
+    rho_new, updated = adaptive_rho_update(
             rp_norm,
             rd_norm,
-            eps_pri,
-            eps_dual,
             rho,
             rho_max=rho_max,
         )
-
-    def unregularized_update(_):
-        return adaptive_rho_update(
-            rp_norm,
-            rd_norm,
-            rho,
-            rho_max=rho_max,
-        )
-
-    rho_new, updated = lax.cond(
-        regularized_rho_update,
-        regularized_update,
-        unregularized_update,
-        operand=None,
-    )
 
     # y is the scaled dual variable, so preserve mu = rho * y.
     y_new = lax.cond(

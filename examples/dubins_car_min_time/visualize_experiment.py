@@ -272,3 +272,70 @@ def plot_tube_graph(disturbed, tube, dt):
     plt.savefig("disturbance_vs_tube_size_xytheta_dubins.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
+
+
+
+def plot_controls(
+    controls,
+    dt,
+    u_min,
+    u_max,
+    filename: str | None = "dubins_controls.png",
+    dpi: int = 300,
+):
+    """Plot Dubins controls over time together with their box constraints."""
+    controls = np.asarray(controls)
+    u_min = np.asarray(u_min).reshape(-1)
+    u_max = np.asarray(u_max).reshape(-1)
+    dt = float(dt)
+
+    if controls.ndim != 2 or controls.shape[1] != 2:
+        raise ValueError(
+            f"controls has shape {controls.shape}. Expected (N, 2) for [v, omega]."
+        )
+    if u_min.shape != (2,) or u_max.shape != (2,):
+        raise ValueError("u_min and u_max must each have shape (2,).")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"dt must be positive and finite, got {dt}.")
+    if np.any(u_min > u_max):
+        raise ValueError("Each lower control bound must be <= its upper bound.")
+
+    labels = [(r"Velocity $v$", "m/s"), (r"Angular velocity $\omega$", "rad/s")]
+    time_edges = np.arange(controls.shape[0] + 1, dtype=float) * dt
+    fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
+
+    for i, (ax, (name, unit)) in enumerate(zip(axes, labels)):
+        ax.axhspan(u_min[i], u_max[i], color=PALETTE["tube_face"], alpha=0.08)
+        ax.axhline(
+            u_max[i],
+            color=PALETTE["adversary"],
+            linestyle="--",
+            linewidth=1.5,
+            label="Control limits" if i == 0 else None,
+        )
+        ax.axhline(
+            u_min[i],
+            color=PALETTE["adversary"],
+            linestyle="--",
+            linewidth=1.5,
+        )
+        ax.stairs(
+            controls[:, i],
+            time_edges,
+            color=PALETTE["plan"],
+            linewidth=2.0,
+            label="Planned control" if i == 0 else None,
+        )
+        ax.set_ylabel(f"{name}\n({unit})")
+        ax.grid(True, alpha=0.35)
+
+    axes[0].legend(loc="best", framealpha=0.9)
+    axes[-1].set_xlabel("Time (s)")
+    axes[-1].set_xlim(time_edges[0], time_edges[-1])
+    fig.suptitle("Dubins Car Controls and Maximum Limits")
+    plt.tight_layout()
+    if filename is None:
+        plt.show()
+    else:
+        plt.savefig(filename, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)

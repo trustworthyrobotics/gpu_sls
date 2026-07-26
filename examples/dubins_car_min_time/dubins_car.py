@@ -17,7 +17,7 @@ from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints
 from gpu_sls.utils.sls_visual import get_trajectory_tubes
-from visualize_experiment import plot_rollouts_tubes_centers, plot_tube_graph
+from visualize_experiment import plot_controls, plot_rollouts_tubes_centers, plot_tube_graph
 
 config.update("jax_enable_x64", False)
 
@@ -290,6 +290,61 @@ def make_constant_disturbance(
 
     return disturbance
 
+def make_circular_obstacle_constraints(
+    obstacles: jnp.ndarray,
+    margin: float = 0.0,
+    eps: float = 1e-8,
+) -> Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """
+    Create circular obstacle constraints of the form
+
+        radius_i + margin - ||x[:2] - center_i||_2 <= 0.
+
+    Parameters
+    ----------
+    obstacles:
+        Array with shape (num_obstacles, 3), where each row is
+
+            [center_x, center_y, radius].
+
+    margin:
+        Additional deterministic clearance around every obstacle.
+
+    eps:
+        Small regularization inside the square root. This prevents an
+        undefined derivative when the nominal state lies exactly at an
+        obstacle center.
+
+    Returns
+    -------
+    constraints:
+        Function with signature constraints(x, u, t) returning one scalar
+        inequality per obstacle.
+    """
+    obstacles = jnp.asarray(obstacles)
+
+    centers = obstacles[:, :2]
+    radii = obstacles[:, 2]
+
+    def constraints(
+        x: jnp.ndarray,
+        u: jnp.ndarray,
+        t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        del u, t
+
+        displacement = x[:2][None, :] - centers
+
+        # Smooth regularized distance:
+        # sqrt(||p-c||^2 + eps^2)
+        distance = jnp.sqrt(
+            jnp.sum(displacement * displacement, axis=-1) + eps**2
+        )
+
+        return radii + margin - distance
+
+    return constraints
+
 # -----------------------------
 # Main experiment
 # -----------------------------
@@ -302,27 +357,27 @@ def main():
     N = 90
 
     # Weights: (x, y, theta, v, omega, T)
-    W = jnp.array([0.1, 0.1, 0.1, 0.1, 0.1, 1.0], dtype=jnp.float64)
+    W = jnp.array([0.1, 0.1, 0.1, 0.1, 0.1, 1.0], dtype=jnp.float32)
 
     cfg = MPCConfig(
         n=n,
         nu=nu,
         N=N,
         W=W,
-        u_ref=jnp.zeros((nu,), dtype=jnp.float64),
+        u_ref=jnp.zeros((nu,), dtype=jnp.float32),
     )
 
     parameter = 1 / N
 
     v_max = 2.0
     om_max = 4.0
-    u_min = jnp.array([-v_max, -om_max], dtype=jnp.float64)
-    u_max = jnp.array([v_max, om_max], dtype=jnp.float64)
+    u_min = jnp.array([-v_max, -om_max], dtype=jnp.float32)
+    u_max = jnp.array([v_max, om_max], dtype=jnp.float32)
 
     constraints_u = make_control_box_constraints(u_min, u_max)
 
-    x_min = jnp.array([-15.0, -15.0, -jnp.inf, 0.0], dtype=jnp.float64)
-    x_max = jnp.array([15.0, 15.0, jnp.inf, 10.0], dtype=jnp.float64)
+    x_min = jnp.array([-15.0, -15.0, -jnp.inf, 0.0], dtype=jnp.float32)
+    x_max = jnp.array([15.0, 15.0, jnp.inf, 10.0], dtype=jnp.float32)
     constraints_x = make_state_box_constraints(x_min, x_max)
     terminal_center = jnp.array([0.5, 0.6])
     terminal_half_width = jnp.array([0.1, 0.1])
@@ -331,19 +386,23 @@ def main():
         beta=terminal_half_width,
         N=N,
     )
+    obstacles = jnp.array([[0.0, 0.0, 0.3]], dtype=jnp.float32)
+    constraints_obs = make_circular_obstacle_constraints(
+        obstacles=obstacles,
+        margin=0.0,
+        eps=1e-6,
+    )
 
-    constraints_all = combine_constraints(constraints_x, constraints_u)
-    constraints_all = combine_constraints(constraints_all, term_constraint)
+    constraints_all = combine_constraints(constraints_x, constraints_u, term_constraint, constraints_obs)
 
 
-    obstacles = jnp.array([[0.0, 0.0, 0.3]], dtype=jnp.float64)
     n_obs = obstacles.shape[0]
     nc = 2 * nu + 2 * n + n_obs + 4
     E_mag = 0.1
     disturbance = make_constant_disturbance(n=n, E_mag=E_mag)
 
-    x0 = jnp.array([-0.75, -0.75, 0.0, 1.0], dtype=jnp.float64)
-    x_goal = jnp.array([0.5, 0.6, 0.0, 1.0], dtype=jnp.float64)
+    x0 = jnp.array([-0.75, -0.75, 0.0, 1.0], dtype=jnp.float32)
+    x_goal = jnp.array([0.5, 0.6, 0.0, 1.0], dtype=jnp.float32)
 
     reference = make_straight_line_reference(
         x_start=x0,
@@ -360,11 +419,11 @@ def main():
     # -----------------------------
     admm_cfg = ADMMConfig(
         eps_abs=1e-2,
-        eps_rel=1e-2,
+        eps_rel=1e-3,
         rho_max=1e5,
-        max_iterations=1000,
+        max_iterations=400,
         rho_update_frequency=25,
-        initial_rho=1.0,
+        initial_rho=1e-2,
     )
 
     sls_cfg = SLSConfig(
@@ -392,13 +451,13 @@ def main():
         config=cfg,
         dynamics=dynamics,
         constraints=constraints_all,
-        obstacles=obstacles,
+        obstacles=jnp.zeros((0, 3)),
         cost=cost,
         num_constraints=nc,
         disturbance=disturbance,
         shift=1,
         X_in=X_ref,
-        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float64),
+        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float32),
     )
     E = jnp.identity(n) * E_mag
     E = E.at[-1, -1].set(0.0)
@@ -419,11 +478,11 @@ def main():
     dt = min_time / N
 
     for i in range(N_ROLLOUTS):
-        disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
+        disturbance_history = [jnp.zeros((n,), dtype=jnp.float32)]
         x = x0
         jax.debug.print(f"Rolling out iteration {i}")
         for k in range(T_steps):
-            disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
+            disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float32)
             for j in range(k + 1):
                 disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
 
@@ -470,6 +529,13 @@ def main():
         disturbed=disturbed,
         tube=tube,
         dt=X_pred[0, -1] / N
+    )
+    plot_controls(
+        controls=np.asarray(U_pred),
+        dt=dt,
+        u_min=np.asarray(u_min),
+        u_max=np.asarray(u_max),
+        filename="dubins_controls.png",
     )
 
 

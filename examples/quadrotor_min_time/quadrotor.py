@@ -16,16 +16,7 @@ from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints, make_control_box_constraints, make_state_box_constraints
 from gpu_sls.utils.sls_visual import get_trajectory_tubes
-from visualize_experiment import plot_quadrotor_3d, plot_tube_graph_quadrotor
-
-config.update("jax_enable_x64", False)
-config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-config.update("jax_persistent_cache_min_compile_time_secs", 0)
-config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-config.update(
-    "jax_persistent_cache_enable_xla_caches",
-    "xla_gpu_per_fusion_autotune_cache_dir",
-)
+from visualize_experiment import plot_controls, plot_quadrotor_3d, plot_tube_graph_quadrotor
 
 # -----------------------------
 # Goal stopping config
@@ -48,8 +39,8 @@ GRAVITY = 9.81
 JX = 0.02
 JY = 0.02
 JZ = 0.04
-J = jnp.diag(jnp.array([JX, JY, JZ], dtype=jnp.float64))
-J_INV = jnp.diag(jnp.array([1.0 / JX, 1.0 / JY, 1.0 / JZ], dtype=jnp.float64))
+J = jnp.diag(jnp.array([JX, JY, JZ], dtype=jnp.float32))
+J_INV = jnp.diag(jnp.array([1.0 / JX, 1.0 / JY, 1.0 / JZ], dtype=jnp.float32))
 
 NUM_RANDOM = 5
 NUM_ADV = 26
@@ -65,7 +56,7 @@ def rotation_matrix(phi: jnp.ndarray, theta: jnp.ndarray, psi: jnp.ndarray) -> j
         [cpsi * cth, cpsi * sth * sphi - spsi * cphi, cpsi * sth * cphi + spsi * sphi],
         [spsi * cth, spsi * sth * sphi + cpsi * cphi, spsi * sth * cphi - cpsi * sphi],
         [-sth,       cth * sphi,                          cth * cphi],
-    ], dtype=jnp.float64)
+    ], dtype=jnp.float32)
 
 def euler_angle_rates_matrix(phi: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarray:
     sphi, cphi = jnp.sin(phi), jnp.cos(phi)
@@ -76,7 +67,7 @@ def euler_angle_rates_matrix(phi: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarra
         [1.0, sphi * tth, cphi * tth],
         [0.0, cphi,       -sphi],
         [0.0, sphi / cth, cphi / cth],
-    ], dtype=jnp.float64)
+    ], dtype=jnp.float32)
 
 def rigid_body_3d_step(x: jnp.ndarray, u: jnp.ndarray, dt: float) -> jnp.ndarray:
     px, py, pz, phi, theta, psi, vx, vy, vz, p, q, r = x[:12]
@@ -227,7 +218,7 @@ def build_piecewise_reference(x0: jnp.ndarray, x_goal: jnp.ndarray, N: int, dura
     dpsi = x_goal[5] - x0[5]
     psi = x0[5] + t * dpsi
 
-    X_ref = jnp.zeros((N + 1, 13), dtype=jnp.float64)
+    X_ref = jnp.zeros((N + 1, 13), dtype=jnp.float32)
 
     X_ref = X_ref.at[:, :3].set(pos)
     X_ref = X_ref.at[:, 5].set(psi)
@@ -334,15 +325,15 @@ def main():
         0.5, 0.5, 0.5,        # velocities
         0.05, 0.05, 0.05,     # body rates
         0.01, 0.01, 0.01, 0.01,  # control
-        20.0                         # total time
-    ], dtype=jnp.float64)
+        5.0                         # total time
+    ], dtype=jnp.float32)
 
     cfg = MPCConfig(
         n=n,
         nu=nu,
         N=N,
         W=W,
-        u_ref=jnp.array([MASS * GRAVITY, 0.0, 0.0, 0.0], dtype=jnp.float64),
+        u_ref=jnp.array([MASS * GRAVITY, 0.0, 0.0, 0.0], dtype=jnp.float32),
     )
 
     # -----------------------------
@@ -352,8 +343,8 @@ def main():
     T_max = 2.0 * T_hover
     tau_max = 10.0
 
-    u_min = jnp.array([0.0, -tau_max, -tau_max, -tau_max], dtype=jnp.float64)
-    u_max = jnp.array([T_max, tau_max, tau_max, tau_max], dtype=jnp.float64)
+    u_min = jnp.array([0.0, -tau_max, -tau_max, -tau_max], dtype=jnp.float32)
+    u_max = jnp.array([T_max, tau_max, tau_max, tau_max], dtype=jnp.float32)
     constraints_u = make_control_box_constraints(u_min, u_max)
 
     # -----------------------------
@@ -367,19 +358,19 @@ def main():
         5.0, 5.0, 5.0,          # vx, vy, vz
         8.0, 8.0, 8.0,          # p, q, r
         20.0                      # total time
-    ], dtype=jnp.float64)
+    ], dtype=jnp.float32)
     x_min = -x_max
     x_min = x_min.at[2].set(-1.0)
     x_min = x_min.at[-1].set(0.1)
 
     constraints_x = make_state_box_constraints(x_min, x_max)
-    terminal_center = jnp.array([1.0, 0.8, 0.5], dtype=jnp.float64)
-    terminal_half_width = jnp.array([0.1, 0.1, 0.1], dtype=jnp.float64)
+    terminal_center = jnp.array([1.0, 0.8, 0.5], dtype=jnp.float32)
+    terminal_half_width = jnp.array([0.1, 0.1, 0.1], dtype=jnp.float32)
     terminal_constraint = make_terminal_set_constraint(
         terminal_center, terminal_half_width, N
     )
     obstacle_constraint = make_sphere_obstacle_constraint(
-        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64), radius=0.4
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32), radius=0.4
     )
     constraints_all = combine_constraints(
         constraints_x, constraints_u, terminal_constraint, obstacle_constraint
@@ -387,7 +378,7 @@ def main():
 
     # obstacles = jnp.array([
     #     [0.0, 0.0, 0.35],
-    # ], dtype=jnp.float64)
+    # ], dtype=jnp.float32)
 
     obstacles = jnp.zeros((0, 3))
 
@@ -401,12 +392,12 @@ def main():
     # Initial / goal
     # -----------------------------
     x0 = jnp.array([
-        -0.75, -0.75, 0.25,    # px, py, pz
+        -0.75, -0.75, -0.25,    # px, py, pz
         0.0, 0.0, 0.0,          # phi, theta, psi
         0.0, 0.0, 0.0,          # vx, vy, vz
         0.0, 0.0, 0.0,          # p, q, r
         initial_duration             # total time
-    ], dtype=jnp.float64)
+    ], dtype=jnp.float32)
 
     x_goal = jnp.array([
         1.0, 0.8, 0.5,          # px, py, pz
@@ -414,14 +405,14 @@ def main():
         0.0, 0.0, 0.0,          # vx, vy, vz
         0.0, 0.0, 0.0,          # p, q, r
         initial_duration             # total time
-    ], dtype=jnp.float64)
+    ], dtype=jnp.float32)
 
     X_ref = build_piecewise_reference(x0, x_goal, N, initial_duration)
     reference = X_ref
     T_steps = N
 
     key = jax.random.PRNGKey(0)
-    E_sim = E_mag * jnp.eye(n, dtype=jnp.float64)
+    E_sim = E_mag * jnp.eye(n, dtype=jnp.float32)
     E_sim = E_sim.at[-1, -1].set(0.0)
 
     # -----------------------------
@@ -431,7 +422,7 @@ def main():
         eps_abs=1e-1,
         eps_rel=1e-3,
         rho_max=1e6,
-        max_iterations=1000,
+        max_iterations=400,
         rho_update_frequency=25,
         initial_rho=1.0,
         regularized_rho_update=False,
@@ -440,7 +431,7 @@ def main():
     sls_cfg = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1e-2,
-        enable_fastsls=True,
+        enable_fastsls=False,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
         warm_start=True,
@@ -448,7 +439,7 @@ def main():
     )
 
     sqp_cfg = SQPConfig(
-        max_sqp_iterations=50,
+        max_sqp_iterations=0,
         warm_start=True,
         feas_tol=1e-10,
         step_tol=1e-10,
@@ -468,7 +459,7 @@ def main():
         disturbance=disturbance,
         shift=1,
         X_in=X_ref,
-        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float64).at[:, 0].set(T_hover),
+        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float32).at[:, 0].set(T_hover),
     )
 
     # -----------------------------
@@ -478,6 +469,13 @@ def main():
     u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
         x0=x0, reference=reference, parameter=parameter
     )
+    import time
+    start = time.perf_counter()
+    u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
+            x0=x0, reference=reference, parameter=parameter
+        )
+    end = time.perf_counter()
+    print(end - start)
     min_time = X_pred[0, -1]
     dt = min_time / N
     print("Computed Min Time:", min_time)
@@ -485,30 +483,30 @@ def main():
     # -----------------------------
     # Rollout simulations
     # -----------------------------
-    xs = np.full((N_ROLLOUTS, T_steps, n), np.nan, dtype=np.float64)
-    disturbed = np.full((N_ROLLOUTS, T_steps, n), np.nan, dtype=np.float64)
+    xs = np.full((N_ROLLOUTS, T_steps, n), np.nan, dtype=np.float32)
+    disturbed = np.full((N_ROLLOUTS, T_steps, n), np.nan, dtype=np.float32)
     stop_steps = np.full((N_ROLLOUTS,), T_steps, dtype=np.int32)
 
-    for i in range(N_ROLLOUTS):
-        disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
-        x = x0.at[-1].set(min_time)
-        jax.debug.print("Rolling out iteration {}", i)
+    # for i in range(N_ROLLOUTS):
+    #     disturbance_history = [jnp.zeros((n,), dtype=jnp.float32)]
+    #     x = x0.at[-1].set(min_time)
+    #     jax.debug.print("Rolling out iteration {}", i)
 
-        for k in range(T_steps):
-            disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
-            for j in range(k + 1):
-                disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
+    #     for k in range(T_steps):
+    #         disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float32)
+    #         for j in range(k + 1):
+    #             disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
 
-            u = U_pred[k] + disturbance_feedback
-            u = jnp.clip(u, u_min, u_max)
+    #         u = U_pred[k] + disturbance_feedback
+    #         u = jnp.clip(u, u_min, u_max)
 
-            key, x, w = quadrotor_step_with_disturbance(key, x, u, E_sim, dt, i)
+    #         key, x, w = quadrotor_step_with_disturbance(key, x, u, E_sim, dt, i)
 
-            err = np.abs(np.asarray(X_pred[k + 1] - x))
+    #         err = np.abs(np.asarray(X_pred[k + 1] - x))
 
-            disturbed[i, k, :] = err
-            disturbance_history.append(w)
-            xs[i, k] = np.asarray(x)
+    #         disturbed[i, k, :] = err
+    #         disturbance_history.append(w)
+    #         xs[i, k] = np.asarray(x)
 
     # -----------------------------
     # 3D tube visualization
@@ -519,11 +517,11 @@ def main():
 
     obstacle_centers = jnp.array([
         [0.0, 0.0, 0.0],
-    ], dtype=jnp.float64)
+    ], dtype=jnp.float32)
 
     obstacle_radii = jnp.array([
         0.40,
-    ], dtype=jnp.float64)
+    ], dtype=jnp.float32)
 
     plot_quadrotor_3d(
         xs=xs,
@@ -547,6 +545,13 @@ def main():
         tube=tube[:, :6],
         dt=dt,
         filename="quadrotor_3d_disturbance_vs_tube_size_pose.png",
+    )
+    plot_controls(
+        controls=np.asarray(U_pred),
+        dt=dt,
+        u_min=np.asarray(u_min),
+        u_max=np.asarray(u_max),
+        filename="quadrotor_controls.png",
     )
 
 

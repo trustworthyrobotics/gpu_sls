@@ -62,7 +62,7 @@ def filter_model_evaluator_factory(model_evaluator, constraints, backoffs):
         t = jnp.arange(T + 1)
 
         g_base = vectorize(constraints)(X, U_pad, t)
-        g_base_tight = g_base + backoffs
+        g_base_tight = g_base + backoffs + 1e-2
 
         g_all = g_base_tight
         g_viol = jnp.maximum(g_all, 0.0)

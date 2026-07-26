@@ -547,3 +547,96 @@ def plot_tube_graph_quadrotor(
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_controls(
+    controls,
+    dt,
+    u_min,
+    u_max,
+    filename: str | None = "quadrotor_controls.png",
+    dpi: int = 300,
+    control_labels: list | None = None,
+):
+    """Plot the zero-order-held control trajectory and its box constraints."""
+    controls = np.asarray(controls)
+    u_min = np.asarray(u_min).reshape(-1)
+    u_max = np.asarray(u_max).reshape(-1)
+    dt = float(dt)
+
+    if controls.ndim != 2:
+        raise ValueError(
+            f"controls has shape {controls.shape}. Expected (N, n_controls)."
+        )
+    n_steps, n_controls = controls.shape
+    if u_min.shape != (n_controls,) or u_max.shape != (n_controls,):
+        raise ValueError(
+            "u_min and u_max must each have one entry per control; "
+            f"got {u_min.shape}, {u_max.shape}, and {n_controls} controls."
+        )
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"dt must be positive and finite, got {dt}.")
+    if np.any(u_min > u_max):
+        raise ValueError("Each lower control bound must be <= its upper bound.")
+
+    if control_labels is None:
+        default_labels = [
+            (r"Thrust $T$", "N"),
+            (r"Roll torque $\tau_x$", r"N$\cdot$m"),
+            (r"Pitch torque $\tau_y$", r"N$\cdot$m"),
+            (r"Yaw torque $\tau_z$", r"N$\cdot$m"),
+        ]
+        control_labels = (
+            default_labels
+            if n_controls == len(default_labels)
+            else [(rf"$u_{i}$", "control") for i in range(n_controls)]
+        )
+    if len(control_labels) != n_controls:
+        raise ValueError("control_labels must have one (name, unit) pair per control.")
+
+    time_edges = np.arange(n_steps + 1, dtype=float) * dt
+    fig, axes = plt.subplots(
+        n_controls,
+        1,
+        figsize=(9, 2.2 * n_controls + 1),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for i, ax in enumerate(axes[:, 0]):
+        lower = float(u_min[i])
+        upper = float(u_max[i])
+        ax.axhspan(lower, upper, color=PALETTE["tube_face"], alpha=0.08)
+        ax.axhline(
+            upper,
+            color=PALETTE["adversary"],
+            linestyle="--",
+            linewidth=1.5,
+            label="Control bounds" if i == 0 else None,
+        )
+        ax.axhline(
+            lower,
+            color=PALETTE["adversary"],
+            linestyle="--",
+            linewidth=1.5,
+        )
+        ax.stairs(
+            controls[:, i],
+            time_edges,
+            color=PALETTE["plan"],
+            linewidth=2.0,
+            label="Planned control" if i == 0 else None,
+        )
+        ax.set_ylabel(f"{control_labels[i][0]}\n({control_labels[i][1]})")
+        ax.grid(True, alpha=0.35)
+
+    axes[0, 0].legend(loc="best", framealpha=0.9)
+    axes[-1, 0].set_xlabel("Time (s)")
+    axes[-1, 0].set_xlim(time_edges[0], time_edges[-1])
+    fig.suptitle("Quadrotor Controls and Constraints")
+    plt.tight_layout()
+    if filename is None:
+        plt.show()
+    else:
+        plt.savefig(filename, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
