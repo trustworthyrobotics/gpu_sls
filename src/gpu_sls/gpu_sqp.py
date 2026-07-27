@@ -52,8 +52,7 @@ def model_evaluator_helper_min_time(cost, dynamics,x0, X, U):
 
     return g, c
 
-def filter_model_evaluator_factory(model_evaluator, constraints, backoffs):
-    # TODO: Might need to add the fact that we inflate obstalces by 1e-2
+def filter_model_evaluator_factory(model_evaluator, constraints, backoffs, eps_abs):
     def filter_model_evaluator(X, U):
         cost, c_dyn = model_evaluator(X, U)
 
@@ -62,7 +61,7 @@ def filter_model_evaluator_factory(model_evaluator, constraints, backoffs):
         t = jnp.arange(T + 1)
 
         g_base = vectorize(constraints)(X, U_pad, t)
-        g_base_tight = g_base + backoffs + 1e-2
+        g_base_tight = g_base + backoffs + eps_abs
 
         g_all = g_base_tight
         g_viol = jnp.maximum(g_all, 0.0)
@@ -266,9 +265,10 @@ def sqp(
             g, c = model_evaluator(X_curr, U_curr)
             feas = jnp.max(jnp.abs(c))
             warm_flag = jnp.logical_and(jnp.array(bool(sqp_config.warm_start)), converged_admm)
-
+            # warm_flag = jnp.logical_and(warm_flag, jnp.array(i != sls_config.max_initial_sqp_iterations))
             # Turn this off? seems to be more optimal
             w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
+            # w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
             rho0 = lax.select(warm_flag, rho, jnp.asarray(admm_config.initial_rho, dtype=rho.dtype))
             h_ct_ws = backoffs
@@ -293,12 +293,13 @@ def sqp(
 
             feas_ok = feas <= sqp_config.feas_tol
             step_ok = step <= sqp_config.step_tol * (1.0 + z_norm)
-            # jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
+            jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
             converged1 = jnp.logical_and(feas_ok, step_ok)
             filter_model_evaluator = filter_model_evaluator_factory(
                 model_evaluator,
                 constraints,
                 backoffs1,
+                admm_config.eps_abs
             )
             current_cost, current_c_filter = filter_model_evaluator(X_curr, U_curr)
 

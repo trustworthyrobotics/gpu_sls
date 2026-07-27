@@ -16,7 +16,13 @@ from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints, make_control_box_constraints, make_state_box_constraints
 from gpu_sls.utils.sls_visual import get_trajectory_tubes
-from visualize_experiment import plot_controls, plot_quadrotor_3d, plot_tube_graph_quadrotor
+from visualize_experiment import plot_controls, plot_quadrotor_3d, plot_tube_graph_quadrotor, plot_top_down_tubes_goal_obstacles
+
+#export ACADOS_SOURCE_DIR=/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/acados_baseline/acados
+# export LD_LIBRARY_PATH="$ACADOS_SOURCE_DIR/lib:${LD_LIBRARY_PATH:-}"
+#
+#
+
 
 # -----------------------------
 # Goal stopping config
@@ -245,13 +251,46 @@ def make_terminal_set_constraint(center: jnp.ndarray, half_width: jnp.ndarray, N
     return constraints
 
 
-def make_min_time_disturbance(n: int, E_mag: float):
-    """Scale physical-state uncertainty by the optimized integration step."""
+# def make_min_time_disturbance(n: int, E_mag: float):
+#     """Scale physical-state uncertainty by the optimized integration step."""
+#     def disturbance(X_prefix: jnp.ndarray) -> jnp.ndarray:
+#         dt = X_prefix[0, -1] / (X_prefix.shape[0] - 1)
+#         E0 = dt * E_mag * jnp.eye(n, dtype=X_prefix.dtype)
+#         E0 = E0.at[-1, -1].set(0.0)
+#         return jnp.broadcast_to(E0, (X_prefix.shape[0], n, n))
+
+#     return disturbance
+
+def make_min_time_disturbance(
+    n: int,
+    E_mag: float,
+    disturbance_index: int = 6,
+):
+    """Disturbance acts only on v_x.
+
+    The disturbance channel is
+
+        x_{k+1} = f(x_k, u_k) + dt * E_mag * e_vx * w_vx,
+
+    where v_x is state index 6.
+
+    The full (n, n) matrix is retained because the SLS implementation
+    expects an n-dimensional disturbance vector.
+    """
     def disturbance(X_prefix: jnp.ndarray) -> jnp.ndarray:
-        dt = X_prefix[0, -1] / (X_prefix.shape[0] - 1)
-        E0 = dt * E_mag * jnp.eye(n, dtype=X_prefix.dtype)
-        E0 = E0.at[-1, -1].set(0.0)
-        return jnp.broadcast_to(E0, (X_prefix.shape[0], n, n))
+        N = X_prefix.shape[0] - 1
+        final_time = X_prefix[0, -1]
+        dt = final_time / N
+
+        E0 = jnp.zeros((n, n), dtype=X_prefix.dtype)
+        E0 = E0.at[disturbance_index, disturbance_index].set(
+            dt * E_mag
+        )
+
+        return jnp.broadcast_to(
+            E0,
+            (X_prefix.shape[0], n, n),
+        )
 
     return disturbance
 
@@ -319,14 +358,23 @@ def main():
     # -----------------------------
     # Cost weights
     # -----------------------------
+    # W = jnp.array([
+    #     0.0, 0.0, 0.0,     # position
+    #     0.1, 0.1, 0.1,        # roll, pitch, yaw
+    #     0.5, 0.5, 0.5,        # velocities
+    #     0.05, 0.05, 0.05,     # body rates
+    #     0.01, 0.01, 0.01, 0.01,  # control
+    #     5.0                         # total time
+    # ], dtype=jnp.float32)
     W = jnp.array([
-        0.0, 0.0, 0.0,     # position
-        0.1, 0.1, 0.1,        # roll, pitch, yaw
-        0.5, 0.5, 0.5,        # velocities
-        0.05, 0.05, 0.05,     # body rates
+        0.01, 0.01, 0.01,     # position
+        0.01, 0.01, 0.01,        # roll, pitch, yaw
+        0.01, 0.01, 0.01,        # velocities
+        0.01, 0.01, 0.01,     # body rates
         0.01, 0.01, 0.01, 0.01,  # control
         5.0                         # total time
     ], dtype=jnp.float32)
+    
 
     cfg = MPCConfig(
         n=n,
@@ -364,8 +412,8 @@ def main():
     x_min = x_min.at[-1].set(0.1)
 
     constraints_x = make_state_box_constraints(x_min, x_max)
-    terminal_center = jnp.array([1.0, 0.8, 0.5], dtype=jnp.float32)
-    terminal_half_width = jnp.array([0.1, 0.1, 0.1], dtype=jnp.float32)
+    terminal_center = jnp.array([1.0, 0.1, 0.5], dtype=jnp.float32)
+    terminal_half_width = jnp.array([0.2, 0.2, 0.2], dtype=jnp.float32)
     terminal_constraint = make_terminal_set_constraint(
         terminal_center, terminal_half_width, N
     )
@@ -392,7 +440,7 @@ def main():
     # Initial / goal
     # -----------------------------
     x0 = jnp.array([
-        -0.75, -0.75, -0.25,    # px, py, pz
+        -0.75, -0.1, 0.25,    # px, py, pz
         0.0, 0.0, 0.0,          # phi, theta, psi
         0.0, 0.0, 0.0,          # vx, vy, vz
         0.0, 0.0, 0.0,          # p, q, r
@@ -400,7 +448,7 @@ def main():
     ], dtype=jnp.float32)
 
     x_goal = jnp.array([
-        1.0, 0.8, 0.5,          # px, py, pz
+        1.0, 0.1, 0.5,          # px, py, pz
         0.0, 0.0, 0.0,          # phi, theta, psi
         0.0, 0.0, 0.0,          # vx, vy, vz
         0.0, 0.0, 0.0,          # p, q, r
@@ -419,19 +467,19 @@ def main():
     # Solver configs
     # -----------------------------
     admm_cfg = ADMMConfig(
-        eps_abs=1e-1,
-        eps_rel=1e-3,
-        rho_max=1e6,
-        max_iterations=400,
+        eps_abs=1e-2,
+        eps_rel=1e-2,
+        rho_max=1e3,
+        max_iterations=1000,
         rho_update_frequency=25,
-        initial_rho=1.0,
+        initial_rho=1e-2,
         regularized_rho_update=False,
     )
 
     sls_cfg = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1e-2,
-        enable_fastsls=False,
+        enable_fastsls=True,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
         warm_start=True,
@@ -439,7 +487,7 @@ def main():
     )
 
     sqp_cfg = SQPConfig(
-        max_sqp_iterations=0,
+        max_sqp_iterations=50,
         warm_start=True,
         feas_tol=1e-10,
         step_tol=1e-10,
@@ -470,12 +518,12 @@ def main():
         x0=x0, reference=reference, parameter=parameter
     )
     import time
-    start = time.perf_counter()
-    u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
-            x0=x0, reference=reference, parameter=parameter
-        )
-    end = time.perf_counter()
-    print(end - start)
+    # start = time.perf_counter()
+    # u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
+    #         x0=x0, reference=reference, parameter=parameter
+    #     )
+    # end = time.perf_counter()
+    # print(end - start)
     min_time = X_pred[0, -1]
     dt = min_time / N
     print("Computed Min Time:", min_time)
@@ -552,6 +600,17 @@ def main():
         u_min=np.asarray(u_min),
         u_max=np.asarray(u_max),
         filename="quadrotor_controls.png",
+    )
+    plot_top_down_tubes_goal_obstacles(
+        plan=X_pred,
+        lower=lower,
+        upper=upper,
+        centers=obstacle_centers,
+        radii=obstacle_radii,
+        goal_center=np.asarray(terminal_center),
+        goal_half_width=np.asarray(terminal_half_width),
+        tube_stride=1,
+        filename="quadrotor_top_down_tubes.png",
     )
 
 
