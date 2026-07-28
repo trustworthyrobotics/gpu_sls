@@ -88,6 +88,14 @@ class GenericMPC:
             )
         )
 
+        self.P_ws = jnp.zeros(
+            (config.N, config.N +1, config.n, config.n)
+        )
+
+        self.K_kj_ws = jnp.zeros(
+            (config.N, config.N + 1, config.nu, config.n)
+        )
+
         self.converged_admm = False
 
         self.U0 = U_in
@@ -150,6 +158,7 @@ class GenericMPC:
             Phi_u,
             betaN,
             muN,
+            PN, K_kjN,
             converged_admm,
         ) = self._solve(
             reference,
@@ -168,6 +177,7 @@ class GenericMPC:
             self.mu_ws,
             self.Phi_x_ws,
             self.Phi_u_ws,
+            self.P_ws, self.K_kj_ws,
             self.converged_admm,
         )
 
@@ -197,6 +207,9 @@ class GenericMPC:
         self.U0 = shift_and_pad(U)
         self.X0 = shift_and_pad(X)
         self.V0 = shift_and_pad(V)
+
+        self.P_ws = PN
+        self.K_kj_ws = K_kjN
 
         # Constraint and tube warm starts
         self.h_ct_ws = shift_and_pad(backoffs)

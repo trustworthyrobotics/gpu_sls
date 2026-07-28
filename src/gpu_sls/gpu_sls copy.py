@@ -322,39 +322,54 @@ def add_obstacle_tightenings(
 #     return h_ct
 
 def smooth_row_norm(A: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
-    """Smooth Euclidean row norm used by the ellipsoidal tightening."""
-    return jnp.sqrt(jnp.sum(jnp.square(A), axis=-1) + eps)
+    return jnp.sqrt(
+        jnp.sum(jnp.square(A), axis=-1) + eps
+    )
 
-
-def tightening_from_nominal_state(
+def local_tightening_jacobian(
     disturbance_fn,
-    x_nom: jnp.ndarray,
-    A: jnp.ndarray,
-    B: jnp.ndarray,
-    P: jnp.ndarray,
-    K_kj: jnp.ndarray,
-    C_box: jnp.ndarray,
-    D_box: jnp.ndarray,
-) -> jnp.ndarray:
-    """Recompute the complete tightening sequence from the nominal states.
-
-    The controller response ``P, K_kj`` and linearized dynamics ``A, B`` are
-    intentionally frozen.  Therefore autodiff captures only the dependence
-
-        x_j -> E(x_j) -> Phi_{k,j} -> h_k,
-
-    including the effect of every previous disturbance injection on every
-    later-stage tightening.
-
-    Returns
-    -------
-    h_ct : (T + 1, nc)
+    primal_pos,
+    C_box,
+    D_box,
+    K_kj,
+):
     """
-    E = disturbance_fn(x_nom)
-    Phi_x, Phi_u = forward_rollout(E, A, B, P, K_kj)
-    beta = get_betas(C_box, D_box, Phi_x, Phi_u)
-    return get_constraint_tightenings(beta)
+    Computes dh_k / dx_k.
 
+    primal_pos: (T + 1, nx)
+    returns:    (T + 1, nc, nx)
+    """
+    T = K_kj.shape[0]
+
+    disturbance_at_state = disturbance_fn.at_state
+
+    def stage_jacobian(k):
+        def h_k(x_k):
+            E_k = disturbance_at_state(x_k)                # (nx, nw)
+            G_k = C_box[k] + D_box[k] @ K_kj[k, k]         # (nc, nx)
+            # G_k = C_box[k]
+            return smooth_row_norm(G_k @ E_k)
+
+        return jax.jacrev(h_k)(primal_pos[k])               # (nc, nx)
+
+    dh_dx_stage = lax.map(
+        stage_jacobian,
+        jnp.arange(T),
+    )
+
+    def h_terminal(x_T):
+        E_T = disturbance_at_state(x_T)
+        return smooth_row_norm(C_box[T] @ E_T)
+
+    dh_dx_terminal = jax.jacrev(h_terminal)(primal_pos[T])
+
+    return jnp.concatenate(
+        [
+            dh_dx_stage,
+            dh_dx_terminal[None, :, :],
+        ],
+        axis=0,
+    )
 
 @partial(jit, static_argnums=(0, 1, 16))
 def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
@@ -408,9 +423,25 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
         rho = lax.select(warm_flag, rho, jnp.array(cfg.initial_rho, dtype=rho.dtype))
         C_box = C[:, :num_regular_constraints, :]
         D_box = D[:, :num_regular_constraints, :]
-        # C_combined = C + dh_dx_all
+        # dh_dx_full = jax.jacrev(tightening_from_nominal_state, argnums=1)(
+        #     disturbance_fn, primal_pos,
+        #     A, B,
+        #     P_prev, K_kj_prev,
+        #     C_box, D_box)
+        # k_idx = jnp.arange(Tp1)
+        # dh_dx_local = dh_dx_full[k_idx, :, k_idx, :]
+        dh_dx_local = local_tightening_jacobian(
+            disturbance_fn,
+            primal_pos,
+            C_box,
+            D_box,
+            K_kj_prev,
+        )
+        dh_dx_local = dh_dx_local.at[..., -1].set(0.0)
+        jax.debug.print("{}", dh_dx_local)
+        C_combined = C + dh_dx_local
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
-            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
+            cfg, Q, q, R, r, M, A, B, c, C_combined, D, tightened_constraints_all, w, y, rho
         )
         prev_rho = rho
 

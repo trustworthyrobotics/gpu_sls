@@ -1,0 +1,53 @@
+W0727 17:07:49.989832   78793 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0727 17:07:49.991464   78668 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+Traceback (most recent call last):
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/examples/quadrotor_min_time/quadrotor.py", line 662, in <module>
+    main()
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/examples/quadrotor_min_time/quadrotor.py", line 561, in main
+    u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
+                                                         ^^^^^^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/src/gpu_sls/generic_mpc.py", line 163, in run
+    ) = self._solve(
+        ^^^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/src/gpu_sls/gpu_sqp.py", line 345, in sqp
+    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u, betaN, muN, PN, K_kjN, converged_admm = lax.fori_loop(
+                                                                                                                                             ^^^^^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/src/gpu_sls/gpu_sqp.py", line 341, in body
+    return lax.cond(converged, do_nothing, do_iter, operand=None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/src/gpu_sls/gpu_sqp.py", line 276, in do_iter
+    dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN, PN, K_kjN, converged_admm_new = compute_search_direction(
+                                                                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/src/gpu_sls/gpu_sqp.py", line 198, in compute_search_direction
+    C, D = linearize(constraints)(X, U_pad, t)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeff/miniconda3/envs/gpu_sls_min_time/lib/python3.11/site-packages/trajax/optimizers.py", line 105, in vfun
+    return vmap(
+           ^^^^^
+  File "/home/jeff/miniconda3/envs/gpu_sls_min_time/lib/python3.11/site-packages/trajax/optimizers.py", line 104, in <lambda>
+    _fun = lambda tup, *margs: fun(*(margs + tup))
+                               ^^^^^^^^^^^^^^^^^^^
+  File "/home/jeff/miniconda3/envs/gpu_sls_min_time/lib/python3.11/site-packages/trajax/optimizers.py", line 144, in linearizer
+    return jacobian_x(*args), jacobian_u(*args)
+           ^^^^^^^^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/src/gpu_sls/utils/constraint_utils.py", line 10, in constraints
+    parts = [f(x, u, t) for f in funcs]
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/src/gpu_sls/utils/constraint_utils.py", line 10, in <listcomp>
+    parts = [f(x, u, t) for f in funcs]
+             ^^^^^^^^^^
+  File "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/gpu_sls/examples/quadrotor_min_time/quadrotor.py", line 247, in constraints
+    center - x[:3] - half_width,
+    ~~~~~~~~~~~~~~~^~~~~~~~~~~~
+  File "/home/jeff/miniconda3/envs/gpu_sls_min_time/lib/python3.11/site-packages/jax/_src/numpy/array_methods.py", line 1145, in op
+    return getattr(self.aval, f"_{name}")(self, *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jeff/miniconda3/envs/gpu_sls_min_time/lib/python3.11/site-packages/jax/_src/numpy/array_methods.py", line 608, in deferring_binary_op
+    return binary_op(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jeff/miniconda3/envs/gpu_sls_min_time/lib/python3.11/site-packages/jax/_src/numpy/ufunc_api.py", line 182, in __call__
+    return call(*args)
+           ^^^^^^^^^^^
+Exception: couldn't apply typeof to args: (LinearizeTracer<float32[3]>, Array([0.4, 0.4, 0.4], dtype=float32))
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.

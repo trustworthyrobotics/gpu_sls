@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import Any, Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -264,35 +264,78 @@ def make_terminal_set_constraint(center: jnp.ndarray, half_width: jnp.ndarray, N
 def make_min_time_disturbance(
     n: int,
     E_mag: float,
+    N: int,
     disturbance_index: int = 6,
 ):
-    """Disturbance acts only on v_x.
+    """Create pointwise and trajectory disturbance maps.
 
-    The disturbance channel is
-
-        x_{k+1} = f(x_k, u_k) + dt * E_mag * e_vx * w_vx,
-
-    where v_x is state index 6.
-
-    The full (n, n) matrix is retained because the SLS implementation
-    expects an n-dimensional disturbance vector.
+    Assumption:
+        The last component of every state x_k is the optimized final time.
     """
-    def disturbance(X_prefix: jnp.ndarray) -> jnp.ndarray:
-        N = X_prefix.shape[0] - 1
-        final_time = X_prefix[0, -1]
+
+    def disturbance_at_state(x_k: jnp.ndarray) -> jnp.ndarray:
+        """
+        x_k: shape (n,)
+        returns: shape (n, n)
+        """
+        final_time = x_k[-1]  # scalar
         dt = final_time / N
 
-        E0 = jnp.zeros((n, n), dtype=X_prefix.dtype)
-        E0 = E0.at[disturbance_index, disturbance_index].set(
-            dt * E_mag
-        )
+        E_k = jnp.zeros((n, n), dtype=x_k.dtype)
 
-        return jnp.broadcast_to(
-            E0,
-            (X_prefix.shape[0], n, n),
-        )
+        return E_k.at[
+            disturbance_index,
+            disturbance_index,
+        ].set(dt * E_mag)
+
+    def disturbance(X: jnp.ndarray) -> jnp.ndarray:
+        """
+        X: shape (T + 1, n)
+        returns: shape (T + 1, n, n)
+        """
+        return jax.vmap(disturbance_at_state)(X)
+
+    # Expose the pointwise function for local differentiation.
+    disturbance.at_state = disturbance_at_state
 
     return disturbance
+
+# def make_min_time_disturbance(
+#     n: int,
+#     N: int,
+#     disturbance_index: int = 6,
+# ):
+#     """
+#     Disturbance magnitude:
+#         - 3.0 for z >= 0.25
+#         - decreases quadratically to 0.1 at z = 0
+#         - clipped at 0.1 below z = 0
+#     """
+
+#     def disturbance_at_state(x_k: jnp.ndarray) -> jnp.ndarray:
+#         z = x_k[2]
+#         final_time = x_k[-1]
+#         dt = final_time / N
+
+#         # Normalize altitude into [0, 1]
+#         s = jnp.clip(z / 0.25, 0.0, 1.0)
+
+#         # Quadratic profile
+#         E_mag = 0.1 + (3.0 - 0.1) * s**2
+
+#         E_k = jnp.zeros((n, n), dtype=x_k.dtype)
+#         E_k = E_k.at[
+#             disturbance_index,
+#             disturbance_index,
+#         ].set(dt * E_mag)
+
+#         return E_k
+
+#     def disturbance(X: jnp.ndarray) -> jnp.ndarray:
+#         return jax.vmap(disturbance_at_state)(X)
+
+#     disturbance.at_state = disturbance_at_state
+#     return disturbance
 
 def make_sphere_obstacle_constraint(
     center: jnp.ndarray,
@@ -413,7 +456,7 @@ def main():
 
     constraints_x = make_state_box_constraints(x_min, x_max)
     terminal_center = jnp.array([1.0, 0.1, 0.5], dtype=jnp.float32)
-    terminal_half_width = jnp.array([0.2, 0.2, 0.2], dtype=jnp.float32)
+    terminal_half_width = jnp.array([0.4, 0.4, 0.4], dtype=jnp.float32)
     terminal_constraint = make_terminal_set_constraint(
         terminal_center, terminal_half_width, N
     )
@@ -433,8 +476,9 @@ def main():
     n_obs = obstacles.shape[0]
     nc = 2 * nu + 2 * n + n_obs + 6 + 1
 
-    E_mag = 0.1
-    disturbance = make_min_time_disturbance(n=n, E_mag=E_mag)
+    E_mag = 3.5
+    disturbance = make_min_time_disturbance(n=n, E_mag=E_mag, N=N)
+    # disturbance = make_min_time_disturbance(n=n, N=N)
 
     # -----------------------------
     # Initial / goal
@@ -467,8 +511,8 @@ def main():
     # Solver configs
     # -----------------------------
     admm_cfg = ADMMConfig(
-        eps_abs=1e-2,
-        eps_rel=1e-2,
+        eps_abs=5e-2,
+        eps_rel=1e-3,
         rho_max=1e3,
         max_iterations=1000,
         rho_update_frequency=25,
