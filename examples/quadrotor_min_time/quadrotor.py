@@ -261,81 +261,81 @@ def make_terminal_set_constraint(center: jnp.ndarray, half_width: jnp.ndarray, N
 
 #     return disturbance
 
-def make_min_time_disturbance(
-    n: int,
-    E_mag: float,
-    N: int,
-    disturbance_index: int = 6,
-):
-    """Create pointwise and trajectory disturbance maps.
-
-    Assumption:
-        The last component of every state x_k is the optimized final time.
-    """
-
-    def disturbance_at_state(x_k: jnp.ndarray) -> jnp.ndarray:
-        """
-        x_k: shape (n,)
-        returns: shape (n, n)
-        """
-        final_time = x_k[-1]  # scalar
-        dt = final_time / N
-
-        E_k = jnp.zeros((n, n), dtype=x_k.dtype)
-
-        return E_k.at[
-            disturbance_index,
-            disturbance_index,
-        ].set(dt * E_mag)
-
-    def disturbance(X: jnp.ndarray) -> jnp.ndarray:
-        """
-        X: shape (T + 1, n)
-        returns: shape (T + 1, n, n)
-        """
-        return jax.vmap(disturbance_at_state)(X)
-
-    # Expose the pointwise function for local differentiation.
-    disturbance.at_state = disturbance_at_state
-
-    return disturbance
-
 # def make_min_time_disturbance(
 #     n: int,
+#     E_mag: float,
 #     N: int,
 #     disturbance_index: int = 6,
 # ):
-#     """
-#     Disturbance magnitude:
-#         - 3.0 for z >= 0.25
-#         - decreases quadratically to 0.1 at z = 0
-#         - clipped at 0.1 below z = 0
+#     """Create pointwise and trajectory disturbance maps.
+
+#     Assumption:
+#         The last component of every state x_k is the optimized final time.
 #     """
 
 #     def disturbance_at_state(x_k: jnp.ndarray) -> jnp.ndarray:
-#         z = x_k[2]
-#         final_time = x_k[-1]
+#         """
+#         x_k: shape (n,)
+#         returns: shape (n, n)
+#         """
+#         final_time = x_k[-1]  # scalar
 #         dt = final_time / N
 
-#         # Normalize altitude into [0, 1]
-#         s = jnp.clip(z / 0.25, 0.0, 1.0)
-
-#         # Quadratic profile
-#         E_mag = 0.1 + (3.0 - 0.1) * s**2
-
 #         E_k = jnp.zeros((n, n), dtype=x_k.dtype)
-#         E_k = E_k.at[
+
+#         return E_k.at[
 #             disturbance_index,
 #             disturbance_index,
 #         ].set(dt * E_mag)
 
-#         return E_k
-
 #     def disturbance(X: jnp.ndarray) -> jnp.ndarray:
+#         """
+#         X: shape (T + 1, n)
+#         returns: shape (T + 1, n, n)
+#         """
 #         return jax.vmap(disturbance_at_state)(X)
 
+#     # Expose the pointwise function for local differentiation.
 #     disturbance.at_state = disturbance_at_state
+
 #     return disturbance
+
+def make_min_time_disturbance(
+    n: int,
+    N: int,
+    disturbance_index: int = 6,
+):
+    """
+    Disturbance magnitude:
+        - 3.0 for z >= 0.25
+        - decreases quadratically to 0.1 at z = 0
+        - clipped at 0.1 below z = 0
+    """
+
+    def disturbance_at_state(x_k: jnp.ndarray) -> jnp.ndarray:
+        z = x_k[2]
+        final_time = x_k[-1]
+        dt = final_time / N
+
+        # Normalize altitude into [0, 1]
+        s = jnp.clip(z / 0.25, 0.0, 1.0)
+
+        # Quadratic profile
+        E_mag = 0.1 + (3.0 - 0.1) * s**2
+
+        E_k = jnp.zeros((n, n), dtype=x_k.dtype)
+        E_k = E_k.at[
+            disturbance_index,
+            disturbance_index,
+        ].set(dt * E_mag)
+
+        return E_k
+
+    def disturbance(X: jnp.ndarray) -> jnp.ndarray:
+        return jax.vmap(disturbance_at_state)(X)
+
+    disturbance.at_state = disturbance_at_state
+    return disturbance
 
 def make_sphere_obstacle_constraint(
     center: jnp.ndarray,
@@ -394,7 +394,7 @@ def main():
     # -----------------------------
     # Horizon and dt
     # -----------------------------
-    N = 110
+    N = 30
     parameter = 1.0 / N
     initial_duration = 2.0
 
@@ -477,8 +477,8 @@ def main():
     nc = 2 * nu + 2 * n + n_obs + 6 + 1
 
     E_mag = 3.5
-    disturbance = make_min_time_disturbance(n=n, E_mag=E_mag, N=N)
-    # disturbance = make_min_time_disturbance(n=n, N=N)
+    # disturbance = make_min_time_disturbance(n=n, E_mag=E_mag, N=N)
+    disturbance = make_min_time_disturbance(n=n, N=N)
 
     # -----------------------------
     # Initial / goal
@@ -512,7 +512,7 @@ def main():
     # -----------------------------
     admm_cfg = ADMMConfig(
         eps_abs=5e-2,
-        eps_rel=1e-3,
+        eps_rel=5e-4,
         rho_max=1e3,
         max_iterations=1000,
         rho_update_frequency=25,
@@ -523,7 +523,7 @@ def main():
     sls_cfg = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1e-2,
-        enable_fastsls=True,
+        enable_fastsls=False,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
         warm_start=True,

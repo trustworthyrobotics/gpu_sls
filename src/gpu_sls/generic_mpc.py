@@ -88,12 +88,18 @@ class GenericMPC:
             )
         )
 
-        self.P_ws = jnp.zeros(
-            (config.N, config.N +1, config.n, config.n)
+        self.Phi_x_I_ws = jnp.zeros(
+            (config.N + 1,
+             config.N + 1,
+             config.n,
+             config.n)
         )
 
-        self.K_kj_ws = jnp.zeros(
-            (config.N, config.N + 1, config.nu, config.n)
+        self.Phi_u_I_ws = jnp.zeros(
+            (config.N,
+             config.N + 1,
+             config.nu,
+             config.n)
         )
 
         self.converged_admm = False
@@ -115,6 +121,9 @@ class GenericMPC:
                 num_constraints,
             )
         )
+
+        self.a = jnp.zeros((config.N + 1, config.N + 1, num_constraints))
+        self.b = jnp.zeros((config.N + 1, config.N + 1, num_constraints))
 
         self.rho = jnp.asarray(
             self.admm_config.initial_rho,
@@ -146,6 +155,7 @@ class GenericMPC:
         reference: jnp.ndarray,
         parameter: Any,
     ):
+        # TODO: Go over which ones need to be shifted and padded
         (
             X,
             U,
@@ -158,7 +168,8 @@ class GenericMPC:
             Phi_u,
             betaN,
             muN,
-            PN, K_kjN,
+            Phi_x_I, Phi_u_I,
+            a, b,
             converged_admm,
         ) = self._solve(
             reference,
@@ -177,7 +188,8 @@ class GenericMPC:
             self.mu_ws,
             self.Phi_x_ws,
             self.Phi_u_ws,
-            self.P_ws, self.K_kj_ws,
+            self.Phi_x_I_ws, self.Phi_u_I_ws,
+            self.a, self.b,
             self.converged_admm,
         )
 
@@ -208,9 +220,6 @@ class GenericMPC:
         self.X0 = shift_and_pad(X)
         self.V0 = shift_and_pad(V)
 
-        self.P_ws = PN
-        self.K_kj_ws = K_kjN
-
         # Constraint and tube warm starts
         self.h_ct_ws = shift_and_pad(backoffs)
         self.beta_ws = shift_and_pad(betaN)
@@ -232,6 +241,10 @@ class GenericMPC:
         # SLS response warm starts
         self.Phi_x_ws = Phi_x
         self.Phi_u_ws = Phi_u
+        self.Phi_x_I_ws = Phi_x_I
+        self.Phi_u_I_ws = Phi_u_I
+        self.a = shift_and_pad(a)
+        self.b = shift_and_pad(b)
 
         return (
             U[0],

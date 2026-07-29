@@ -18,8 +18,6 @@ class ACPScanCache(NamedTuple):
     Al:  jnp.ndarray
     ArC: jnp.ndarray
     AlP: jnp.ndarray
-    Cn:  jnp.ndarray
-    Pn:  jnp.ndarray
 
 @register_pytree_node_class
 @dataclass(frozen=True)
@@ -166,7 +164,7 @@ def associative_scan_cache_acp_jax(elems_acp, T: int, n: int, reverse: bool = Fa
     if reverse:
         out = out[::-1]
 
-    return out, ACPScanCache(Ar=Ar, Al=Al, ArC=ArC, AlP=AlP, Cn=Cn, Pn=Pn)
+    return out, ACPScanCache(Ar=Ar, Al=Al, ArC=ArC, AlP=AlP)
 
 
 @partial(jax.jit, static_argnums=(2, 4))
@@ -246,43 +244,114 @@ def admm_augment_xu(Q, q, R, r, M, C, D, w_bar, y_bar, rho):
 
     return tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M
 
-# def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
-#     """
-#     z, w, w_prev, y: (T+1, m)
-#     Returns scalar norms and (optional) thresholds.
-#     """
-#     r = z - w                          # primal residual
-#     s = rho * (w - w_prev)             # dual residual (A=I)
+def admm_augment_ct_grad(tilde_Q, tilde_q, C, D, a, b, rho, Jh):
+    num_stages = Jh.shape[0]
 
-#     # Norms over all time/constraints
-#     r_norm = jnp.linalg.norm(r.reshape(-1), ord=2)
-#     s_norm = jnp.linalg.norm(s.reshape(-1), ord=2)
+    # Mask keeps only j > k.
+    future_mask = jnp.triu(
+        jnp.ones((num_stages, num_stages), dtype=Jh.dtype),
+        k=1,
+    )
 
-#     # Stopping thresholds (Boyd et al., scaled form)
-#     n = r.size
-#     z_norm = jnp.linalg.norm(z.reshape(-1), ord=2)
-#     w_norm = jnp.linalg.norm(w.reshape(-1), ord=2)
-#     y_norm = jnp.linalg.norm(y.reshape(-1), ord=2)
+    # rho * sum_{j=k+1}^N H_{j,k}^T H_{j,k}
+    #
+    # Jh has indices:
+    #   j: affected constraint stage
+    #   c: constraint index
+    #   k: source state stage
+    #   i: state coordinate
+    coupled_hessian = rho * jnp.einsum(
+        "jk,jcki,jckl->kil",
+        future_mask,
+        Jh,
+        Jh,
+    )
+    coupled_q = rho * jnp.einsum(
+        "jk,jcki,jkc->ki",
+        future_mask,
+        Jh,
+        b - a,
+    )
 
-#     eps_pri = jnp.sqrt(n) * eps_abs + eps_rel * z_norm
-#     eps_dual = jnp.sqrt(n) * eps_abs + eps_rel * (rho * y_norm)
+    tilde_Q = tilde_Q + coupled_hessian
+    tilde_q = tilde_q + coupled_q
 
-#     return r_norm, s_norm, eps_pri, eps_dual
+    return tilde_Q, tilde_q
 
-def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
-    r = z - w
-    s = rho * (w - w_prev)
+def admm_residuals(
+    z_bar, w, w_prev, y, z_grad,
+    a, a_prev, b, rho,
+    eps_abs=1e-2,
+    eps_rel=1e-2,
+):
+    T = z_grad.shape[0]
 
-    r_norm = jnp.linalg.norm(r.reshape(-1), ord=jnp.inf)
-    s_norm = jnp.linalg.norm(s.reshape(-1), ord=jnp.inf)
+    causal_mask = jnp.tril(
+        jnp.ones((T, T), dtype=z_grad.dtype),
+        k=-1,
+    )[:, :, None]
 
-    z_norm = jnp.linalg.norm(z.reshape(-1), ord=jnp.inf)
-    w_norm = jnp.linalg.norm(w.reshape(-1), ord=jnp.inf)
-    y_norm = jnp.linalg.norm(y.reshape(-1), ord=jnp.inf)
+    # -------------------------
+    # Primal residuals
+    # -------------------------
+    r_bar = z_bar - w
+    r_grad = causal_mask * (z_grad - a)
 
-    eps_pri = eps_abs + eps_rel * jnp.maximum(z_norm, w_norm)
-    # eps_pri = eps_abs
-    eps_dual = eps_abs + eps_rel * (rho * y_norm)
+    r_bar_norm = jnp.linalg.norm(r_bar.reshape(-1), ord=jnp.inf)
+    r_grad_norm = jnp.linalg.norm(r_grad.reshape(-1), ord=jnp.inf)
+
+    r_norm = jnp.maximum(r_bar_norm, r_grad_norm)
+
+    # -------------------------
+    # Dual residuals
+    # -------------------------
+    s_bar = rho * (w - w_prev)
+    s_grad = rho * causal_mask * (a - a_prev)
+
+    s_bar_norm = jnp.linalg.norm(s_bar.reshape(-1), ord=jnp.inf)
+    s_grad_norm = jnp.linalg.norm(s_grad.reshape(-1), ord=jnp.inf)
+
+    s_norm = jnp.maximum(s_bar_norm, s_grad_norm)
+
+    # -------------------------
+    # Primal tolerance
+    # -------------------------
+    direct_primal_scale = jnp.maximum(
+        jnp.linalg.norm(z_bar.reshape(-1), ord=jnp.inf),
+        jnp.linalg.norm(w.reshape(-1), ord=jnp.inf),
+    )
+
+    coupled_primal_scale = jnp.maximum(
+        jnp.linalg.norm((causal_mask * z_grad).reshape(-1), ord=jnp.inf),
+        jnp.linalg.norm((causal_mask * a).reshape(-1), ord=jnp.inf),
+    )
+
+    primal_scale = jnp.maximum(
+        direct_primal_scale,
+        coupled_primal_scale,
+    )
+
+    eps_pri = eps_abs + eps_rel * primal_scale
+
+    # -------------------------
+    # Dual tolerance
+    # -------------------------
+    direct_dual_scale = rho * jnp.linalg.norm(
+        y.reshape(-1),
+        ord=jnp.inf,
+    )
+
+    coupled_dual_scale = rho * jnp.linalg.norm(
+        (causal_mask * b).reshape(-1),
+        ord=jnp.inf,
+    )
+
+    dual_scale = jnp.maximum(
+        direct_dual_scale,
+        coupled_dual_scale,
+    )
+
+    eps_dual = eps_abs + eps_rel * dual_scale
 
     return r_norm, s_norm, eps_pri, eps_dual
 
@@ -357,55 +426,38 @@ def adaptive_rho_update(
     return rho_new, updated
 
 
-def rho_update_y(
+def rho_update_scaled_duals(
     rp_norm,
     rd_norm,
-    eps_pri,
-    eps_dual,
     rho,
     y,
+    b,
     rho_max,
-    regularized_rho_update,
 ):
-    # def regularized_update(_):
-    #     return adaptive_rho_update_regularized(
-    #         rp_norm,
-    #         rd_norm,
-    #         eps_pri,
-    #         eps_dual,
-    #         rho,
-    #         rho_max=rho_max,
-    #     )
-
-    # def unregularized_update(_):
-    #     return adaptive_rho_update(
-    #         rp_norm,
-    #         rd_norm,
-    #         rho,
-    #         rho_max=rho_max,
-    #     )
-
-    # rho_new, updated = lax.cond(
-    #     regularized_rho_update,
-    #     regularized_update,
-    #     unregularized_update,
-    #     operand=None,
-    # )
     rho_new, updated = adaptive_rho_update(
-            rp_norm,
-            rd_norm,
-            rho,
-            rho_max=rho_max,
-        )
+        rp_norm,
+        rd_norm,
+        rho,
+        rho_max=rho_max,
+    )
 
-    # y is the scaled dual variable, so preserve mu = rho * y.
+    scale = rho / rho_new
+
     y_new = lax.cond(
         updated,
-        lambda _: (rho / rho_new) * y,
+        lambda _: scale * y,
         lambda _: y,
         operand=None,
     )
-    return rho_new, y_new, updated
+
+    b_new = lax.cond(
+        updated,
+        lambda _: scale * b,
+        lambda _: b,
+        operand=None,
+    )
+
+    return rho_new, y_new, b_new, updated
 
 
 def generate_leaf(tilde_Q, tilde_R, tilde_M, A, B, reg=1e-8):
@@ -497,11 +549,39 @@ def get_K(tilde_R, tilde_M, A, B, P):
         return scipy.linalg.solve(G, -H)
     return vmap(one)(jnp.arange(T))
 
-def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho):
+def project(z_bar, z_grad, f_ct):
+    T = z_bar.shape[0]
+
+    causal_mask = jnp.tril(
+        jnp.ones((T, T), dtype=z_grad.dtype),
+        k=-1,
+    )
+
+    grad_sum = jnp.einsum(
+        "kj,kjc->kc",
+        causal_mask,
+        z_grad,
+    )
+
+    num_terms = 1.0 + jnp.sum(causal_mask, axis=1)
+
+    mu = jnp.maximum(
+        (z_bar + grad_sum - f_ct) / num_terms[:, None],
+        0.0,
+    )
+
+    z_bar_new = z_bar - mu
+    z_grad_new = z_grad - causal_mask[:, :, None] * mu[:, None, :]
+
+    return z_bar_new, z_grad_new
+
+def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, Jh, a, b):
     rho_max = cfg.rho_max
+
     def one_iter(carry):
         (it, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, 
          x_bar, u_bar, y_bar, w_prev, rho, cache, BRinv, MRinv, P, _, K,
+         a_prev, b_prev,
          _, _, _, _, _) = carry
 
 
@@ -509,9 +589,10 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         T = Q.shape[0] - 1
         n = Q.shape[1]
         c0, p0 = generate_leaf_bp(c[1:], BRinv, MRinv, tilde_r, tilde_q, T, n)
-        b, p = associative_scan_use_cache_cp_jax(c0, p0, T + 1, cache, reverse=True)
+        _, p = associative_scan_use_cache_cp_jax(c0, p0, T + 1, cache, reverse=True)
         k = get_k(tilde_R, tilde_r, B, P, p, c[1:])
 
+        # ------- Calculate Optimal Time -------
         dx0 = c[0, :-1]
 
         P0 = P[0]
@@ -526,30 +607,32 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         dx0_aug = c[0].at[-1].set(delta_T)
 
         x_bar, u_stage = rollout_gpu(
-            K,
-            k,
-            dx0_aug,
-            A,
-            B,
-            c[1:],
+            K, k, dx0_aug,
+            A, B, c[1:]
         )
         u_bar = jnp.pad(u_stage, ((0, 1), (0, 0)))
 
-        z_bar = (
-            jnp.einsum('tmi,ti->tm', C, x_bar) +
-            jnp.einsum('tmi,ti->tm', D, u_bar)
-        )
         # -------- Project onto constraint set -------- 
-        w_new = jnp.minimum(z_bar + y_bar, f)
+        z_bar = jnp.einsum('tmi,ti->tm', C, x_bar) + jnp.einsum('tmi,ti->tm', D, u_bar)
+        z_grad = jnp.einsum("kcjn,jn->kjc", Jh, x_bar)
+        w_new, a_new = project(z_bar + y_bar, z_grad + b_prev, f)
 
+
+        causal_mask = jnp.tril(
+            jnp.ones((T + 1, T + 1), dtype=z_grad.dtype),
+            k=-1,
+        )
         # # -------- Dual update (scaled form) -------- 
         y_new = y_bar + (z_bar - w_new)
-
+        b_new = b_prev + causal_mask[:, :, None] * (
+            z_grad - a_new
+        )
 
         # -------- Termination + Rho/Cache Update -------- 
         rp_norm, rd_norm, eps_pri, eps_dual = admm_residuals(
-            z_bar, w_new, w_prev, y_new, rho,
-            eps_abs=cfg.eps_abs, eps_rel=cfg.eps_rel
+            z_bar=z_bar, w=w_new, w_prev=w_prev, y=y_new, z_grad=z_grad,
+            a=a_new, a_prev=a_prev, b=b_new, rho=rho,
+            eps_abs=cfg.eps_abs, eps_rel=cfg.eps_rel,
         )
 
         # Convergence check
@@ -557,24 +640,31 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         do_rho_update = (it % cfg.rho_update_frequency) == 0
 
         def update_fn(_):
-            rho_upd, y_upd, updated = rho_update_y(
+            rho_upd, y_upd, b_upd, updated = rho_update_scaled_duals(
                 rp_norm,
                 rd_norm,
-                eps_pri,
-                eps_dual,
                 rho,
                 y_new,
+                b_new,
                 rho_max,
-                cfg.regularized_rho_update,
             )
-            return rho_upd, y_upd, updated
+            return rho_upd, y_upd, b_upd, updated
+
 
         def no_update_fn(_):
-            return rho, y_new, jnp.array(False)
-        
-        rho_new, y_new, rho_updated = lax.cond(do_rho_update, update_fn, no_update_fn, operand=None)
+            return rho, y_new, b_new, jnp.array(False)
+
+        rho_new, y_new, b_new, rho_updated = lax.cond(
+            do_rho_update,
+            update_fn,
+            no_update_fn,
+            operand=None,
+        )
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
             Q, q, R, r, M, C, D, w_new, y_new, rho_new
+        )
+        tilde_Q, tilde_q = admm_augment_ct_grad(
+            tilde_Q, tilde_q, C, D, a_new, b_new, rho_new, Jh
         )
 
         def cache_update(_):
@@ -598,7 +688,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, cache_new, BRinv, MRinv, P, K = lax.cond(rho_updated, cache_update, no_cache_update, operand=None)
 
         return (it + 1, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, x_bar, u_bar, y_new, w_new,
-                rho_new, cache_new, BRinv, MRinv, P, p, K,
+                rho_new, cache_new, BRinv, MRinv, P, p, K, a_new, b_new,
                 rp_norm, rd_norm, eps_pri, eps_dual, converged)
 
     # --- loop condition: keep going until max_iters OR converged ---
@@ -606,6 +696,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         it = carry[0]
         converged = carry[-1]
         return jnp.logical_and(it < cfg.max_iterations, jnp.logical_not(converged))
+
     T = A.shape[0]
     n = Q.shape[1]
     nx = Q.shape[-1]
@@ -618,11 +709,17 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     init_u = jnp.zeros((T + 1, nu), dtype=Q.dtype)
     init_w = w
     init_y = y
+    init_a = a
+    init_b = b
     rho0 = rho
     p_init = jnp.zeros((T + 1, nx), dtype=Q.dtype)
     tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
         Q, q, R, r, M, C, D, init_w, init_y, rho0
     )
+    tilde_Q, tilde_q = admm_augment_ct_grad(
+        tilde_Q, tilde_q, C, D, init_a, init_b, rho0, Jh
+    )
+
     elems_acp, BRinv, MRinv = generate_leaf(tilde_Q, tilde_R, tilde_M, A, B)
     out_acp, cache = associative_scan_cache_acp_jax(elems_acp, T + 1, n, reverse=True)
     P = out_acp[:, -n:, :]
@@ -633,20 +730,21 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         init_x, init_u, init_y, init_w,                          
         jnp.array(rho0, dtype=Q.dtype),
         cache, BRinv, MRinv, P, p_init, K,
+        init_a, init_b,
         jnp.array(jnp.inf, dtype=Q.dtype),
         jnp.array(jnp.inf, dtype=Q.dtype),
         jnp.array(jnp.inf, dtype=Q.dtype),
         jnp.array(jnp.inf, dtype=Q.dtype),
-        jnp.array(False)
+        jnp.array(False),
     )
 
     out = jax.lax.while_loop(cond_fun, one_iter, init)
 
-    it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, K, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
+    it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, K, a_bar, b_bar, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
     v = dual_lqr(x_bar, P_final, p_final)
     jax.debug.print(
         "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
         it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
     )
     mu = rho_final * y_bar
-    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, converged
+    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, a_bar, b_bar, converged

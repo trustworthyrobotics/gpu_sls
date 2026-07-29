@@ -156,7 +156,8 @@ def compute_search_direction(
     x0, X, U, V, c,
     w, y, rho,
     h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws,
-    P_ws, K_kj_ws,
+    Phi_x_I_ws, Phi_u_I_ws,
+    a, b,
     sqp_iteration
 ):
     T = U.shape[0]
@@ -197,7 +198,6 @@ def compute_search_direction(
     f = -g
     C, D = linearize(constraints)(X, U_pad, t)
     C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
-    E = disturbance(X)
 
     Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[1]), Q.shape)
     R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]) * 0.5, R.shape)
@@ -205,34 +205,35 @@ def compute_search_direction(
     n_obs = obstacles.shape[0]
 
     def run_nominal(_):
-        dX, dU, dV, w1, y1, rho1, _, converged_admm = constrained_solve(
-            admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho
+        Jh = jnp.zeros((T + 1, nc, T + 1, nx))
+        dX, dU, dV, w1, y1, rho1, _, a1, b1, converged_admm = constrained_solve(
+            admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, Jh, a, b
         )
         backoffs = jnp.zeros((T + 1, nc - n_obs))
         Phi_x   = jnp.zeros((T + 1, T + 1, nx, nx))
         Phi_u   = jnp.zeros((T, T + 1, nu, nx))
         betaN   = jnp.ones((T + 1, T + 1, nc - n_obs)) * 1e-10
         muN     = jnp.zeros((T + 1, nc))
-        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, P_ws, K_kj_ws, converged_admm
+        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x, Phi_u, a1, b1, converged_admm
 
     def run_sls(_):
-        dX, dU, dV, w1, y1, rho1, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN, PN, K_kjN = sls_solve_gpu(
+        dX, dU, dV, w1, y1, rho1, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1,  = sls_solve_gpu(
             admm_config, disturbance,
             Q, q, R, r, M, A, B, c,
             C_all, D_all, f_all, w, y, rho, sls_config,
-            Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, P_ws, K_kj_ws
+            Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a, b,
         )
-        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, PN, K_kjN, converged_admm
+        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm
 
     use_nominal = jnp.logical_or(
         jnp.logical_not(sls_config.enable_fastsls),
         jnp.logical_and(sls_config.enable_fastsls, sqp_iteration < sls_config.max_initial_sqp_iterations)
     )
-    dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, PN, K_kjN, converged_admm= lax.cond(
+    dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm = lax.cond(
         use_nominal, run_nominal, run_sls, operand=None
     )
 
-    return dX, dU, dV, q, r, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, PN, K_kjN, converged_admm
+    return dX, dU, dV, q, r, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm
 
 
 @partial(jit, static_argnums=(0,1,2,3,4,5,6,7))
@@ -245,7 +246,8 @@ def sqp(
     x0, X_in, U_in, V_in,
     w, y, rho,
     obstacles,
-    h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, P_ws, K_kj_ws, converged_admm_prev
+    h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, 
+    a, b, converged_admm_prev
 ):
     _cost = partial(cost, W, reference)
     if hessian_approx is not None:
@@ -257,7 +259,7 @@ def sqp(
     model_evaluator = partial(model_evaluator_helper_min_time, _cost, _dynamics, x0)
 
     def body(i, carry):
-        i, X_curr, U_curr, V_curr, w, y, rho, converged, backoffs, Phi_x, Phi_u, beta_ws, mu_w, P_ws, K_kj_ws, converged_admm = carry
+        i, X_curr, U_curr, V_curr, w, y, rho, converged, backoffs, Phi_x, Phi_u, beta_ws, mu_w, Phi_x_I_ws, Phi_u_I_ws, a, b, converged_admm = carry
 
         def do_nothing(_):
             return carry
@@ -271,16 +273,18 @@ def sqp(
             w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
             # w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
+            a0 = lax.select(jnp.array(False), a, jnp.zeros_like(a))
+            b0 = lax.select(jnp.array(False), b, jnp.zeros_like(b))
             rho0 = lax.select(warm_flag, rho, jnp.asarray(admm_config.initial_rho, dtype=rho.dtype))
             h_ct_ws = backoffs
-            dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN, PN, K_kjN, converged_admm_new = compute_search_direction(
+            dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN, Phi_x_I_next, Phi_u_I_next, a1, b1, converged_admm_new = compute_search_direction(
                 sls_config, admm_config,
                 _cost, _dynamics, _hessian_approx,
                 constraints, disturbance,
                 obstacles,
                 x0, X_curr, U_curr, V_curr, c,
                 w0, y0, rho0,
-                h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, P_ws, K_kj_ws, i
+                h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a0, b0, i
             )
 
             step = jnp.maximum(
@@ -304,12 +308,6 @@ def sqp(
             )
             current_cost, current_c_filter = filter_model_evaluator(X_curr, U_curr)
 
-            g, c = model_evaluator(X_curr, U_curr)
-
-            rho_merit = merit_rho(c, dV)
-            merit_fn  = merit_function_factory(rho_merit)
-            current_merit = merit_fn(V_curr, g, c)
-            merit_slope = slope(dX, dU, dV, c, q, r, rho_merit)
             last_iter = (i == (sqp_config.max_sqp_iterations + sls_config.max_initial_sqp_iterations - 1))
             do_ls = jnp.logical_and(jnp.array(bool(sqp_config.line_search)), jnp.logical_not(last_iter))
             def ls_branch(_):
@@ -329,6 +327,8 @@ def sqp(
 
             w_next = lax.select(converged1, w, w1)
             y_next = lax.select(converged1, y, y1)
+            a_next = lax.select(converged1, a, a1)
+            b_next = lax.select(converged1, b, b1)
             rho_next = lax.select(converged1, rho, rho1)
             backoffs_next = lax.select(converged1, backoffs, backoffs1)
             Phi_x_next = lax.select(converged1, Phi_x, Phi_x1)
@@ -336,13 +336,13 @@ def sqp(
 
             return (i + 1, X_next, U_next, V_next, w_next, y_next, rho_next,
                     jnp.logical_or(converged, converged1),
-                    backoffs_next, Phi_x_next, Phi_u_next, betaN, muN, PN, K_kjN, converged_admm_new)
+                    backoffs_next, Phi_x_next, Phi_u_next, betaN, muN, Phi_x_I_next, Phi_u_I_next, a_next, b_next, converged_admm_new)
 
         return lax.cond(converged, do_nothing, do_iter, operand=None)
 
     backoffs0 = h_ct_ws
-    carry0 = (0, X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x_ws, Phi_u_ws, beta_ws, mu_ws, P_ws, K_kj_ws, converged_admm_prev)
-    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u, betaN, muN, PN, K_kjN, converged_admm = lax.fori_loop(
+    carry0 = (0, X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x_ws, Phi_u_ws, beta_ws, mu_ws, Phi_x_I_ws, Phi_u_I_ws, a, b, converged_admm_prev)
+    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_out, b_out, converged_admm = lax.fori_loop(
         0, sqp_config.max_sqp_iterations + sls_config.max_initial_sqp_iterations, body, carry0,
     )
-    return X_out, U_out, V_out, w_out, y_out, rho_out, backoffs, Phi_x, Phi_u, betaN, muN, PN, K_kjN, converged_admm
+    return X_out, U_out, V_out, w_out, y_out, rho_out, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_out, b_out, converged_admm

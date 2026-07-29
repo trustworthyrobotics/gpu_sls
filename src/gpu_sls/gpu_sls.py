@@ -105,12 +105,11 @@ def calculate_cost(Q_bar, R_bar, C, D, eta):
     return Cx, Cxu, Cu
 
 @jax.jit
-def calculate_phis_controller(A, B, Cx, Cxu, Cu, E):
+def calculate_phis_controller(A, B, Cx, Cxu, Cu):
     T = Cu.shape[0]
     nx = A.shape[1]
     nu = B.shape[-1]
     Tp1 = T + 1
-    nw = E.shape[-1]
     A = A[:T]
     B = B[:T]
     # def solve_one_j(j):
@@ -152,7 +151,7 @@ def calculate_phis_controller(A, B, Cx, Cxu, Cu, E):
     return P, K_kj
 
 @jax.jit
-def get_controller(Q, R, A, B, C, D, E, eta_stage, eta_f):
+def get_controller(Q, R, A, B, C, D, eta_stage, eta_f):
     T, nx, _ = A.shape
 
     js = jnp.arange(T)
@@ -173,7 +172,7 @@ def get_controller(Q, R, A, B, C, D, E, eta_stage, eta_f):
     Cx_Nj = vmap(terminal_Cx_for_j)(jnp.arange(T))
     Cx = jnp.concatenate([Cx_kj, Cx_Nj[None, ...]], axis=0)
 
-    P, K_kj = calculate_phis_controller(A, B, Cx, Cxu_kj, Cu_kj, E)
+    P, K_kj = calculate_phis_controller(A, B, Cx, Cxu_kj, Cu_kj)
     return P, K_kj
 
 def forward_rollout(E, A, B, P, K_kj):
@@ -231,7 +230,7 @@ def get_betas(C, D, Phi_x, Phi_u):
 def get_constraint_tightenings(betas, eps_beta=1e-6):
     T1, _, _ = betas.shape
 
-    s = jnp.sqrt(jnp.maximum(betas, 0.0))
+    s = jnp.sqrt(jnp.maximum(betas, eps_beta))
 
     k_idx = jnp.arange(T1)[:, None]
     j_idx = jnp.arange(T1)[None, :]
@@ -329,29 +328,14 @@ def smooth_row_norm(A: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
 def tightening_from_nominal_state(
     disturbance_fn,
     x_nom: jnp.ndarray,
-    A: jnp.ndarray,
-    B: jnp.ndarray,
-    P: jnp.ndarray,
-    K_kj: jnp.ndarray,
+    Phi_x_I: jnp.ndarray,
+    Phi_u_I: jnp.ndarray,
     C_box: jnp.ndarray,
     D_box: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Recompute the complete tightening sequence from the nominal states.
-
-    The controller response ``P, K_kj`` and linearized dynamics ``A, B`` are
-    intentionally frozen.  Therefore autodiff captures only the dependence
-
-        x_j -> E(x_j) -> Phi_{k,j} -> h_k,
-
-    including the effect of every previous disturbance injection on every
-    later-stage tightening.
-
-    Returns
-    -------
-    h_ct : (T + 1, nc)
-    """
     E = disturbance_fn(x_nom)
-    Phi_x, Phi_u = forward_rollout(E, A, B, P, K_kj)
+    Phi_x = jnp.einsum("kjab,jbc->kjac", Phi_x_I, E)
+    Phi_u = jnp.einsum("kjab,jbc->kjac", Phi_u_I, E)
     beta = get_betas(C_box, D_box, Phi_x, Phi_u)
     return get_constraint_tightenings(beta)
 
@@ -366,7 +350,8 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
                        sls_config: SLSConfig, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
                        obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
                        beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray,
-                       P_ws: jnp.ndarray, K_kj_ws: jnp.ndarray):
+                       Phi_x_I_ws: jnp.ndarray, Phi_u_I_ws: jnp.ndarray,
+                       a_init: jnp.ndarray, b_init: jnp.ndarray):
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
@@ -374,7 +359,6 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
     E = disturbance_fn(primal_pos)
     num_obstacles = obstacles.shape[0]
     T   = Tp1 - 1
-
     # beta0 = jnp.ones((Tp1, Tp1, nc - num_obstacles), dtype=Q.dtype) * 1e-10
     # h_ct0 = jnp.zeros((Tp1, nc - num_obstacles))
     x0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
@@ -388,14 +372,19 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
     h_ct0 = h_ct_ws
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, P_ws, K_kj_ws)
+    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, Phi_x_I_ws, Phi_u_I_ws, a_init, b_init)
+
+    I = jnp.eye(nx)
+
+    # Recommended (no unnecessary copies until needed)
+    I_batch = jnp.broadcast_to(I, (Tp1, nx, nx))
 
     def cond_fn(carry):
-        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _ = carry
+        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, _, _ = carry
         return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, _, _, mu, P_prev, K_kj_prev = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, _, _, mu, Phi_x_I, Phi_u_I, a, b = carry
         x_prev = x_curr
         u_prev = u_curr
         num_regular_constraints = f.shape[1] - num_obstacles
@@ -408,17 +397,31 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
         rho = lax.select(warm_flag, rho, jnp.array(cfg.initial_rho, dtype=rho.dtype))
         C_box = C[:, :num_regular_constraints, :]
         D_box = D[:, :num_regular_constraints, :]
-        # C_combined = C + dh_dx_all
-        x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
-            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
+
+        Jh = jax.jacfwd(
+            lambda primal_pos: tightening_from_nominal_state(
+                disturbance_fn,
+                primal_pos,
+                Phi_x_I,
+                Phi_u_I,
+                C_box,
+                D_box,
+            )
+        )(primal_pos)
+        # jax.debug.print("{}", jnp.isnan(Jh).any())
+        Jh = jnp.zeros_like(Jh)
+        x_curr, u_curr, v_curr, w, y, rho, mu, a, b, converged_admm = constrained_solve(
+            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho, Jh, a, b 
         )
         prev_rho = rho
 
         metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
         mu_nominal = mu[: , :num_regular_constraints]
         eta_stage, eta_f = get_etas(mu_nominal, beta)
-        P, K_kj = get_controller(Q_bar, R_bar, A, B, C_box, D_box, E, eta_stage, eta_f)
-        Phi_x, Phi_u = forward_rollout(E, A, B, P, K_kj)
+        P, K_kj = get_controller(Q_bar, R_bar, A, B, C_box, D_box, eta_stage, eta_f)
+        Phi_x_I, Phi_u_I = forward_rollout(I_batch, A, B, P, K_kj)
+        Phi_x = jnp.einsum("kjab,jbc->kjac", Phi_x_I, E)
+        Phi_u = jnp.einsum("kjab,jbc->kjac", Phi_u_I, E)
         beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
         y = prev_rho / rho * y
@@ -429,9 +432,9 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
         converged = jnp.logical_or(converged, converged_now)
 
         return (i + jnp.array(1, dtype=jnp.int32),
-                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, P, K_kj)
+                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, Phi_x_I, Phi_u_I, a, b)
 
     carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
 
-    _, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, PN, K_kjN = carryN
-    return xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, PN, K_kjN
+    _, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, Phi_x_I, Phi_u_I, a_bar, b_bar = carryN
+    return xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_bar, b_bar
