@@ -25,6 +25,7 @@ class SLSConfig:
     rti: bool = False
     initialize_nominal: bool = True
     max_initial_sqp_iterations: int = 0
+    gradient_window: int = 0
 
 
 @jax.jit
@@ -339,15 +340,107 @@ def tightening_from_nominal_state(
     beta = get_betas(C_box, D_box, Phi_x, Phi_u)
     return get_constraint_tightenings(beta)
 
+def make_phi_windows(Phi, L):
+    """
+    Phi: (K, K, ..., ...)
+    returns: (K, L, ..., ...)
+    """
+    K = Phi.shape[0]
 
-@partial(jit, static_argnums=(0, 1, 16))
-def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
+    k = jnp.arange(K)[:, None]
+    ell = jnp.arange(L)[None, :]
+
+    j = k - L + ell
+    valid = j >= 0
+    j_safe = jnp.clip(j, 0, K - 1)
+
+    Phi_window = Phi[
+        jnp.arange(K)[:, None],
+        j_safe,
+    ]
+
+    return Phi_window * valid[(...,) + (None,) * (Phi.ndim - 2)]
+
+def tightening_stage_window(
+    x_window,
+    Phi_x_window_k,
+    Phi_u_window_k,
+    C_k,
+    D_k,
+    disturbance_fn,
+):
+    E_window = disturbance_fn(x_window)
+
+    Phi_x_E = jnp.einsum(
+        "jxn,jne->jxe",
+        Phi_x_window_k,
+        E_window,
+    )
+
+    Phi_u_E = jnp.einsum(
+        "jun,jne->jue",
+        Phi_u_window_k,
+        E_window,
+    )
+
+    term_x = jnp.einsum(
+        "cx,jxe->jce",
+        C_k,
+        Phi_x_E,
+    )
+
+    term_u = jnp.einsum(
+        "cu,jue->jce",
+        D_k,
+        Phi_u_E,
+    )
+
+    g_phi = term_x + term_u
+
+    return jnp.sum(
+        jnp.sqrt(
+            jnp.sum(g_phi**2, axis=-1) + 1e-8
+        ),
+        axis=0,
+    )
+
+def make_state_windows(
+    X: jnp.ndarray,
+    L: int,
+) -> jnp.ndarray:
+    """
+    X:       (T1, nx)
+    returns: (T1, L, nx)
+
+    Window k contains states approximately [k-L, ..., k-1].
+    """
+    T1, nx = X.shape
+
+    X_pad = jnp.pad(
+        X,
+        ((L, 0), (0, 0)),
+        mode="constant",
+    )
+
+    starts = jnp.arange(T1)
+
+    return jax.vmap(
+        lambda start: jax.lax.dynamic_slice(
+            X_pad,
+            (start, 0),
+            (L, nx),
+        )
+    )(starts)
+
+@partial(jit, static_argnums=(0, 1, 2))
+def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
                        R: jnp.ndarray, r: jnp.ndarray,
                        M: jnp.ndarray,
                        A: jnp.ndarray, B: jnp.ndarray, c: jnp.ndarray,
                        C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
                        w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
-                       sls_config: SLSConfig, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
+                       rho_grad,
+                       Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
                        obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
                        beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray,
                        Phi_x_I_ws: jnp.ndarray, Phi_u_I_ws: jnp.ndarray,
@@ -355,7 +448,7 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
-    nc  = w.shape[1]
+    L = sls_config.gradient_window
     E = disturbance_fn(primal_pos)
     num_obstacles = obstacles.shape[0]
     T   = Tp1 - 1
@@ -372,7 +465,7 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
     h_ct0 = h_ct_ws
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, Phi_x_I_ws, Phi_u_I_ws, a_init, b_init)
+    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, rho_grad, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, Phi_x_I_ws, Phi_u_I_ws, a_init, b_init)
 
     I = jnp.eye(nx)
 
@@ -380,11 +473,11 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
     I_batch = jnp.broadcast_to(I, (Tp1, nx, nx))
 
     def cond_fn(carry):
-        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, _, _ = carry
+        i, _, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, _, _ = carry
         return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, _, _, mu, Phi_x_I, Phi_u_I, a, b = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, rho_grad, converged, _, h_ct, _, _, mu, Phi_x_I, Phi_u_I, a, b = carry
         x_prev = x_curr
         u_prev = u_curr
         num_regular_constraints = f.shape[1] - num_obstacles
@@ -398,20 +491,52 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
         C_box = C[:, :num_regular_constraints, :]
         D_box = D[:, :num_regular_constraints, :]
 
-        Jh = jax.jacfwd(
-            lambda primal_pos: tightening_from_nominal_state(
-                disturbance_fn,
-                primal_pos,
-                Phi_x_I,
-                Phi_u_I,
-                C_box,
-                D_box,
-            )
-        )(primal_pos)
-        # jax.debug.print("{}", jnp.isnan(Jh).any())
-        Jh = jnp.zeros_like(Jh)
-        x_curr, u_curr, v_curr, w, y, rho, mu, a, b, converged_admm = constrained_solve(
-            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho, Jh, a, b 
+        # Jh = jax.jacfwd(
+        #     lambda primal_pos: tightening_from_nominal_state(
+        #         disturbance_fn,
+        #         primal_pos,
+        #         Phi_x_I,
+        #         Phi_u_I,
+        #         C_box,
+        #         D_box,
+        #     )
+        # )(primal_pos)
+        Phi_x_window = make_phi_windows(Phi_x_I, L)
+        Phi_u_window = make_phi_windows(Phi_u_I, L)
+
+        Phi_u_window = jnp.pad(
+            Phi_u_window,
+            (
+                (0, 1),  # add terminal affected stage
+                (0, 0),
+                (0, 0),
+                (0, 0),
+            ),
+        )
+        X_windows = make_state_windows(primal_pos, L)
+
+        Jh_window = jax.vmap(
+            lambda Xk, Pxk, Puk, Ck, Dk: jax.jacfwd(
+                lambda W: tightening_stage_window(
+                    W,
+                    Pxk,
+                    Puk,
+                    Ck,
+                    Dk,
+                    disturbance_fn,
+                )
+            )(Xk)
+        )(
+            X_windows,
+            Phi_x_window,
+            Phi_u_window,
+            C_box,
+            D_box,
+        )
+                # jax.debug.print("{}", jnp.isnan(Jh).any())
+        # Jh = jnp.zeros_like(Jh)
+        x_curr, u_curr, v_curr, w, y, rho, rho_grad, mu, a, b, converged_admm = constrained_solve(
+            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho, rho_grad, Jh_window, a, b, L 
         )
         prev_rho = rho
 
@@ -432,9 +557,9 @@ def sls_solve_gpu(cfg, disturbance_fn, Q: jnp.ndarray, q: jnp.ndarray,
         converged = jnp.logical_or(converged, converged_now)
 
         return (i + jnp.array(1, dtype=jnp.int32),
-                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, Phi_x_I, Phi_u_I, a, b)
+                beta, x_curr, u_curr, v_curr, w, y, rho, rho_grad, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, Phi_x_I, Phi_u_I, a, b)
 
     carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
 
-    _, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, Phi_x_I, Phi_u_I, a_bar, b_bar = carryN
-    return xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_bar, b_bar
+    _, betaN, xN, uN, vN, wN, yN, rhoN, rho_gradN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, Phi_x_I, Phi_u_I, a_bar, b_bar = carryN
+    return xN, uN, vN, wN, yN, rhoN, rho_gradN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_bar, b_bar

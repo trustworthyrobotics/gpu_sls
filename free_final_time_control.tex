@@ -1,0 +1,860 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{float}
+
+\title{Minimum Time Control}
+\author{Jeffrey Fang}
+\date{July 2026}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+
+\begin{document}
+
+\section{Problem Formulation}
+
+Consider a continuous uncertain nonlinear system
+
+\begin{equation}
+    \dot x(t) = f(x(t), u(t)) + E(x(t)) w(t)
+\end{equation}
+where $\mathcal{E}_{n_x} := \{ w: \|w_k\|_\infty \leq 1$ \}. We consider the euler-discretized system, namely
+\begin{equation}
+    x_{k+1} = x_k + \Delta t \left(f(x_k, u_k) + E(x_k)w_k\right)
+\end{equation}
+for some discretization time step, $\Delta t$. We want to solve the following free final time optimization,
+\begin{subequations}
+    \begin{align}
+        \min_{\mathbf{\pi}(\cdot), T} \quad & T \\
+        \text{s.t.} \quad &  x_{k+1} = x_k + \Delta t \left(f(x_k, u_k) + E(x_k)w_k \right), && \forall k \in [N] \\
+        & x_0 = \bar{x} \\
+        & u_k = \pi_k(x_{0:k}) \\
+        & (x_k, u_k) \in \mathcal{X}^\text{safe}, && \forall k \in [N], &&& \forall w \in \mathcal{E}_{n_x} \\
+        & x_N \in \mathcal{X}_f.
+    \end{align}
+\end{subequations}
+Basically, in this optimization we want to robustly reach some terminal set $\mathcal{X}_f$ in minimum time. As common practice in minimum time optimization, we represent $\Delta t$ as $\Delta \tau T$ and we introduce the time normalization constant $\Delta \tau$, in other words, let,
+\begin{equation}
+    \Delta t = \Delta \tau T, \qquad \Delta \tau = \frac{1}{N}.
+\end{equation}
+Therefore, the optimization we seek to solve is, 
+\begin{subequations}
+    \begin{align}
+        \min_{\mathbf{\pi}(\cdot)} \quad & T \\
+        \text{s.t.} \quad &  x_{k+1} = x_k + \Delta \tau T \left(f(x_k, u_k) + E(x_k)w_k \right), && \forall k \in [N] \\
+        & x_0 = \bar{x} \\
+        & u_k = \pi_k(x_{0:k}) \\
+        & (x_k, u_k) \in \mathcal{X}^\text{safe}, && \forall k \in [N], &&& \forall w \in \mathcal{B}_\infty \\
+        & x_N \in \mathcal{X}_f.
+    \end{align}
+\end{subequations}
+\section{Approach}
+We can solve this optimization using SLS. We first assume that $\mathcal{X}_f$ is defined by some hyperbox that is centered on $\alpha_f$ with radius $\beta_f$. We define the new robust free final time optimization as,
+\begin{subequations}
+    \begin{align}
+        \min_{\mathbf{x}, \mathbf{u}, \mathbf{\Phi}^\text{x}, \mathbf{\Phi}^\text{u}} \quad & T \\
+        \text{s.t.} \quad & x_{k+1} = x_k + \Delta \tau T f(x_k, u_k), && \forall k \in [N], \\
+        & x_0 = \bar{x}, \\
+        & \mathbf{\Phi}^\text{x}_{j+1, j} = \tilde E(x_j), && \forall j \in [N], \\
+        & \mathbf{\Phi}^\text{x}_{k+1, j} = \tilde A_k \mathbf{\Phi}^\text{x}_{k,j} + \tilde B_k \mathbf{\Phi}^\text{u}_{k,j}, && \forall k \in [N]\\
+        & g(x_k, u_k) + h_k(\mathbf{\Phi}) \leq 0^{n_c}, && \forall k \in [N], &&& \forall w \in \mathcal{E}_{n_x}, \\
+        &  | \alpha_f - x_N | + h_N(\mathbf{\Phi}) \leq \beta_f, && \forall k \in [N], &&& \forall w \in \mathcal{E}_{n_x}.
+    \end{align}
+\end{subequations}
+To solve this, we follow a similar pattern to GPUSLS. First, we split the optimization into a nominal trajectory generation, and then a robust feedback controller update. First, the nominal trajectory optimization,
+\begin{subequations}
+    \begin{align}
+        \min_{\mathbf{x}, \mathbf{u}, T} \quad &  T \\
+        \text{s.t.} \quad & x_{k+1} = x_k + \Delta \tau T f(x_k, u_k), && \forall k \in [N], \\
+        & x_0 = \bar{x}, \\
+        & g(x_k, u_k) + h_k(\mathbf{\Phi}) \leq 0^{n_c}, && \forall k \in [N], \\
+        &  | \alpha_f - x_N | + h_N(\mathbf{\Phi}) \leq \beta_f, && \forall k \in [N]. \label{eq:terminal_set_constraints}
+    \end{align}
+\end{subequations}
+Next, the controller update, 
+\begin{subequations}
+    \begin{align}
+        \min_{\mathbf{\Phi}^\text{x}, \mathbf{\Phi}^\text{u}} \quad & H(\mathbf{\Phi}) \\
+        \text{s.t.} \quad
+        & \mathbf{\Phi}^\text{x}_{j+1, j} = \tilde E(x_j), &&\forall j \in [N], \\
+        & \mathbf{\Phi}^\text{x}_{k+1, j} = \tilde A_k \mathbf{\Phi}^\text{x}_{k,j} + \tilde B_k \mathbf{\Phi}^\text{u}_{k,j}, && \forall j \in [N], &&& \forall k \in [j + 1, N].
+    \end{align}
+\end{subequations}
+To solve this, we use SQP. First, we define our Lagrangian. 
+\begin{equation}
+    \begin{aligned}
+        \mathcal{L} (X, U , T, \mu, \gamma, \lambda_-, \lambda_+) = & T + \mu_0^\top (\bar x_0 - x_0) + \sum_{k=0}^{N - 1} \mu_{k+1}^\top \left(x_{k} + \Delta \tau T f(x_k, u_k) - x_{k+1}\right) \\
+        & + \sum_{k=0}^{N-1} \gamma_k (g(x_k, u_k) + h_k(\mathbf{\Phi})) \\
+        & + \lambda_-^\top (x_N - \alpha_f + h_N(\mathbf{\Phi}) - \beta_f) + \lambda_+^\top (\alpha_f - x_N + h_N(\mathbf{\Phi}) - \beta_f)\\ 
+    \end{aligned}
+\end{equation}
+Suppose our current iterate is
+\begin{equation}
+    \bar{x_k}, \qquad \bar{u_k}, \qquad \bar{T}.
+\end{equation}
+We define the increments
+\begin{equation}
+    \delta x_k = x_k - \bar{x}_k, \qquad \delta u_k = u_k - \bar{u}_k, \qquad \delta T = T - \bar{T},
+\end{equation}
+and the dynamics defect as
+\begin{equation}
+    d_k =  \bar{x}_k + \Delta \tau \bar{T} f(\bar{x}_k, \bar{u}_k) - \bar{x}_{k+1}.
+\end{equation}
+First we take hessians and jacobians of our Lagrangian for our cost.
+\begin{equation}
+    \begin{aligned}
+        & Q_k = \nabla^2_{x_k} \mathcal{L}_k, && R_k = \nabla^2_{u_k} \mathcal{L}_k, &&& P_k = \nabla^2_{T} \mathcal{L}_k, &&&& M_k = \nabla^2_{x_ku_k} \mathcal{L}_k, \\
+        & S_k = \nabla^2_{x_kT} \mathcal{L}_k, && N_k = \nabla^2_{Tu_k} \mathcal{L}_k, \\
+        & q_k = \nabla_{x_k} \mathcal{L}_k, && r_k = \nabla_{u_k} \mathcal{L}_k, &&& p_k = \nabla_{T} \mathcal{L}_k,
+    \end{aligned}
+\end{equation}
+Next, we define the jacobians
+\begin{equation}
+    A_k = \nabla_x f(x_k, u_k) |_{(\bar{x}_k, \bar{u}_k)}, \qquad B_k = \nabla_u f(x_k, u_k) |_{(\bar{x}_k, \bar{u}_k)}
+\end{equation}
+The linearized nominal dynamics become,
+\begin{equation}
+    \delta x_{k+1} = \delta x_k + \Delta \tau \bar{T} A_k \delta x_k + \Delta \tau \bar{T} B_k \delta u_k + \Delta \tau f(\bar x_k, \bar u_k)\delta T + d_k
+\end{equation}
+and the linearized disturbance becomes,
+\begin{equation}
+    \Delta \tau \bar{T} E_k.
+\end{equation}
+Define
+\begin{subequations}
+    \begin{align}
+        & \tilde{A}_k = I + \Delta \tau \bar{T} A_k, \\
+        & \tilde{B}_k = \Delta \tau \bar{T} B_k, \\
+        & \tilde{c}_k = \Delta \tau f(\bar{x}_k, \bar{u}_k), \\
+        & \tilde {E}_k = \Delta \tau \bar{T} E_k. 
+    \end{align}
+\end{subequations}
+Using this system, we have our new transformed dynamics
+\begin{equation}
+    \delta x_{k+1} = \tilde{A}_k \delta x_k + \tilde{B}_k \delta u_k + \tilde{c}_k \delta T + d_k.
+\end{equation}
+Lastly, we define the linearized constraints,
+\begin{equation}
+    C_k = \nabla_x g(x_k, u_k) |_{(\bar{x}_k, \bar{u}_k)}, \qquad D_k = \nabla_u g(x_k, u_k)|_{(\bar{x}_k, \bar{u}_k)}, \qquad f = -g(\bar{x}_k, \bar{u}_k)
+\end{equation}
+For \eqref{eq:terminal_set_constraints}, we split the constraint into two constraints,
+\begin{equation}
+    \alpha_f - x_N + h_N(\mathbf{\Phi}) \leq \beta_f \qquad x_N - \alpha_f + h_N(\mathbf{\Phi}) \leq \beta_f.
+\end{equation}
+Substituting $x_N = \bar{x}_N + \delta x_N$,
+\begin{equation}
+    \begin{aligned}
+        & \alpha_f - (\bar{x}_N + \delta x_N) + h_N(\mathbf{\Phi}) \leq \beta_f, && (\bar{x}_N + \delta x_N) - \alpha_f + h_N(\mathbf{\Phi}) \leq \beta_f, \\
+        & - \delta x_N \leq \beta_f - \alpha_f + \bar x_N - h_N(\mathbf{\Phi}), && \delta x_N \leq \beta_f + \alpha_f - \bar{x}_N - h_N(\mathbf{\Phi}).
+    \end{aligned}
+\end{equation}
+This can be rewritten as,
+\begin{equation}
+    \begin{bmatrix}
+        -I \\
+        I
+    \end{bmatrix}
+    \delta x_N
+    \leq
+    \begin{bmatrix}
+        \beta_f - \alpha_f + \bar x_N \\
+        \beta_f + \alpha_f - \bar x_N
+    \end{bmatrix}
+    -
+    h_N(\mathbf{\Phi}).
+\end{equation}
+We can now form our linearized QP.
+\begin{subequations}
+    \begin{align}
+        \min_{\delta X, \delta U, \delta T} \quad & \sum_{k = 0}^{N - 1} \frac{1}{2} \begin{bmatrix}
+            \delta x_k \\
+            \delta T \\
+            \delta u_k 
+        \end{bmatrix}^\top
+        \begin{bmatrix}
+            Q_k & S_k & M_k \\
+            S_k^\top & P_k & N_k \\
+            M_k^\top & N_K^\top & R_k
+        \end{bmatrix}
+        \begin{bmatrix}
+            \delta x_k \\
+            \delta T \\
+            \delta u_k
+        \end{bmatrix}
+        +
+        \begin{bmatrix}
+            q_k \\
+            p_k \\
+            r_k \\
+        \end{bmatrix}^\top
+        \begin{bmatrix}
+            \delta x_k \\
+            \delta T \\
+            \delta u_k
+        \end{bmatrix} \\
+        \text{s.t.} \quad & \delta x_{k+1} = \tilde{A}_k \delta x_k + \tilde{B}_k \delta u_k + \tilde{c}_k \delta T + d_k, && \forall k \in [N]\\
+        & \delta x_0 = x_0 - \bar{x}_0 \\
+        & C_k \delta x_k + D_k \delta u_k \leq f_k - h_k(\mathbf{\Phi}), && \forall k \in [N] \\
+        & \begin{bmatrix}
+            -I \\
+            I
+        \end{bmatrix}
+        \delta x_N
+        \leq
+        \begin{bmatrix}
+            \beta_f - \alpha_f + \bar x_N \\
+            \beta_f + \alpha_f - \bar x_N
+        \end{bmatrix}
+        -
+        h_N(\mathbf{\Phi}).
+    \end{align}
+\end{subequations}
+\section{State Augmentation}
+We seek to be able to solve the minimization of this QP using the canonical Riccati Equations, and therefore being able to use parallel associative scans. We therefore augment the state matrix with $\delta T$. In other words, let,
+\begin{equation}
+    \delta \hat x_k = \begin{bmatrix}
+        \delta x_k \\
+        \delta T_k
+    \end{bmatrix}.
+\end{equation}
+We then redefine our augmented cost terms,
+\begin{equation}
+    \hat{Q}_k = \begin{bmatrix}
+        Q_k & S_k \\
+        S_k^\top & P_k
+    \end{bmatrix},
+    \qquad
+    \hat M _k = \begin{bmatrix}
+        M_k \\
+        N_k
+    \end{bmatrix},
+    \qquad
+    \hat{q}_k = \begin{bmatrix}
+        q_k \\
+        p_k
+    \end{bmatrix}.
+\end{equation}
+We then redefine our dynamics
+\begin{equation}
+    \begin{aligned}
+        & \delta \hat x_{k+1} = \begin{bmatrix}
+            \tilde{A}_k & \tilde{c}_k \\
+            0 & 1
+        \end{bmatrix} \delta \hat{x}_{k}
+        +
+        \begin{bmatrix}
+            \tilde{B}_k \\
+            0
+        \end{bmatrix} \delta u_k
+        +
+        d_k \\
+        & \hat A_k = \begin{bmatrix}
+            \tilde{A}_k & \tilde{c}_k \\
+            0 & 1
+        \end{bmatrix},
+        \qquad
+        \hat{B}_k = \begin{bmatrix}
+            \tilde{B}_k \\
+            0
+        \end{bmatrix} \\
+        & \delta \hat x_{k+1} = \hat{A}_k \delta \hat x_k + \hat B_k \delta u_k + d_k
+    \end{aligned}
+\end{equation}
+For the initial condition, the augmented state contains $\delta T_0$, which should remain a free variable, therefore, the initial condition constraint is only applied on to the first $n_x$ states. We represent this by
+\begin{equation}
+    \delta \hat x_0^{[0:n_x]} = x_0 - \bar{x}_0
+\end{equation}
+Lastly, we redefine our constraints. For notational simplicty, we combine the constraints
+\begin{equation}
+    \begin{aligned}
+        & \begin{bmatrix}
+                C_k & 0 \\
+                -I & 0 \\
+                I & 0
+            \end{bmatrix} \delta \hat x_k
+        + \begin{bmatrix}
+            D_k \\
+            0 \\
+            0
+        \end{bmatrix} \delta u_k \leq \begin{bmatrix}
+            f_k \\
+            \beta_f - \alpha_f + \bar x_N \\
+            \beta_f + \alpha_f - \bar x_N
+        \end{bmatrix} - h_k(\mathbf{\Phi}), \\
+        & \hat{C}_k = \begin{bmatrix}
+            C_k & 0 \\
+            -I & 0 \\
+            I & 0
+        \end{bmatrix},
+        \qquad
+        \hat D_k = \begin{bmatrix}
+            D_k \\
+            0 \\
+            0
+        \end{bmatrix},
+        \qquad,
+        \hat f_k = \begin{bmatrix}
+            f_k \\
+            \beta_f - \alpha_f + \bar x_N \\
+            \beta_f + \alpha_f - \bar x_N
+        \end{bmatrix}, \\
+        & \hat C_k \delta \hat x_k + \hat D_k \delta u_k \leq \hat f_k - h_k(\mathbf{\Phi}).
+    \end{aligned}
+\end{equation}
+We can now rewrite our state-augmented optimization as,
+\begin{subequations} \label{eq:condensed_qp}
+    \begin{align}
+        \min_{\delta \hat X, \delta U} \quad & \sum_{k=0}^{N-1} \begin{bmatrix}
+            \delta \hat x_k \\
+            \delta u_k
+        \end{bmatrix}^\top
+        \begin{bmatrix}
+            \hat Q_k & \hat M_k \\
+            \hat M_k^\top & R_k
+        \end{bmatrix} \begin{bmatrix}
+            \delta \hat x_k \\
+            \delta u_k
+        \end{bmatrix}
+        + \begin{bmatrix}
+            \hat q_k \\
+            r_k
+        \end{bmatrix}^\top
+        \begin{bmatrix}
+            \delta \hat x_k \\
+            \delta u_k
+        \end{bmatrix} \\
+        \text{s.t.} \quad & \delta \hat x_{k+1} = \hat{A}_{k} \delta \hat x_k + \hat B_k \delta u_k + d_k, && \forall k \in [N]\\
+        & \delta \hat x_0^{[0:n_x]} = x_0 - \bar{x}_0, \\
+        & \hat C_k \delta \hat x_k + \hat D_k \delta u_k \leq \hat f_k - h_k(\mathbf{\Phi}), && \forall k \in [N].
+    \end{align}
+\end{subequations}
+This optimization now becomes our standard affine LQR. This optimization can use similar ideas from GPU SLS. One notable difference, however, is that we have a free variable $\delta T$ in our optimization, which is not constrained by anything in the initial condition. Consider the value function at time step 0,
+\begin{equation}
+    V_{0 \rightarrow N}(\delta \hat x_0) = \frac{1}{2} \delta \hat x_0^\top \bar P_0 \delta \hat x_0 + \bar p_0 \delta \hat x_0.
+\end{equation}
+where $\bar{P}_0$ and $\bar{p}_0$ represent the Riccati terms. Decoupling the state and time, we have,
+\begin{equation}
+    V_{0 \rightarrow N} \left(\begin{bmatrix}
+        \delta x_0 \\
+        \delta T
+    \end{bmatrix}\right) = \frac{1}{2} \begin{bmatrix}
+        \delta x_0 \\
+        \delta T
+    \end{bmatrix} ^\top \bar P_0 \begin{bmatrix}
+        \delta x_0 \\
+        \delta T
+    \end{bmatrix} + \bar p_0 \begin{bmatrix}
+        \delta x_0 \\
+        \delta T
+    \end{bmatrix},
+\end{equation}
+Suppose we have the matrix decomposition
+\begin{equation}
+    \bar P_0 := \begin{bmatrix}
+        \bar P_{0,x} & \bar P_{0,xT} \\
+        \bar P_{0, xT}^\top & \bar P_{0,T}
+    \end{bmatrix},
+    \qquad 
+    \bar p_0 = \begin{bmatrix}
+        \bar p_{0, x} \\
+        \bar p_{0,T}
+    \end{bmatrix}
+\end{equation}
+Therefore, we can write our value function as,
+\begin{equation}
+    \begin{aligned}
+        & V_{0 \rightarrow N}(\delta x_0, \delta T) = \frac{1}{2} \begin{bmatrix}
+            \delta x_0 \\
+            \delta T
+        \end{bmatrix}^\top 
+        \begin{bmatrix}
+            \bar P_{0,x} & \bar P_{0,xT} \\
+            \bar P_{0, xT}^\top & \bar P_{0,T}
+        \end{bmatrix}
+        \begin{bmatrix}
+            \delta x_0 \\
+            \delta T
+        \end{bmatrix}
+        +
+        \begin{bmatrix}
+            \bar p_{0, x} \\
+            \bar p_{0,T}
+        \end{bmatrix}^\top \begin{bmatrix}
+            \delta x_0 \\
+            \delta T
+        \end{bmatrix} \\
+        & V_{0 \rightarrow N} (\delta x_0, \delta T) = \frac{1}{2} \delta x_0^\top \bar P_{0,x} \delta x_0
+        +
+        \delta T^\top \bar P_{0, xT} \delta x_0 + \frac{1}{2} \delta T^\top \bar P_{0, T} \delta T + \bar p _{0,x}^\top \delta x_0 + \bar p_{0, T}^\top \delta T
+    \end{aligned}
+\end{equation}
+We can find the optimal $\delta T$ by solving the following minimization,
+\begin{equation}
+    \min_{\delta x_0, \delta T} \quad V_{0 \rightarrow N} (\delta x_0, \delta T)
+\end{equation}
+Since $\delta x_0$ is fixed, we can write the minimization as,
+\begin{equation}
+    \min_{\delta T} \quad \delta T^\top \bar P_{0, xT} \delta x_0 + \frac{1}{2} \delta T^\top \bar P_{0, T} \delta T  + \bar p_{0, T}^\top \delta T
+\end{equation}
+We can solve this optimization in closed form. Let
+\begin{subequations}
+    \begin{align}
+        & J(\delta T) = \delta T^\top \bar P_{0, xT} \delta x_0 + \frac{1}{2} \delta T^\top \bar P_{0, T} \delta T  + \bar p_{0, T}^\top \delta T \\
+        & \frac{\partial J}{\partial \delta T} = \bar P_{0, xT} \delta x_0 + \bar P_{0, T} \delta T  + \bar p_{0, T} = 0 \\
+        & \delta T^* = - \frac{\bar p_{0,T} +  \bar P_{0,xT}^\top \delta x_0}{\bar P_{0, T}}
+    \end{align}
+\end{subequations}
+In the case that $\delta x_0 = 0$, we have,
+\begin{equation}
+    \delta T^* = - \frac{\bar p_{0,T}}{\bar P_{0,T}}.
+\end{equation}
+Therefore, we have that
+\begin{equation}
+    \delta \hat x_0 = \begin{bmatrix}
+        \delta x_0 \\
+        \delta T^*
+    \end{bmatrix}.
+\end{equation}
+Using this, $\delta \hat x_0$, we can rollout our dynamics to retrieve our optimal $\delta X, \delta U$. We lastly update our increments via,
+\begin{equation}
+    X = \bar X + \alpha \delta X, \qquad U = \bar U + \alpha \delta U, \qquad T = \bar T + \alpha \delta T
+\end{equation}
+Lastly, the controller update remains the same,
+\begin{subequations}
+    \begin{align}
+        \min_{\mathbf{\Phi}^\text{x}, \mathbf{\Phi}^\text{u}} \quad & H(\mathbf{\Phi}) \\
+        \text{s.t.} \quad
+        & \mathbf{\Phi}^\text{x}_{j+1, j} = \tilde E_j, &&\forall j \in [N], \\
+        & \mathbf{\Phi}^\text{x}_{k+1, j} = \tilde A_k \mathbf{\Phi}^\text{x}_{k,j} + \tilde B_k \mathbf{\Phi}^\text{u}_{k,j}, && \forall j \in [N], &&& \forall k \in [j + 1, N].
+    \end{align}
+\end{subequations}
+\section{Multi-Phase Min-Time Optimization}
+An extension of the above pipeline can be used for multi phase min time optimization where we seek to reach multiple waypoints each in minimum time. Formally, say we want to reach a set of sets (waypoints), $\boldsymbol{\mathcal{X}} = \{ \mathcal{X}_1, \mathcal{X}_2, \ldots, \mathcal{X}_n\}$ in min time. We therefore define the Multi-Phase Minimum Time Optimal Control Problem (MPMTOCP) as,
+\begin{subequations}
+    \begin{align}
+        \min_{\mathbf{\pi}(\cdot), T_1, \ldots, T_n} \quad & \sum_{i=0}^n T_i \\
+        \text{s.t.} \quad &  x_{k+1} = x_k + \Delta t_i \left(f_i(x_k, u_k) + E_i(x_k)w_k \right), && \forall k \in [N_{i-1}, N_i] &&& \forall i \in [n],\\
+        & x_0 = \bar{x} \\
+        & u_k = \pi_k(x_{0:k}) \\
+        & (x_k, u_k) \in \mathcal{X}^\text{safe}, && \forall k \in [N_i], &&& \forall w \in \mathcal{E}_{n_x} \\
+        & x_{N_i} \in \mathcal{X}_{f_i}, && \forall \mathcal{X}_{f_i} \in \boldsymbol{\mathcal{X}}, &&& \forall w \in \mathcal{E}_{n_x} \label{eq:term_constraint}.
+    \end{align}
+\end{subequations}
+In other words, we have $n$ terminal/waypoint constraints \eqref{eq:term_constraint} that are each constrained at their respective horizon step $N_i$. We also consider hybrid dynamics and disturbance models, where each segment $[N_{i-1}, N_i]$ has its own dynamics model and disturbance model. This is useful for cases like aerospace if you are doing like multi-stage burns/separations.
+
+We define the time variables $T_1, \ldots, T_i$ to represent the time between each segment. A nice benefit of this being min time, is the fact that we probably? will retain smooth trajectories. Following the same ideas as the single-phase minimum time optimal control problem, we define the augmented state
+\begin{equation}
+    \delta \hat x = \begin{bmatrix}
+        \delta x \\
+        \delta T_1 \\
+        \vdots \\
+        \delta T_n
+    \end{bmatrix}
+\end{equation}
+We then define the dynamics
+\begin{equation}
+    \delta \hat x_{k+1} = \begin{bmatrix}
+        \tilde{A}_k & \tilde c_k^{(1)} & \cdots & \tilde c_k^{(n)} \\
+        0 & 1 & 0 & 0\\
+        0 & 0 & \ddots & 0 \\
+        0 & 0 & 0 & 1
+    \end{bmatrix} \delta \hat x_k
+    +
+    \begin{bmatrix}
+        \tilde B_k \\
+        0 \\
+        \vdots \\
+        0
+    \end{bmatrix} \delta u_k
+    + d_k
+\end{equation}
+where we define
+\begin{equation}
+    A_{k}^{(i)} = \nabla_x f_i(\bar x_k, \bar u_k), \qquad B_{k}^{(i)} = \nabla_u f_i(\bar x_k, \bar u_k), \qquad \forall i \in [n]
+\end{equation}
+\begin{equation}
+    \tilde A_k = \begin{cases}
+        I + \Delta \tau_1 \bar{T}_1 A_k^{(1)}, & 0 \leq k < N_1, \\
+        I + \Delta \tau_2 \bar{T}_2 A_k^{(2)}, & N_1 \leq k < N_2, \\
+        \quad \vdots \\
+        I + \Delta \tau_n \bar{T}_n A_k^{(i)}, & N_{n-1} \leq k < N_n
+    \end{cases},
+    \qquad
+    \tilde B_k = \begin{cases}
+        \Delta \tau_1 \bar{T}_1 B_k, & 0 \leq k < N_1 \\
+        \Delta \tau_2 \bar{T}_2 B_k, & N_1 \leq k < N_2 \\
+        \quad \vdots \\
+        \Delta \tau_n \bar{T}_n B_k, & N_{n-1} \leq k < N_n,
+    \end{cases}
+\end{equation}
+\begin{equation}
+    \tilde c_i = \begin{cases}
+        \Delta \tau_i f_i(\bar x_k, \bar u_k), & N_{i - 1} \leq k < N_i, \\
+        0, & \text{otherwise},
+    \end{cases},
+    \qquad
+    d_k = \begin{cases}
+        \bar{x}_k + \Delta \tau_1 \bar{T}_1 f(\bar{x}_k, \bar{u}_k) - \bar{x}_{k+1}, & 0 \leq k < N_1 \\
+        \bar{x}_k + \Delta \tau_2 \bar{T}_2 f(\bar{x}_k, \bar{u}_k) - \bar{x}_{k+1}, & N_1 \leq k < N_2 \\
+        \quad \vdots \\
+        \bar{x}_k + \Delta \tau_n \bar{T}_n f(\bar{x}_k, \bar{u}_k) - \bar{x}_{k+1}, & N_{n - 1} \leq k < N_n.
+    \end{cases}
+\end{equation}
+The construction of the cost and constraints follow in a similar fashion. Therefore, the resulting optimization becomes \eqref{eq:condensed_qp}. We can follow a similar procedure to recover our optimal $\delta T_i$,
+\begin{equation}
+    \delta T^* = - \bar P_{0, T}^{-1}\left(\bar p_{0,T} +  \bar P_{0,x} \delta x_0\right)
+\end{equation}
+where we have,
+\begin{equation}
+    \delta T^* = \begin{bmatrix}
+        \delta T^*_1 \\
+        \vdots \\
+        \delta T^*_n
+    \end{bmatrix}.
+\end{equation}
+
+\section{Disturbance Aware Min Time Optimization}
+Consider our standard constraint tightening term, $h^{\text{ct}}$. From our CDC work, we know that the optimal feedback controller in the SLS optimization is invariant to the initial condition. Therefore, we write the constraint tightening as a function of our initial disturbance injections,
+\begin{equation}
+    h_k(E(x_0), E(x_1),\ldots, E(x_{k-1}))^\text{ct} := \sum_{j=0}^{k-1} \| C_k \mathbf \Phi^\text{x}_{k,j} E(x_j) + D_k \mathbf \Phi^\text{u}_{k,j}\|.
+\end{equation}
+Using the feedback definition as, $\mathbf \Phi^\text{u}_{k,j} = K_{k,j} \mathbf \Phi^\text{x}_{k,j} E(x_j)$, we get
+\begin{equation}
+    h_k(E(x_0), E(x_1),\ldots, E(x_{k-1}))^\text{ct} := \sum_{j=0}^{k-1} \| (C_k + D_k K_{k,j})\mathbf \Phi^\text{x}_{k,j} E(x_j) \|.
+\end{equation}
+Note that this is a nonlinear function. In our GPUSLS structure, between the alternating optimization, we hold all $\mathbf \Phi$ constant. Next, consider our tightened nonlinear constraints,
+\begin{equation}
+    g(x_k, u_k) + h(E(x_0), E(x_1),\ldots, E(x_{k-1}))^\text{ct} \leq 0.
+\end{equation}
+In our current approaches, we evaluate $h(E(x_0), E(x_1),\ldots, E(x_{k-1}))^\text{ct}$ once, effectively leaving it as a constant value in our optimization. However, taking this static evaluation loses information about how the constraint tightenings change with respect to our $x$. Taking a first order linearization of this, we get
+\begin{equation}
+g(\bar{x}_k,\bar{u}_k) +
+\left.\frac{\partial g}{\partial x}\right|_{(\bar{x}_k,\bar{u}_k)}
+\delta x_k
++
+\left.\frac{\partial g}{\partial u}\right|_{(\bar{x}_k,\bar{u}_k)}
+\delta u_k +
+h\!\left(E(\bar x_0), E(\bar x_1),\ldots, E(\bar x_{k-1}))\right)
++
+\left.
+\sum_{j < k}
+\frac{\partial h_k}{\partial E}
+\right|_{E(\bar{x}_j)}
+\left.
+\frac{\partial E}{\partial x}
+\right|_{\bar{x}_j}
+\delta x_j
+\le 0.
+\end{equation}
+Adding this new tightening term causes the constraint to be tightly stage-wise coupled. However, we can make slight modifications to the existing GPUSLS pipeline to handle this. We first introduce the variables to simplify notation,
+\begin{equation}
+    C_k = \left.\frac{\partial g}{\partial x}\right|_{(\bar{x}_k,\bar{u}_k)},
+    \qquad
+    D_k = \left.\frac{\partial g}{\partial u}\right|_{(\bar{x}_k,\bar{u}_k)},
+    \qquad
+    H_{k,j} = \left. \frac{\partial h_k}{\partial E}
+    \right|_{E(\bar{x}_j)}
+    \left.
+    \frac{\partial E}{\partial x}
+    \right|_{\bar{x}_j},
+\end{equation}
+and
+\begin{equation}
+    h_k(\bar x_k) = h(E(\bar x_0), E(\bar x_1), \ldots, E(\bar x_{k-1})).
+\end{equation}
+Therefore, 
+\begin{equation}
+    C_k \delta x_k + D_k \delta u_k  + \sum_{j < k} H_{k,j} \delta x_j \leq - g(\bar x_k, \bar u_k)  - h_k(\bar x_k),
+\end{equation}
+letting $f_k^\text{ct} = -g(\bar x_k, \bar u_k) - h_k(\bar x_k)$, we have,
+\begin{equation}
+    C_k \delta x_k + D_k \delta u_k  + \sum_{j < k} H_{k,j} \delta x_j \leq f^\text{ct}_k,
+\end{equation}
+Next, we introduce the split variables
+\begin{equation}
+    \bar z_k = C_k \delta x_k + D_k \delta u_k, \qquad z_{k,j} = H_{k,j} \delta x_j.
+\end{equation}
+Therefore, our split constraint becomes,
+\begin{equation}
+    \bar z_k + \sum_{j < k} z_{k,j} \leq f_k^{\text{ct}}.
+\end{equation}
+As a reminder, consider the original Augmented Lagrangian in GPUSLS,
+\begin{equation}
+        \mathcal{L}_{k}(\delta x_k, \delta u_k, \bar \lambda_k) = J_\text{QP}(\delta x_k, \delta u_k) + I_\mathcal{C}(\bar z_k)
+        +
+        \bar \lambda_k^\top (C_k \delta x_k + D_k \delta u_k - \bar z_k)
+        +
+        \frac{\rho}{2} \| C_k \delta x_k + D_k \delta u_k - \bar z_k \|^2_2 \\
+\end{equation}
+we then add our new split terms which gives us our modified augmented lagrangian,
+\begin{equation}
+    \begin{aligned}
+        \mathcal{L}_{k}(\delta x_k, \delta u_k, \bar \lambda_k, \lambda_{k+1:N}) = & J_\text{QP}(\delta x_k, \delta u_k) + I_\mathcal{C}(\bar z_k, z_{0:k-1, k})
+        +
+        \bar \lambda_k^\top (C_k \delta x_k + D_k \delta u_k - \bar z_k)
+        \\ & +
+        \frac{\rho_{\text{nom}}}{2} \| C_k \delta x_k + D_k \delta u_k - \bar z_k \|^2_2 \\
+        & + \sum_{j = k + 1}^N \lambda_{j,k}^\top (H_{j,k} \delta x_k - z_{j,k}) + \frac{\rho_{\text{grad}}}{2} \| H_{j,k} \delta x_k - z_{j,k} \|_2^2
+    \end{aligned}
+\end{equation}
+where the new indicator function is defined as
+\begin{equation}
+    I_\mathcal{C}(\bar z_k, z_{0: k-1, k}) = \begin{cases}
+        0, & \text{if } \bar z_k + \sum_{j < k} z_{k,j} \leq f_k^{\text{ct}}, \\
+        \infty, & \text{otherwise}.
+    \end{cases}
+\end{equation}
+Therefore, our new stage-wise cost terms are defined by
+\begin{equation}
+    \begin{aligned}
+        & \tilde Q_k = Q_k + \rho_{\text{nom}} C^\top_k C_k + \rho_{\text{grad}} \sum_{j=k+1}^N H_{j,k}^\top H_{j,k}, && \tilde R_k = R_k + \rho_{\text{nom}} D_k^\top D_k \\
+        & \tilde q_k = q_k + C_k^\top (\bar \lambda_k - \rho_{\text{nom}} \bar z_k) + \sum_{j=k+1}^N H_{j,k}^\top (\lambda_{j,k} - \rho_{\text{grad}} z_{j,k}), && \tilde r_k = r_k + D_k^\top (\bar \lambda - \rho_{\text{nom}} z_k) \\
+        & \tilde S_k = S_k + \rho_{\text{nom}} C_k^\top D_k
+    \end{aligned}
+\end{equation}
+Introduce the scaled dual variables
+\begin{equation}
+    \bar y_k = \frac{\bar \lambda_k}{\rho_{\text{nom}}}, \qquad y_{k,j} = \frac{\lambda_{k,j}}{\rho_\text{grad}}
+\end{equation}
+Therefore, our updated linear cost terms become
+\begin{equation}
+    \tilde q_k = q_k + \rho_{\text{nom}}C_k^\top (\bar y_k - \bar z_k) + \sum_{j=k+1}^N \rho_{\text{grad}}H_{j,k}^\top (y_{j,k} - z_{j,k}), \qquad \tilde r_k = r_k + \rho_{\text{nom}} D_k^\top (\bar y_k -  z_k). \\
+\end{equation}
+This QP retains the stage-wise separable QP structure of GPU SLS. Next we work on the projection step. We want to calculate the following,
+```latex
+\begin{equation}
+    \begin{aligned}
+        \bar z_k^+, \{z_{k,j}^+\}_{j=0}^{k-1}
+        =
+        \arg\min_{\bar z_k,\{z_{k,j}\}_{j=0}^{k-1}}
+        \quad &
+        \frac{\rho_{\mathrm{nom}}}{2}
+        \left\|
+            \bar z_k - \left(\bar z_k^\dagger + \bar y_k\right)
+        \right\|_2^2
+        +
+        \sum_{j<k}
+        \frac{\rho_{\mathrm{grad}}}{2}
+        \left\|
+            z_{k,j} - \left(z_{k,j}^\dagger + y_{k,j}\right)
+        \right\|_2^2
+        \\
+        \text{s.t.}\quad &
+        \bar z_k + \sum_{j<k} z_{k,j}
+        \leq f_k^{\mathrm{ct}}.
+    \end{aligned}
+\end{equation}
+Define
+\begin{equation}
+    \bar v_k := \bar z_k^\dagger + \bar y_k,
+    \qquad
+    v_{k,j} := z_{k,j}^\dagger + y_{k,j}.
+\end{equation}
+The Lagrangian is
+\begin{equation}
+    \begin{aligned}
+        \mathcal{L}
+        \left(
+            \bar z_k,
+            \{z_{k,j}\}_{j<k},
+            \mu_k
+        \right)
+        ={}&
+        \frac{\rho_{\mathrm{nom}}}{2}
+        \left\|
+            \bar z_k-\bar v_k
+        \right\|_2^2 +
+        \sum_{j<k}
+        \frac{\rho_{\mathrm{grad}}}{2}
+        \left\|
+            z_{k,j}-v_{k,j}
+        \right\|_2^2
+        +
+        \mu_k^\top
+        \left(
+            \bar z_k
+            +
+            \sum_{j<k}z_{k,j}
+            -
+            f_k^{\mathrm{ct}}
+        \right),
+    \end{aligned}
+\end{equation}
+where
+\begin{equation}
+    \mu_k \geq 0.
+\end{equation}
+Stationarity gives
+\begin{equation}
+    \begin{aligned}
+        \nabla_{\bar z_k}\mathcal{L}
+        &=
+        \rho_{\mathrm{nom}}
+        \left(
+            \bar z_k-\bar v_k
+        \right)
+        +
+        \mu_k
+        =
+        0,
+        \\
+        \nabla_{z_{k,j}}\mathcal{L}
+        &=
+        \rho_{\mathrm{grad}}
+        \left(
+            z_{k,j}-v_{k,j}
+        \right)
+        +
+        \mu_k
+        =
+        0,
+        \qquad j<k.
+    \end{aligned}
+\end{equation}
+Therefore,
+\begin{equation}
+    \begin{aligned}
+        \bar z_k
+        =
+        \bar v_k
+        -
+        \frac{1}{\rho_{\mathrm{nom}}}\mu_k, \qquad
+        z_{k,j}
+        =
+        v_{k,j}
+        -
+        \frac{1}{\rho_{\mathrm{grad}}}\mu_k,
+        \qquad j<k.
+    \end{aligned}
+\end{equation}
+When the constraint is active,
+\begin{equation}
+    \bar z_k
+    +
+    \sum_{j<k}z_{k,j}
+    =
+    f_k^{\mathrm{ct}}.
+\end{equation}
+Substituting the stationary solutions gives
+\begin{equation}
+    \bar v_k
+    +
+    \sum_{j<k}v_{k,j}
+    -
+    \left(
+        \frac{1}{\rho_{\mathrm{nom}}}
+        +
+        \frac{k}{\rho_{\mathrm{grad}}}
+    \right)\mu_k
+    =
+    f_k^{\mathrm{ct}},
+\end{equation}
+since there are \(k\) terms in the sum \(j=0,\ldots,k-1\). Thus,
+\begin{equation}
+    \mu_k
+    =
+    \left[
+        \frac{
+            \bar v_k
+            +
+            \displaystyle\sum_{j<k}v_{k,j}
+            -
+            f_k^{\mathrm{ct}}
+        }{
+            \displaystyle
+            \frac{1}{\rho_{\mathrm{nom}}}
+            +
+            \frac{k}{\rho_{\mathrm{grad}}}
+        }
+    \right]_+,
+\end{equation}
+where \([\cdot]_+\) denotes the componentwise positive part. Equivalently, in terms of the original variables,
+\begin{equation}
+    \mu_k
+    =
+    \left[
+        \frac{
+            \bar z_k^\dagger
+            +
+            \bar y_k
+            +
+            \displaystyle\sum_{j<k}
+            \left(
+                z_{k,j}^\dagger+y_{k,j}
+            \right)
+            -
+            f_k^{\mathrm{ct}}
+        }{
+            \displaystyle
+            \frac{1}{\rho_{\mathrm{nom}}}
+            +
+            \frac{k}{\rho_{\mathrm{grad}}}
+        }
+    \right]_+.
+\end{equation}
+
+The projected variables are therefore
+\begin{equation}
+    \boxed{
+    \begin{aligned}
+        \bar z_k^+
+        &=
+        \bar z_k^\dagger
+        +
+        \bar y_k
+        -
+        \frac{1}{\rho_{\mathrm{nom}}}\mu_k,
+        \\
+        z_{k,j}^+
+        &=
+        z_{k,j}^\dagger
+        +
+        y_{k,j}
+        -
+        \frac{1}{\rho_{\mathrm{grad}}}\mu_k,
+        \qquad j<k.
+    \end{aligned}
+    }
+\end{equation}
+```
+
+Therefore,
+\begin{equation}
+    \bar z_k^+ = \bar z_k^\dagger - \mu_k, \qquad z_{k,j}^+ = z_{k,j}^\dagger - \mu_k.
+\end{equation}
+Then our dual ascent update is,
+\begin{equation}
+    \bar \lambda^+_k = \bar \lambda^\dagger_k + \rho_{\text{nom}}(C_k \delta x_k^+ + D_k \delta u_k^+ - \bar z^+_k),
+    \qquad
+    \lambda^+_{j,k} = \lambda^\dagger_{j,k} + \rho_{\text{grad}}\left(H_{j,k} \delta x_k^+ - z_{j,k}^+ \right)
+\end{equation}
+% \begin{equation}
+%     \left.
+%     \sum_{j = k - 1 - L}^{k-1}
+%     \frac{\partial h}{\partial E}
+%     \right|_{E(\bar{x}_j)}
+%     \left.
+%     \frac{\partial E}{\partial x}
+%     \right|_{\bar{x}_j}
+%     \delta x_j.
+% \end{equation}
+% Next, we introduce the slack variables,
+\section{Min Time Optimization Results}
+\begin{table}[H]
+\centering
+\caption{Solved Optimal minimum time.}
+\label{tab:min_time_benchmark}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Benchmark} & \textbf{GPU-SLS} & \textbf{FATROP} & \textbf{IPOPT} & \textbf{acados} \\
+\midrule
+Dubins Car & 1.04 s & 1.27 s & 1.25 s & 1.24 s \\
+Quadrotor  & 1.01 s & 1.01 s & 1.01 s&  -- s\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

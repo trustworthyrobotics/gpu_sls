@@ -43,6 +43,8 @@ class GenericMPC:
         self.shift = shift
         self.obstacles = obstacles
 
+        L = sls_config.gradient_window
+
         num_obstacles = self.obstacles.shape[0]
 
         self.h_ct_ws = jnp.zeros(
@@ -122,10 +124,14 @@ class GenericMPC:
             )
         )
 
-        self.a = jnp.zeros((config.N + 1, config.N + 1, num_constraints))
-        self.b = jnp.zeros((config.N + 1, config.N + 1, num_constraints))
+        self.a = jnp.zeros((config.N + 1, L, num_constraints))
+        self.b = jnp.zeros((config.N + 1, L, num_constraints))
 
         self.rho = jnp.asarray(
+            self.admm_config.initial_rho,
+            dtype=self.w.dtype,
+        )
+        self.rho_grad = jnp.asarray(
             self.admm_config.initial_rho,
             dtype=self.w.dtype,
         )
@@ -162,7 +168,7 @@ class GenericMPC:
             V,
             w,
             y,
-            rho,
+            rho, rho_grad,
             backoffs,
             Phi_x,
             Phi_u,
@@ -182,6 +188,7 @@ class GenericMPC:
             self.w,
             self.y,
             self.rho,
+            self.rho_grad,
             self.obstacles,
             self.h_ct_ws,
             self.beta_ws,
@@ -238,13 +245,23 @@ class GenericMPC:
         self.y = rho / self.rho * self.y
         self.rho = rho
 
+        rho_grad = jnp.asarray(
+            rho_grad,
+            dtype=self.rho_grad.dtype,
+        )
+
+        # Preserve the scaled dual variable when rho changes.
+        self.a = shift_and_pad(a)
+        self.b = shift_and_pad(b)
+        
+        self.b = rho_grad / self.rho_grad * self.b
+        self.rho_grad = rho_grad
+
         # SLS response warm starts
         self.Phi_x_ws = Phi_x
         self.Phi_u_ws = Phi_u
         self.Phi_x_I_ws = Phi_x_I
         self.Phi_u_I_ws = Phi_u_I
-        self.a = shift_and_pad(a)
-        self.b = shift_and_pad(b)
 
         return (
             U[0],

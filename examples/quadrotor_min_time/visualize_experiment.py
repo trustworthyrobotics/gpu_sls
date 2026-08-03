@@ -934,3 +934,343 @@ def plot_top_down_tubes_goal_obstacles(
     else:
         plt.savefig(filename, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
+
+def plot_side_view_tubes_goal_obstacles(
+    plan,
+    lower=None,
+    upper=None,
+    centers=None,
+    radii=None,
+    goal_center=None,
+    goal_half_width=None,
+    tube_stride: int = 1,
+    tube_alpha: float = 0.15,
+    ground_height: float | None = 0.0,
+    margin: float = 0.2,
+    filename: str | None = "quadrotor_side_view_tubes.png",
+    dpi: int = 300,
+    title: str = "Quadrotor Robust Tubes: Side View",
+):
+    """
+    Plot an x-z side view of the planned trajectory, robust tubes,
+    spherical obstacles, terminal goal set, and optional ground plane.
+
+    Expected shapes
+    ---------------
+    plan:
+        (T, n_state), with position [px, py, pz, ...]
+
+    lower, upper:
+        (T, n_state), lower and upper bounds of each robust tube box
+
+    centers:
+        (K, 3), centers of spherical obstacles
+
+    radii:
+        (K,), spherical obstacle radii
+
+    goal_center:
+        (3,), center of the terminal position set
+
+    goal_half_width:
+        (3,), half-width of the terminal position box
+    """
+    plan = np.asarray(plan)
+
+    if plan.ndim != 2 or plan.shape[1] < 3:
+        raise ValueError(
+            f"plan has shape {plan.shape}. "
+            "Expected (T, n_state) with n_state >= 3."
+        )
+
+    # State indices used for the side view.
+    x_index = 0
+    z_index = 2
+
+    # Validate tube arrays.
+    lower = None if lower is None else np.asarray(lower)
+    upper = None if upper is None else np.asarray(upper)
+
+    if (lower is None) != (upper is None):
+        raise ValueError("lower and upper must be provided together.")
+
+    if lower is not None:
+        if lower.shape != upper.shape:
+            raise ValueError(
+                "lower and upper must have matching shapes; "
+                f"got {lower.shape} and {upper.shape}."
+            )
+
+        if lower.ndim != 2 or lower.shape[1] < 3:
+            raise ValueError(
+                "lower and upper must have shape (T, n_state), "
+                "with n_state >= 3."
+            )
+
+    # Validate spherical obstacles.
+    centers = None if centers is None else np.atleast_2d(np.asarray(centers))
+    radii = None if radii is None else np.asarray(radii).reshape(-1)
+
+    if centers is not None:
+        if centers.ndim != 2 or centers.shape[1] < 3:
+            raise ValueError(
+                f"centers has shape {centers.shape}. Expected (K, 3)."
+            )
+
+        if radii is None or len(radii) != len(centers):
+            raise ValueError(
+                "centers and radii must contain the same number of obstacles."
+            )
+
+        if np.any(radii < 0.0):
+            raise ValueError("Obstacle radii must be nonnegative.")
+
+    # Validate the terminal goal set.
+    if (goal_center is None) != (goal_half_width is None):
+        raise ValueError(
+            "goal_center and goal_half_width must be provided together."
+        )
+
+    if goal_center is not None:
+        goal_center = np.asarray(goal_center).reshape(-1)
+        goal_half_width = np.asarray(goal_half_width).reshape(-1)
+
+        if goal_center.size < 3 or goal_half_width.size < 3:
+            raise ValueError(
+                "goal_center and goal_half_width must each contain x, y, and z."
+            )
+
+        if np.any(goal_half_width[:3] < 0.0):
+            raise ValueError("goal_half_width must be nonnegative.")
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    # Robust tube boxes projected onto the x-z plane.
+    if lower is not None:
+        stride = max(1, int(tube_stride))
+
+        for k in range(0, len(lower), stride):
+            lo_x = lower[k, x_index]
+            lo_z = lower[k, z_index]
+            up_x = upper[k, x_index]
+            up_z = upper[k, z_index]
+
+            bounds = np.array([lo_x, lo_z, up_x, up_z])
+            if not np.all(np.isfinite(bounds)):
+                continue
+
+            width = up_x - lo_x
+            height = up_z - lo_z
+
+            if width < 0.0 or height < 0.0:
+                continue
+
+            tube_rectangle = Rectangle(
+                (lo_x, lo_z),
+                width,
+                height,
+                facecolor=PALETTE["tube_face"],
+                edgecolor=PALETTE["tube_edge"],
+                linewidth=0.6,
+                alpha=tube_alpha,
+                zorder=1,
+            )
+            ax.add_patch(tube_rectangle)
+
+        # Dummy artist for the legend.
+        ax.plot(
+            [],
+            [],
+            color=PALETTE["tube_edge"],
+            linewidth=4,
+            alpha=0.6,
+            label="Robust tube",
+        )
+
+    # Spherical obstacles projected onto the x-z plane.
+    #
+    # The orthographic projection of a sphere is a circle with the same radius,
+    # centered at (center_x, center_z).
+    if centers is not None:
+        for obstacle_index, (center, radius) in enumerate(
+            zip(centers, radii)
+        ):
+            center_x = center[x_index]
+            center_z = center[z_index]
+
+            if not np.all(np.isfinite([center_x, center_z, radius])):
+                continue
+
+            obstacle = plt.Circle(
+                (center_x, center_z),
+                float(radius),
+                facecolor=PALETTE["obs_face"],
+                edgecolor=PALETTE["obs_edge"],
+                linewidth=1.5,
+                alpha=0.45,
+                label="Obstacle" if obstacle_index == 0 else None,
+                zorder=2,
+            )
+            ax.add_patch(obstacle)
+
+            ax.scatter(
+                center_x,
+                center_z,
+                marker="x",
+                s=30,
+                color=PALETTE["obs_edge"],
+                zorder=3,
+            )
+
+    # Terminal goal box projected onto the x-z plane.
+    if goal_center is not None:
+        goal_lower_x = goal_center[x_index] - goal_half_width[x_index]
+        goal_lower_z = goal_center[z_index] - goal_half_width[z_index]
+
+        goal_rectangle = Rectangle(
+            (goal_lower_x, goal_lower_z),
+            2.0 * goal_half_width[x_index],
+            2.0 * goal_half_width[z_index],
+            facecolor=PALETTE["goal_face"],
+            edgecolor=PALETTE["goal_edge"],
+            linewidth=2.0,
+            alpha=0.3,
+            label="Goal terminal set",
+            zorder=2,
+        )
+        ax.add_patch(goal_rectangle)
+
+        ax.scatter(
+            goal_center[x_index],
+            goal_center[z_index],
+            marker="*",
+            s=90,
+            color=PALETTE["goal_edge"],
+            zorder=4,
+        )
+
+    # Nominal planned trajectory.
+    valid_plan = np.all(
+        np.isfinite(plan[:, [x_index, z_index]]),
+        axis=1,
+    )
+
+    if np.any(valid_plan):
+        ax.plot(
+            plan[valid_plan, x_index],
+            plan[valid_plan, z_index],
+            linestyle="--",
+            linewidth=2.5,
+            color=PALETTE["plan"],
+            label="Planned trajectory",
+            zorder=4,
+        )
+
+        first_valid_index = np.flatnonzero(valid_plan)[0]
+        ax.scatter(
+            plan[first_valid_index, x_index],
+            plan[first_valid_index, z_index],
+            marker="o",
+            s=55,
+            color=PALETTE["plan"],
+            label="Start",
+            zorder=5,
+        )
+
+    # Optional ground-height line.
+    if ground_height is not None:
+        ground_height = float(ground_height)
+        if not np.isfinite(ground_height):
+            raise ValueError("ground_height must be finite or None.")
+
+        ax.axhline(
+            ground_height,
+            color=PALETTE["obs_edge"],
+            linestyle="-",
+            linewidth=1.5,
+            alpha=0.7,
+            label="Ground",
+            zorder=0,
+        )
+
+    # Collect all relevant extents.
+    extent_x = [plan[:, x_index]]
+    extent_z = [plan[:, z_index]]
+
+    if lower is not None:
+        extent_x.extend([
+            lower[:, x_index],
+            upper[:, x_index],
+        ])
+        extent_z.extend([
+            lower[:, z_index],
+            upper[:, z_index],
+        ])
+
+    if centers is not None:
+        extent_x.extend([
+            centers[:, x_index] - radii,
+            centers[:, x_index] + radii,
+        ])
+        extent_z.extend([
+            centers[:, z_index] - radii,
+            centers[:, z_index] + radii,
+        ])
+
+    if goal_center is not None:
+        extent_x.append(np.array([
+            goal_center[x_index] - goal_half_width[x_index],
+            goal_center[x_index] + goal_half_width[x_index],
+        ]))
+        extent_z.append(np.array([
+            goal_center[z_index] - goal_half_width[z_index],
+            goal_center[z_index] + goal_half_width[z_index],
+        ]))
+
+    if ground_height is not None:
+        extent_z.append(np.array([ground_height]))
+
+    extent_x = np.concatenate([
+        np.asarray(values).reshape(-1)
+        for values in extent_x
+    ])
+    extent_z = np.concatenate([
+        np.asarray(values).reshape(-1)
+        for values in extent_z
+    ])
+
+    finite_x = extent_x[np.isfinite(extent_x)]
+    finite_z = extent_z[np.isfinite(extent_z)]
+
+    if finite_x.size == 0:
+        finite_x = np.array([0.0])
+
+    if finite_z.size == 0:
+        finite_z = np.array([0.0])
+
+    x_min = float(np.min(finite_x))
+    x_max = float(np.max(finite_x))
+    z_min = float(np.min(finite_z))
+    z_max = float(np.max(finite_z))
+
+    # Equal physical scaling without forcing a square figure.
+    x_padding = max(float(margin), 0.05 * max(x_max - x_min, 1.0))
+    z_padding = max(float(margin), 0.05 * max(z_max - z_min, 1.0))
+
+    ax.set_xlim(x_min - x_padding, x_max + x_padding)
+    ax.set_ylim(z_min - z_padding, z_max + z_padding)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("z (m)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.35)
+    ax.legend(loc="best", framealpha=0.9)
+
+    plt.tight_layout()
+
+    if filename is None:
+        plt.show()
+    else:
+        plt.savefig(filename, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)

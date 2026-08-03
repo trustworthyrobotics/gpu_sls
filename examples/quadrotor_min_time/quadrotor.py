@@ -5,6 +5,8 @@ import os
 from typing import Any
 
 import jax
+
+jax.config.update("jax_enable_x64", False)
 import jax.numpy as jnp
 from jax import config
 
@@ -16,7 +18,7 @@ from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints, make_control_box_constraints, make_state_box_constraints
 from gpu_sls.utils.sls_visual import get_trajectory_tubes
-from visualize_experiment import plot_controls, plot_quadrotor_3d, plot_tube_graph_quadrotor, plot_top_down_tubes_goal_obstacles
+from visualize_experiment import plot_controls, plot_quadrotor_3d, plot_tube_graph_quadrotor, plot_top_down_tubes_goal_obstacles, plot_side_view_tubes_goal_obstacles
 
 #export ACADOS_SOURCE_DIR=/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/acados_baseline/acados
 # export LD_LIBRARY_PATH="$ACADOS_SOURCE_DIR/lib:${LD_LIBRARY_PATH:-}"
@@ -45,8 +47,8 @@ GRAVITY = 9.81
 JX = 0.02
 JY = 0.02
 JZ = 0.04
-J = jnp.diag(jnp.array([JX, JY, JZ], dtype=jnp.float32))
-J_INV = jnp.diag(jnp.array([1.0 / JX, 1.0 / JY, 1.0 / JZ], dtype=jnp.float32))
+J = jnp.diag(jnp.array([JX, JY, JZ], dtype=jnp.float64))
+J_INV = jnp.diag(jnp.array([1.0 / JX, 1.0 / JY, 1.0 / JZ], dtype=jnp.float64))
 
 NUM_RANDOM = 5
 NUM_ADV = 26
@@ -62,7 +64,7 @@ def rotation_matrix(phi: jnp.ndarray, theta: jnp.ndarray, psi: jnp.ndarray) -> j
         [cpsi * cth, cpsi * sth * sphi - spsi * cphi, cpsi * sth * cphi + spsi * sphi],
         [spsi * cth, spsi * sth * sphi + cpsi * cphi, spsi * sth * cphi - cpsi * sphi],
         [-sth,       cth * sphi,                          cth * cphi],
-    ], dtype=jnp.float32)
+    ], dtype=jnp.float64)
 
 def euler_angle_rates_matrix(phi: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarray:
     sphi, cphi = jnp.sin(phi), jnp.cos(phi)
@@ -73,7 +75,7 @@ def euler_angle_rates_matrix(phi: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarra
         [1.0, sphi * tth, cphi * tth],
         [0.0, cphi,       -sphi],
         [0.0, sphi / cth, cphi / cth],
-    ], dtype=jnp.float32)
+    ], dtype=jnp.float64)
 
 def rigid_body_3d_step(x: jnp.ndarray, u: jnp.ndarray, dt: float) -> jnp.ndarray:
     px, py, pz, phi, theta, psi, vx, vy, vz, p, q, r = x[:12]
@@ -224,7 +226,7 @@ def build_piecewise_reference(x0: jnp.ndarray, x_goal: jnp.ndarray, N: int, dura
     dpsi = x_goal[5] - x0[5]
     psi = x0[5] + t * dpsi
 
-    X_ref = jnp.zeros((N + 1, 13), dtype=jnp.float32)
+    X_ref = jnp.zeros((N + 1, 13), dtype=jnp.float64)
 
     X_ref = X_ref.at[:, :3].set(pos)
     X_ref = X_ref.at[:, 5].set(psi)
@@ -300,28 +302,77 @@ def make_terminal_set_constraint(center: jnp.ndarray, half_width: jnp.ndarray, N
 
 #     return disturbance
 
+# def make_min_time_disturbance(
+#     n: int,
+#     N: int,
+#     disturbance_index: int = 6,
+# ):
+#     """
+#     Disturbance magnitude:
+#         - 3.0 for z >= 0.25
+#         - decreases quadratically to 0.1 at z = 0
+#         - clipped at 0.1 below z = 0
+#     """
+
+#     def disturbance_at_state(x_k: jnp.ndarray) -> jnp.ndarray:
+#         z = x_k[2]
+#         final_time = x_k[-1]
+#         dt = final_time / N
+
+#         # Normalize altitude into [0, 1]
+#         s = jnp.clip((z + 0.1), 0.0, 1.0)
+
+#         # Quadratic profile
+#         E_mag = 0.01 + 10.0 * s**2
+
+#         E_k = jnp.zeros((n, n), dtype=x_k.dtype)
+#         E_k = E_k.at[
+#             disturbance_index,
+#             disturbance_index,
+#         ].set(dt * E_mag)
+
+#         return E_k
+
+#     def disturbance(X: jnp.ndarray) -> jnp.ndarray:
+#         return jax.vmap(disturbance_at_state)(X)
+
+#     disturbance.at_state = disturbance_at_state
+#     return disturbance
+
 def make_min_time_disturbance(
     n: int,
     N: int,
     disturbance_index: int = 6,
 ):
     """
-    Disturbance magnitude:
-        - 3.0 for z >= 0.25
-        - decreases quadratically to 0.1 at z = 0
-        - clipped at 0.1 below z = 0
+    Smooth tanh disturbance profile:
+
+        - approximately 0.01 at low altitude
+        - approximately 10.01 at high altitude
+        - transition centered at z = 0.25
+
+    Increase sharpness for a steeper transition.
     """
+
+    transition_height = -1.0
+    sharpness = 5.0
+    min_mag = 0.01
+    max_mag = 4.01
 
     def disturbance_at_state(x_k: jnp.ndarray) -> jnp.ndarray:
         z = x_k[2]
         final_time = x_k[-1]
         dt = final_time / N
 
-        # Normalize altitude into [0, 1]
-        s = jnp.clip(z / 0.25, 0.0, 1.0)
+        # Smoothly maps z from low magnitude to high magnitude.
+        s = 3.0 * (
+            jnp.tanh(
+                6 * z - 2
+            ) + 1
+        )
 
-        # Quadratic profile
-        E_mag = 0.1 + (3.0 - 0.1) * s**2
+        # E_mag = min_mag + (max_mag - min_mag) * s
+        E_mag = s
 
         E_k = jnp.zeros((n, n), dtype=x_k.dtype)
         E_k = E_k.at[
@@ -394,7 +445,7 @@ def main():
     # -----------------------------
     # Horizon and dt
     # -----------------------------
-    N = 30
+    N = 50
     parameter = 1.0 / N
     initial_duration = 2.0
 
@@ -408,15 +459,15 @@ def main():
     #     0.05, 0.05, 0.05,     # body rates
     #     0.01, 0.01, 0.01, 0.01,  # control
     #     5.0                         # total time
-    # ], dtype=jnp.float32)
+    # ], dtype=jnp.float64)
     W = jnp.array([
-        0.01, 0.01, 0.01,     # position
+        1e-5, 1e-5, 1e-5,     # position
         0.01, 0.01, 0.01,        # roll, pitch, yaw
         0.01, 0.01, 0.01,        # velocities
         0.01, 0.01, 0.01,     # body rates
         0.01, 0.01, 0.01, 0.01,  # control
         5.0                         # total time
-    ], dtype=jnp.float32)
+    ], dtype=jnp.float64)
     
 
     cfg = MPCConfig(
@@ -424,7 +475,7 @@ def main():
         nu=nu,
         N=N,
         W=W,
-        u_ref=jnp.array([MASS * GRAVITY, 0.0, 0.0, 0.0], dtype=jnp.float32),
+        u_ref=jnp.array([MASS * GRAVITY, 0.0, 0.0, 0.0], dtype=jnp.float64),
     )
 
     # -----------------------------
@@ -434,8 +485,8 @@ def main():
     T_max = 2.0 * T_hover
     tau_max = 10.0
 
-    u_min = jnp.array([0.0, -tau_max, -tau_max, -tau_max], dtype=jnp.float32)
-    u_max = jnp.array([T_max, tau_max, tau_max, tau_max], dtype=jnp.float32)
+    u_min = jnp.array([0.0, -tau_max, -tau_max, -tau_max], dtype=jnp.float64)
+    u_max = jnp.array([T_max, tau_max, tau_max, tau_max], dtype=jnp.float64)
     constraints_u = make_control_box_constraints(u_min, u_max)
 
     # -----------------------------
@@ -449,32 +500,36 @@ def main():
         5.0, 5.0, 5.0,          # vx, vy, vz
         8.0, 8.0, 8.0,          # p, q, r
         20.0                      # total time
-    ], dtype=jnp.float32)
+    ], dtype=jnp.float64)
     x_min = -x_max
     x_min = x_min.at[2].set(-1.0)
     x_min = x_min.at[-1].set(0.1)
 
     constraints_x = make_state_box_constraints(x_min, x_max)
-    terminal_center = jnp.array([1.0, 0.1, 0.5], dtype=jnp.float32)
-    terminal_half_width = jnp.array([0.4, 0.4, 0.4], dtype=jnp.float32)
+    terminal_center = jnp.array([5.0, 0.1, 1.0], dtype=jnp.float64)
+    terminal_half_width = jnp.array([0.6, 0.6, 0.2], dtype=jnp.float64)
     terminal_constraint = make_terminal_set_constraint(
         terminal_center, terminal_half_width, N
     )
     obstacle_constraint = make_sphere_obstacle_constraint(
-        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32), radius=0.4
+        jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64), radius=0.4
     )
+    # constraints_all = combine_constraints(
+    #     constraints_x, constraints_u, terminal_constraint, obstacle_constraint
+    # )
     constraints_all = combine_constraints(
-        constraints_x, constraints_u, terminal_constraint, obstacle_constraint
-    )
+            constraints_x, constraints_u, terminal_constraint
+        )
 
     # obstacles = jnp.array([
     #     [0.0, 0.0, 0.35],
-    # ], dtype=jnp.float32)
+    # ], dtype=jnp.float64)
 
     obstacles = jnp.zeros((0, 3))
 
     n_obs = obstacles.shape[0]
-    nc = 2 * nu + 2 * n + n_obs + 6 + 1
+    # nc = 2 * nu + 2 * n + n_obs + 6 + 1
+    nc = 2 * nu + 2 * n + n_obs + 6
 
     E_mag = 3.5
     # disturbance = make_min_time_disturbance(n=n, E_mag=E_mag, N=N)
@@ -484,27 +539,27 @@ def main():
     # Initial / goal
     # -----------------------------
     x0 = jnp.array([
-        -0.75, -0.1, 0.25,    # px, py, pz
+        -0.75, -0.1, -0.5,    # px, py, pz
         0.0, 0.0, 0.0,          # phi, theta, psi
         0.0, 0.0, 0.0,          # vx, vy, vz
         0.0, 0.0, 0.0,          # p, q, r
         initial_duration             # total time
-    ], dtype=jnp.float32)
+    ], dtype=jnp.float64)
 
     x_goal = jnp.array([
-        1.0, 0.1, 0.5,          # px, py, pz
+        5.0, 0.1, 1.0,          # px, py, pz
         0.0, 0.0, 0.0,          # phi, theta, psi
         0.0, 0.0, 0.0,          # vx, vy, vz
         0.0, 0.0, 0.0,          # p, q, r
         initial_duration             # total time
-    ], dtype=jnp.float32)
+    ], dtype=jnp.float64)
 
     X_ref = build_piecewise_reference(x0, x_goal, N, initial_duration)
     reference = X_ref
     T_steps = N
 
     key = jax.random.PRNGKey(0)
-    E_sim = E_mag * jnp.eye(n, dtype=jnp.float32)
+    E_sim = E_mag * jnp.eye(n, dtype=jnp.float64)
     E_sim = E_sim.at[-1, -1].set(0.0)
 
     # -----------------------------
@@ -512,7 +567,9 @@ def main():
     # -----------------------------
     admm_cfg = ADMMConfig(
         eps_abs=5e-2,
-        eps_rel=5e-4,
+        eps_rel=1e-3,
+        eps_abs_grad=1e-2,
+        eps_rel_grad=1e-3,
         rho_max=1e3,
         max_iterations=1000,
         rho_update_frequency=25,
@@ -523,15 +580,16 @@ def main():
     sls_cfg = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1e-2,
-        enable_fastsls=False,
+        enable_fastsls=True,
         initialize_nominal=True,
         max_initial_sqp_iterations=100,
         warm_start=True,
         rti=False,
+        gradient_window=10,
     )
 
     sqp_cfg = SQPConfig(
-        max_sqp_iterations=50,
+        max_sqp_iterations=100,
         warm_start=True,
         feas_tol=1e-10,
         step_tol=1e-10,
@@ -551,7 +609,7 @@ def main():
         disturbance=disturbance,
         shift=1,
         X_in=X_ref,
-        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float32).at[:, 0].set(T_hover),
+        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float64).at[:, 0].set(T_hover),
     )
 
     # -----------------------------
@@ -580,12 +638,12 @@ def main():
     stop_steps = np.full((N_ROLLOUTS,), T_steps, dtype=np.int32)
 
     # for i in range(N_ROLLOUTS):
-    #     disturbance_history = [jnp.zeros((n,), dtype=jnp.float32)]
+    #     disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
     #     x = x0.at[-1].set(min_time)
     #     jax.debug.print("Rolling out iteration {}", i)
 
     #     for k in range(T_steps):
-    #         disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float32)
+    #         disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
     #         for j in range(k + 1):
     #             disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
 
@@ -608,12 +666,12 @@ def main():
     upper = X_pred[:, :3] + tube[:, :3]
 
     obstacle_centers = jnp.array([
-        [0.0, 0.0, 0.0],
-    ], dtype=jnp.float32)
+        [0.0, 0.05, 0.0],
+    ], dtype=jnp.float64)
 
     obstacle_radii = jnp.array([
         0.40,
-    ], dtype=jnp.float32)
+    ], dtype=jnp.float64)
 
     plot_quadrotor_3d(
         xs=xs,
@@ -655,6 +713,32 @@ def main():
         goal_half_width=np.asarray(terminal_half_width),
         tube_stride=1,
         filename="quadrotor_top_down_tubes.png",
+    )
+
+    plot_side_view_tubes_goal_obstacles(
+        plan=X_pred,
+        lower=lower,
+        upper=upper,
+        centers=obstacle_centers,
+        radii=obstacle_radii,
+        goal_center=np.asarray(terminal_center),
+        goal_half_width=np.asarray(terminal_half_width),
+        tube_stride=2,
+        ground_height=0.0,
+        filename="quadrotor_side_view_tubes.png",
+    )
+
+    np.savez(
+        "quadrotor_side_view_data.npz",
+        plan=np.asarray(X_pred),
+        lower=np.asarray(lower),
+        upper=np.asarray(upper),
+        centers=np.asarray(obstacle_centers),
+        radii=np.asarray(obstacle_radii),
+        goal_center=np.asarray(terminal_center),
+        goal_half_width=np.asarray(terminal_half_width),
+        ground_height=np.asarray(0.0, dtype=np.float32),
+        tube_stride=np.asarray(2, dtype=np.int32),
     )
 
 
