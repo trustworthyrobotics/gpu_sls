@@ -390,125 +390,6 @@ def admm_residuals(
         eps_dual_grad,
     )
 
-# def admm_residuals(
-#     z_bar, w, w_prev, y, z_grad,
-#     a, a_prev, b, rho,
-#     eps_abs=1e-2,
-#     eps_rel=1e-2,
-# ):
-#     T = z_grad.shape[0]
-
-#     causal_mask = jnp.tril(
-#         jnp.ones((T, T), dtype=z_grad.dtype),
-#         k=-1,
-#     )[:, :, None]
-
-#     # Reconstruct the complete constraint quantities.
-#     z_total = z_bar + jnp.sum(causal_mask * z_grad, axis=1)
-#     w_total = w + jnp.sum(causal_mask * a, axis=1)
-
-#     # The residual now measures the actual aggregate constraint mismatch.
-#     r_total = z_total - w_total
-#     r_norm = jnp.linalg.norm(r_total.reshape(-1), ord=jnp.inf)
-
-#     # Aggregate dual residual consistently.
-#     w_total_prev = w_prev + jnp.sum(causal_mask * a_prev, axis=1)
-#     s_total = rho * (w_total - w_total_prev)
-#     s_norm = jnp.linalg.norm(s_total.reshape(-1), ord=jnp.inf)
-
-#     primal_scale = jnp.maximum(
-#         jnp.linalg.norm(z_total.reshape(-1), ord=jnp.inf),
-#         jnp.linalg.norm(w_total.reshape(-1), ord=jnp.inf),
-#     )
-
-#     dual_total = y + jnp.sum(causal_mask * b, axis=1)
-#     dual_scale = rho * jnp.linalg.norm(
-#         dual_total.reshape(-1),
-#         ord=jnp.inf,
-#     )
-
-#     eps_pri = eps_abs + eps_rel * primal_scale
-#     eps_dual = eps_abs + eps_rel * dual_scale
-
-#     return r_norm, s_norm, eps_pri, eps_dual
-
-# def admm_residuals(
-#     z_bar, w, w_prev, y, z_grad,
-#     a, a_prev, b, rho,
-#     eps_abs=1e-2,
-#     eps_rel=1e-2,
-# ):
-#     T = z_grad.shape[0]
-
-#     causal_mask = jnp.tril(
-#         jnp.ones((T, T), dtype=z_grad.dtype),
-#         k=-1,
-#     )[:, :, None]
-
-#     # -------------------------
-#     # Primal residuals
-#     # -------------------------
-#     r_bar = z_bar - w
-#     r_grad = causal_mask * (z_grad - a)
-
-#     r_bar_norm = jnp.linalg.norm(r_bar.reshape(-1), ord=jnp.inf)
-#     r_grad_norm = jnp.linalg.norm(r_grad.reshape(-1), ord=jnp.inf)
-
-#     r_norm = jnp.maximum(r_bar_norm, r_grad_norm)
-
-#     # -------------------------
-#     # Dual residuals
-#     # -------------------------
-#     s_bar = rho * (w - w_prev)
-#     s_grad = rho * causal_mask * (a - a_prev)
-
-#     s_bar_norm = jnp.linalg.norm(s_bar.reshape(-1), ord=jnp.inf)
-#     s_grad_norm = jnp.linalg.norm(s_grad.reshape(-1), ord=jnp.inf)
-
-#     s_norm = jnp.maximum(s_bar_norm, s_grad_norm)
-
-#     # -------------------------
-#     # Primal tolerance
-#     # -------------------------
-#     direct_primal_scale = jnp.maximum(
-#         jnp.linalg.norm(z_bar.reshape(-1), ord=jnp.inf),
-#         jnp.linalg.norm(w.reshape(-1), ord=jnp.inf),
-#     )
-
-#     coupled_primal_scale = jnp.maximum(
-#         jnp.linalg.norm((causal_mask * z_grad).reshape(-1), ord=jnp.inf),
-#         jnp.linalg.norm((causal_mask * a).reshape(-1), ord=jnp.inf),
-#     )
-
-#     primal_scale = jnp.maximum(
-#         direct_primal_scale,
-#         coupled_primal_scale,
-#     )
-
-#     eps_pri = eps_abs + eps_rel * primal_scale
-
-#     # -------------------------
-#     # Dual tolerance
-#     # -------------------------
-#     direct_dual_scale = rho * jnp.linalg.norm(
-#         y.reshape(-1),
-#         ord=jnp.inf,
-#     )
-
-#     coupled_dual_scale = rho * jnp.linalg.norm(
-#         (causal_mask * b).reshape(-1),
-#         ord=jnp.inf,
-#     )
-
-#     dual_scale = jnp.maximum(
-#         direct_dual_scale,
-#         coupled_dual_scale,
-#     )
-
-#     eps_dual = eps_abs + eps_rel * dual_scale
-
-#     return r_norm, s_norm, eps_pri, eps_dual
-
 def adaptive_rho_update(
     rp_norm,
     rd_norm,
@@ -796,6 +677,19 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
             eps_rel_grad=cfg.eps_rel_grad,
         )
 
+        r_primal = jnp.abs(z_bar - w_new)
+        idx = jnp.argmax(r_primal)
+        stage, constraint = jnp.unravel_index(idx, r_primal.shape)
+
+        # jax.debug.print(
+        #     "ADMM it={} worst primal: stage={} constraint={} residual={:.3e} tol={:.3e}",
+        #     it,
+        #     stage,
+        #     constraint,
+        #     r_primal[stage, constraint],
+        #     eps_pri,
+        # )
+
         # Convergence check
         nominal_converged = (
             (rp_norm <= eps_pri)
@@ -818,14 +712,34 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
                 y_new,
                 rho_max,
             )
-            rho_grad_upd, b_upd, updated_grad = rho_update_scaled_duals(
-                rp_grad_norm,
-                rd_grad_norm,
-                rho_grad,
-                b_new,
-                rho_max,
+            if L > 0:
+                rho_grad_upd, b_upd, updated_grad = rho_update_scaled_duals(
+                    rp_grad_norm,
+                    rd_grad_norm,
+                    rho_grad,
+                    b_new,
+                    rho_max,
+                )
+            else:
+                rho_grad_upd = rho_grad
+                b_upd = b_new
+                updated_grad = jnp.array(False)
+
+            return (
+                rho_upd,
+                rho_grad_upd,
+                y_upd,
+                b_upd,
+                jnp.logical_or(updated, updated_grad),
             )
-            return rho_upd, rho_grad_upd, y_upd, b_upd, jnp.bitwise_or(updated, updated_grad)
+            # rho_grad_upd, b_upd, updated_grad = rho_update_scaled_duals(
+            #     rp_grad_norm,
+            #     rd_grad_norm,
+            #     rho_grad,
+            #     b_new,
+            #     rho_max,
+            # )
+            # return rho_upd, rho_grad_upd, y_upd, b_upd, jnp.bitwise_or(updated, jnp.bitwise_and(updated_grad, L > 0))
 
 
         def no_update_fn(_):
@@ -881,8 +795,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     n = Q.shape[1]
     nx = Q.shape[-1]
     nu = R.shape[-1]
-    f = f - cfg.eps_abs
-    # f = f
+    # f = f - cfg.eps_abs
+    f = f
     R = jnp.concatenate([R, jnp.zeros((1, nu, nu), dtype=R.dtype)], axis=0)
     r = jnp.concatenate([r, jnp.zeros((1, nu), dtype=r.dtype)], axis=0)
     M = jnp.concatenate([M, jnp.zeros((1, nx, nu), dtype=M.dtype)], axis=0)
@@ -930,9 +844,102 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     (it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, rho_grad_final, _, _, _, P_final, p_final, K, a_bar, b_bar, rp_norm, rd_norm, eps_pri, eps_dual,
      rp_norm_grad, rd_norm_grad, eps_pri_grad, eps_dual_grad, converged) = out
     v = dual_lqr(x_bar, P_final, p_final)
-    jax.debug.print(
-        "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e} Rho_grad_final {:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho_grad0 {:.3e}",
-        it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0, rho_grad_final, rp_norm_grad, eps_pri_grad, rd_norm_grad, eps_dual_grad, rho_grad0
+
+    # ---------------------------------------------------------
+    # Recompute the final nominal constraint values
+    # ---------------------------------------------------------
+    z_bar = (
+        jnp.einsum("tmi,ti->tm", C, x_bar)
+        + jnp.einsum("tmi,ti->tm", D, u_bar)
     )
+
+    # Absolute primal residual for every constraint
+    r_primal = jnp.abs(z_bar - w_bar)
+
+    # Worst nominal primal residual
+    worst_idx = jnp.argmax(r_primal)
+    worst_stage, worst_constraint = jnp.unravel_index(
+        worst_idx,
+        r_primal.shape,
+    )
+
+    # ---------------------------------------------------------
+    # Gradient residual (if enabled)
+    # ---------------------------------------------------------
+    if L > 0:
+        x_window, _ = previous_state_windows(x_bar, L)
+        z_grad = jnp.einsum("kcln,kln->klc", Jh, x_window)
+
+        window_mask_final = make_gradient_window_mask(
+            T + 1,
+            L,
+            A.dtype,
+        )
+
+        r_grad = jnp.abs(
+            window_mask_final[:, :, None]
+            * (z_grad - a_bar)
+        )
+
+        worst_grad = jnp.max(r_grad)
+    else:
+        worst_grad = jnp.asarray(0.0, dtype=Q.dtype)
+
+    # ---------------------------------------------------------
+    # Original ADMM summary
+    # ---------------------------------------------------------
+    jax.debug.print(
+        "ADMM done: Total Iterations={} converged={} "
+        "rho={:.3e} rp={:.3e} (<= {:.3e}) "
+        "rd={:.3e} (<= {:.3e}) "
+        "Rho0 {:.3e} "
+        "Rho_grad_final {:.3e} "
+        "rp_grad={:.3e} (<= {:.3e}) "
+        "rd_grad={:.3e} (<= {:.3e}) "
+        "Rho_grad0 {:.3e}",
+        it - 1,
+        converged,
+        rho_final,
+        rp_norm,
+        eps_pri,
+        rd_norm,
+        eps_dual,
+        rho0,
+        rho_grad_final,
+        rp_norm_grad,
+        eps_pri_grad,
+        rd_norm_grad,
+        eps_dual_grad,
+        rho_grad0,
+    )
+
+    # ---------------------------------------------------------
+    # Detailed diagnostics
+    # ---------------------------------------------------------
+    # jax.debug.print(
+    #     "\nWorst nominal primal residual:"
+    #     "\n  stage       = {}"
+    #     "\n  constraint  = {}"
+    #     "\n  residual    = {:.6e}"
+    #     "\n  z_bar       = {:.6e}"
+    #     "\n  w_bar       = {:.6e}"
+    #     "\n  rhs (f)     = {:.6e}"
+    #     "\n  ratio        = {:.3f}",
+    #     worst_stage,
+    #     worst_constraint,
+    #     r_primal[worst_stage, worst_constraint],
+    #     z_bar[worst_stage, worst_constraint],
+    #     w_bar[worst_stage, worst_constraint],
+    #     f[worst_stage, worst_constraint],
+    #     r_primal[worst_stage, worst_constraint]
+    #     / jnp.maximum(eps_pri, 1e-12),
+    # )
+
+    # jax.debug.print(
+    #     "Largest gradient residual = {:.6e}",
+    #     worst_grad,
+    # )
+
     mu = rho_final * y_bar
+
     return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, rho_grad_final, mu, a_bar, b_bar, converged

@@ -491,16 +491,6 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
         C_box = C[:, :num_regular_constraints, :]
         D_box = D[:, :num_regular_constraints, :]
 
-        # Jh = jax.jacfwd(
-        #     lambda primal_pos: tightening_from_nominal_state(
-        #         disturbance_fn,
-        #         primal_pos,
-        #         Phi_x_I,
-        #         Phi_u_I,
-        #         C_box,
-        #         D_box,
-        #     )
-        # )(primal_pos)
         Phi_x_window = make_phi_windows(Phi_x_I, L)
         Phi_u_window = make_phi_windows(Phi_u_I, L)
 
@@ -533,13 +523,10 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
             C_box,
             D_box,
         )
-                # jax.debug.print("{}", jnp.isnan(Jh).any())
-        # Jh = jnp.zeros_like(Jh)
+
         x_curr, u_curr, v_curr, w, y, rho, rho_grad, mu, a, b, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho, rho_grad, Jh_window, a, b, L 
         )
-        prev_rho = rho
-
         metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
         mu_nominal = mu[: , :num_regular_constraints]
         eta_stage, eta_f = get_etas(mu_nominal, beta)
@@ -549,8 +536,7 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
         Phi_u = jnp.einsum("kjab,jbc->kjac", Phi_u_I, E)
         beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
-        y = prev_rho / rho * y
-        rho = jnp.asarray(rho, dtype=prev_rho.dtype)
+        rho = jnp.asarray(rho, dtype=rho.dtype)
         w   = jnp.asarray(w,   dtype=w.dtype)
         y   = jnp.asarray(y,   dtype=y.dtype)
         converged_now = metric <= tol

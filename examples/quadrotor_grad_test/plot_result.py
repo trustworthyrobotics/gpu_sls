@@ -16,6 +16,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.patches import Circle, Rectangle
 
 
@@ -102,7 +103,11 @@ def draw_disturbance_gradient(
         zorder=-10,
     )
 
-    colorbar = fig.colorbar(image, ax=ax, pad=0.02)
+    # Tie the colorbar axes to the plot axes so equal-aspect and layout changes
+    # keep both axes exactly the same height.
+    divider = make_axes_locatable(ax)
+    colorbar_ax = divider.append_axes("right", size="3%", pad=0.12)
+    colorbar = fig.colorbar(image, cax=colorbar_ax)
     colorbar.set_label(r"Disturbance magnitude $E_{\mathrm{mag}}(z)$ before $\Delta t$ scaling")
 
 

@@ -250,13 +250,21 @@ def filter_model_evaluator_factory(
         # Original nonlinear nominal constraints.
         g_base = vectorize(constraints)(X, U_pad, t)
 
+        # C_all, D_all = linearize(constraints)(
+        #     X,
+        #     U_pad,
+        #     t,
+        # )
+
         # Recompute tightening for this line-search candidate.
+        # h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_all, D_all)
         h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
         # h_ct_trial = backoffs
         # h_ct_trial = jnp.zeros_like(h_ct_trial)
         # Handle the case where the tightening contains only base constraints,
         # while g_base may contain additional constraint channels.
         n_tight = h_ct_trial.shape[1]
+        eps_abs = 0
         g_base_tight = (
             g_base[:, :n_tight]
             + h_ct_trial
@@ -407,8 +415,21 @@ def compute_search_direction(
     f = -g
     C, D = linearize(constraints)(X, U_pad, t)
     C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
+    # ????
+    terminal_control_rows = jnp.linalg.norm(D_all[-1], axis=-1) > 1e-7
 
-    Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[1]), Q.shape)
+    D_all = D_all.at[-1].set(jnp.zeros_like(D_all[-1]))
+
+    f_all = f_all.at[-1].set(
+        jnp.where(
+            terminal_control_rows,
+            jnp.asarray(1e6, dtype=f_all.dtype),
+            f_all[-1],
+        )
+    )
+    # ?????
+
+    Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[-1]), Q.shape).at[..., 0, 0].set(10.0)
     R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]) * 0.5, R.shape)
 
     n_obs = obstacles.shape[0]
@@ -477,6 +498,7 @@ def sqp(
             g, c = model_evaluator(X_curr, U_curr)
             feas = jnp.max(jnp.abs(c))
             warm_flag = jnp.logical_and(jnp.array(bool(sqp_config.warm_start)), converged_admm)
+            # warm_flag = jnp.array(bool(sqp_config.warm_start))
             # warm_flag = jnp.logical_and(warm_flag, jnp.array(i != sls_config.max_initial_sqp_iterations))
             # Turn this off? seems to be more optimal
             w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
@@ -514,11 +536,13 @@ def sqp(
             U_curr_pad = jnp.pad(U_curr, ((0, 1), (0, 0)))
             t_curr = jnp.arange(T + 1)
 
-            C_box, D_box = linearize(constraints)(
+            C_all, D_all = linearize(constraints)(
                 X_curr,
                 U_curr_pad,
                 t_curr,
             )
+
+            D_all = D_all.at[-1].set(jnp.zeros_like(D_all[-1]))
 
             converged1 = jnp.logical_and(feas_ok, step_ok)
             filter_model_evaluator = filter_model_evaluator_factory(
@@ -527,8 +551,8 @@ def sqp(
                 disturbance_fn=disturbance,
                 Phi_x_I=Phi_x_I_next,
                 Phi_u_I=Phi_u_I_next,
-                C_box=C_box,
-                D_box=D_box,
+                C_box=C_all,
+                D_box=D_all,
                 backoffs=backoffs1,
                 eps_abs=admm_config.eps_abs,
             )
@@ -536,7 +560,6 @@ def sqp(
 
             # last_iter = (i == (sqp_config.max_sqp_iterations + sls_config.max_initial_sqp_iterations - 1))
             # do_ls = jnp.logical_and(jnp.array(bool(sqp_config.line_search)), jnp.logical_not(last_iter))
-            # last_iter = (i == (sqp_config.max_sqp_iterations + sls_config.max_initial_sqp_iterations - 1))
             do_ls = jnp.array(bool(sqp_config.line_search))
             def ls_branch(_):
                 Xn, Un, Vn = parallel_filter_line_search(
@@ -553,14 +576,14 @@ def sqp(
 
             X_next, U_next, V_next = lax.cond(do_ls, ls_branch, fullstep_branch, operand=None)
 
-            jax.debug.callback(
-                save_sqp_xz_step_plot,
-                i,
-                X_curr,
-                dX,
-                X_next,
-                ordered=True,
-            )
+            # jax.debug.callback(
+            #     save_sqp_xz_step_plot,
+            #     i,
+            #     X_curr,
+            #     dX,
+            #     X_next,
+            #     ordered=True,
+            # )
 
             w_next = lax.select(converged1, w, w1)
             y_next = lax.select(converged1, y, y1)

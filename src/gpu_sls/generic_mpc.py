@@ -30,7 +30,6 @@ class GenericMPC:
         constraints,
         obstacles,
         cost,
-        num_constraints: int,
         disturbance,
         X_in,
         U_in,
@@ -46,6 +45,19 @@ class GenericMPC:
         L = sls_config.gradient_window
 
         num_obstacles = self.obstacles.shape[0]
+
+        x_dummy = jnp.zeros((config.n,), dtype=X_in.dtype)
+        u_dummy = jnp.zeros((config.nu,), dtype=U_in.dtype)
+        t_dummy = jnp.asarray(0, dtype=jnp.int32)
+
+        constraint_shape = jax.eval_shape(
+            constraints,
+            x_dummy,
+            u_dummy,
+            t_dummy,
+        )
+
+        num_constraints = constraint_shape.shape[0]
 
         self.h_ct_ws = jnp.zeros(
             (
