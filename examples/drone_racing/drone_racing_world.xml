@@ -1,0 +1,58 @@
+<mujoco model="drone_racing">
+<compiler angle="radian"/>
+<asset>
+    <mesh name="georgia_tech_gate"
+          file="georgia_tech_gate/georgia_tech_gate_textured.obj"/>
+    <texture name="georgia_tech_gate_design" type="2d"
+             file="georgia_tech_gate/gate_design.png"/>
+    <material name="georgia_tech_gate_material"
+              texture="georgia_tech_gate_design"
+              texrepeat="1 1" texuniform="false"
+              specular="0" shininess="0"/>
+</asset>
+<visual>
+    <global azimuth="135" elevation="-20"/>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.8 0.8 0.8"/>
+</visual>
+<worldbody>
+<light pos="0 0 8" dir="0 0 -1"/>
+<camera name="race_camera" pos="-6 -6 4"
+        xyaxes="0.479 -0.878 0 0.205 0.112 0.972"/>
+
+<!-- Large grey floor -->
+<geom
+    name="race_floor"
+    type="plane"
+    pos="0 0 0.01"
+    size="0 0 0.1"
+    rgba="0.32 0.32 0.32 1"
+/>
+
+<!-- Gate poses are overwritten from GATES when drone_test.py runs. -->
+<body name="gate1" pos="2.0 0.0 1.0" euler="0 0 0">
+    <geom name="gate1_georgia_tech_mesh" type="mesh"
+          mesh="georgia_tech_gate" euler="0 0 1.57079632679"
+          material="georgia_tech_gate_material"/>
+</body>
+<body name="gate2" pos="4.0 1.0 1.25" euler="0 0 0.35">
+    <geom name="gate2_georgia_tech_mesh" type="mesh"
+          mesh="georgia_tech_gate" euler="0 0 1.57079632679"
+          material="georgia_tech_gate_material"/>
+</body>
+<body name="gate3" pos="6.0 -1.2 0.95" euler="0 0 -0.45">
+    <geom name="gate3_georgia_tech_mesh" type="mesh"
+          mesh="georgia_tech_gate" euler="0 0 1.57079632679"
+          material="georgia_tech_gate_material"/>
+</body>
+<body name="gate4" pos="8.0 0.5 1.4" euler="0.12 0 0.20">
+    <geom name="gate4_georgia_tech_mesh" type="mesh"
+          mesh="georgia_tech_gate" euler="0 0 1.57079632679"
+          material="georgia_tech_gate_material"/>
+</body>
+<body name="gate5" pos="10.0 -0.5 1.05" euler="0 0 -0.25">
+    <geom name="gate5_georgia_tech_mesh" type="mesh"
+          mesh="georgia_tech_gate" euler="0 0 1.57079632679"
+          material="georgia_tech_gate_material"/>
+</body>
+</worldbody>
+</mujoco>

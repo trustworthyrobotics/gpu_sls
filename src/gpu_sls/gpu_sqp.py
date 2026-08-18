@@ -264,7 +264,7 @@ def filter_model_evaluator_factory(
         # Handle the case where the tightening contains only base constraints,
         # while g_base may contain additional constraint channels.
         n_tight = h_ct_trial.shape[1]
-        eps_abs = 0
+        # eps_abs = 0
         g_base_tight = (
             g_base[:, :n_tight]
             + h_ct_trial

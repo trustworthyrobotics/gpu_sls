@@ -10,8 +10,10 @@ authors = [{name="Jeffrey Fang"}]
 requires-python = ">=3.11"
 
 dependencies = [
+    "crazyflow>=0.2.1,<0.3",
+    "flax>=0.12.1,<0.12.2",
     "pycddlib",
-    "jax[cuda12]==0.8.1",
+    "jax[cuda13]==0.8.1",
     "mujoco",
     "mujoco-mjx",
     "gym-quadruped",
