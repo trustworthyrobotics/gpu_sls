@@ -167,6 +167,48 @@ class GenericMPC:
 
         self._solve = jax.jit(work)
 
+    def reset(self, X_in, U_in):
+        """
+        Reset all MPC/SQP/SLS/ADMM warm-start state to the initial state.
+        """
+        # Primal warm starts
+        self.X0 = X_in
+        self.U0 = U_in
+        self.V0 = jnp.zeros_like(self.V0)
+
+        # Constraint / tube warm starts
+        self.h_ct_ws = jnp.zeros_like(self.h_ct_ws)
+        self.beta_ws = jnp.ones_like(self.beta_ws) * 1e-10
+        self.mu_ws = jnp.zeros_like(self.mu_ws)
+
+        # ADMM warm starts
+        self.w = jnp.zeros_like(self.w)
+        self.y = jnp.zeros_like(self.y)
+
+        self.rho = jnp.asarray(
+            self.admm_config.initial_rho,
+            dtype=self.rho.dtype,
+        )
+
+        # Gradient ADMM warm starts
+        self.a = jnp.zeros_like(self.a)
+        self.b = jnp.zeros_like(self.b)
+
+        self.rho_grad = jnp.asarray(
+            self.admm_config.initial_rho,
+            dtype=self.rho_grad.dtype,
+        )
+
+        # SLS response warm starts
+        self.Phi_x_ws = jnp.zeros_like(self.Phi_x_ws)
+        self.Phi_u_ws = jnp.zeros_like(self.Phi_u_ws)
+
+        self.Phi_x_I_ws = jnp.zeros_like(self.Phi_x_I_ws)
+        self.Phi_u_I_ws = jnp.zeros_like(self.Phi_u_I_ws)
+
+        # Solver state
+        self.converged_admm = False
+
     def run(
         self,
         x0: jnp.ndarray,

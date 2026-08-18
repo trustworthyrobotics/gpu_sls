@@ -20,6 +20,8 @@ from visualize_experiment import plot_quadrotor_3d, plot_tube_graph_quadrotor
 from visualize_drone_racing import visualize_trajectory_and_gates
 
 config.update("jax_enable_x64", False)
+
+DTYPE = jnp.float64 if config.x64_enabled else jnp.float32
 config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 config.update("jax_persistent_cache_min_compile_time_secs", 0)
 config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -39,8 +41,8 @@ GRAVITY = 9.81
 JX = 0.02
 JY = 0.02
 JZ = 0.04
-J = jnp.diag(jnp.array([JX, JY, JZ], dtype=jnp.float64))
-J_INV = jnp.diag(jnp.array([1.0 / JX, 1.0 / JY, 1.0 / JZ], dtype=jnp.float64))
+J = jnp.diag(jnp.array([JX, JY, JZ], dtype=DTYPE))
+J_INV = jnp.diag(jnp.array([1.0 / JX, 1.0 / JY, 1.0 / JZ], dtype=DTYPE))
 
 NUM_RANDOM = 5
 NUM_ADV = 26
@@ -56,7 +58,7 @@ def rotation_matrix(phi: jnp.ndarray, theta: jnp.ndarray, psi: jnp.ndarray) -> j
         [cpsi * cth, cpsi * sth * sphi - spsi * cphi, cpsi * sth * cphi + spsi * sphi],
         [spsi * cth, spsi * sth * sphi + cpsi * cphi, spsi * sth * cphi - cpsi * sphi],
         [-sth,       cth * sphi,                          cth * cphi],
-    ], dtype=jnp.float64)
+    ], dtype=DTYPE)
 
 def euler_angle_rates_matrix(phi: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarray:
     sphi, cphi = jnp.sin(phi), jnp.cos(phi)
@@ -67,7 +69,7 @@ def euler_angle_rates_matrix(phi: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarra
         [1.0, sphi * tth, cphi * tth],
         [0.0, cphi,       -sphi],
         [0.0, sphi / cth, cphi / cth],
-    ], dtype=jnp.float64)
+    ], dtype=DTYPE)
 
 def dynamics(
     x: jnp.ndarray,
@@ -295,7 +297,7 @@ def build_piecewise_reference(
     num_phases = waypoint_centers.shape[0]
     nx = 12 + num_phases
 
-    X_ref = jnp.zeros((N + 1, nx), dtype=jnp.float64)
+    X_ref = jnp.zeros((N + 1, nx), dtype=DTYPE)
 
     # --------------------------------------------------
     # Duration states are constant reference values
@@ -478,11 +480,11 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
     # -----------------------------
     W = jnp.concatenate([jnp.array([
             0.0, 0.0, 0.0,        # position
-            0.01, 0.01, 0.01,        # roll, pitch, yaw
+            0.0, 0.0, 0.0,        # roll, pitch, yaw
             0.01, 0.01, 0.01,        # velocities
             0.01, 0.01, 0.01,        # body rates
             0.01, 0.01, 0.01, 0.01,  # control
-        ], dtype=jnp.float64),
+        ], dtype=DTYPE),
         TIME_WEIGHT * jnp.ones(NUM_PHASES),  # time
     ])
 
@@ -491,7 +493,7 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
         nu=nu,
         N=N,
         W=W,
-        u_ref=jnp.array([MASS * GRAVITY, 0.0, 0.0, 0.0], dtype=jnp.float64),
+        u_ref=jnp.array([MASS * GRAVITY, 0.0, 0.0, 0.0], dtype=DTYPE),
     )
 
     # -----------------------------
@@ -501,8 +503,8 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
     T_max = 2.0 * T_hover
     tau_max = 10.0
 
-    u_min = jnp.array([0.0, -tau_max, -tau_max, -tau_max], dtype=jnp.float64)
-    u_max = jnp.array([T_max, tau_max, tau_max, tau_max], dtype=jnp.float64)
+    u_min = jnp.array([0.0, -tau_max, -tau_max, -tau_max], dtype=DTYPE)
+    u_max = jnp.array([T_max, tau_max, tau_max, tau_max], dtype=DTYPE)
     constraints_u = make_control_box_constraints(u_min, u_max)
 
     MIN_TIME = 0.005
@@ -519,7 +521,7 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
             10.0 * jnp.pi,          # psi
             5.0, 5.0, 5.0,          # vx, vy, vz
             8.0, 8.0, 8.0,          # p, q, r
-        ], dtype=jnp.float64),
+        ], dtype=DTYPE),
         MAX_TIME * jnp.ones(NUM_PHASES)
     ])
     x_min = -x_max
@@ -533,7 +535,7 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
         WAYPOINT_HALF_WIDTHS,
     )
     constraints_all = combine_constraints(
-        constraints_x,
+        # constraints_x,
         constraints_u,
         waypoint_constraint
     )
@@ -547,7 +549,7 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
     # Solver configs
     # -----------------------------
     admm_cfg = ADMMConfig(
-        eps_abs=5e-2,
+        eps_abs=1e-2,
         eps_rel=1e-3,
         rho_max=1e6,
         max_iterations=1000,
@@ -558,7 +560,7 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
     )
 
     sls_cfg = SLSConfig(
-        max_sls_iterations=1,
+        max_sls_iterations=0,
         sls_primal_tol=1e-2,
         enable_fastsls=False,
         initialize_nominal=True,
@@ -571,8 +573,8 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
     sqp_cfg = SQPConfig(
         max_sqp_iterations=100,
         warm_start=True,
-        feas_tol=1e-10,
-        step_tol=1e-10,
+        feas_tol=0.2,
+        step_tol=10,
         line_search=True,
     )
 
@@ -588,161 +590,127 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
         disturbance=disturbance,
         shift=1,
         X_in=X_IN,
-        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=jnp.float64).at[:, 0].set(T_hover),
+        U_in=jnp.zeros((cfg.N, cfg.nu), dtype=DTYPE).at[:, 0].set(T_hover),
     )
     return controller
 
 def run_rollouts(N, X_pred, U_pred, x0, min_time, Phi_x, Phi_u, disturbance_fn, waypoints):
-    N_ROLLOUTS = NUM_RANDOM + NUM_ADV
-    n = X_pred.shape[-1]
-    nu = U_pred.shape[-1]
-    xs = np.full((N_ROLLOUTS, N, n), np.nan, dtype=np.float64)
-    disturbed = np.full((N_ROLLOUTS, N, n), np.nan, dtype=np.float64)
-    stop_steps = np.full((N_ROLLOUTS,), N, dtype=np.int32)
-    min_time = X_pred[0, -1]
-    dt = min_time / N
-    for i in range(N_ROLLOUTS):
-        disturbance_history = [jnp.zeros((n,), dtype=jnp.float64)]
-        x = x0.at[-1].set(min_time)
-        jax.debug.print("Rolling out iteration {}", i)
+    pass
+    # N_ROLLOUTS = NUM_RANDOM + NUM_ADV
+    # n = X_pred.shape[-1]
+    # nu = U_pred.shape[-1]
+    # xs = np.full((N_ROLLOUTS, N, n), np.nan, dtype=np.float64)
+    # disturbed = np.full((N_ROLLOUTS, N, n), np.nan, dtype=np.float64)
+    # stop_steps = np.full((N_ROLLOUTS,), N, dtype=np.int32)
+    # min_time = X_pred[0, -1]
+    # dt = min_time / N
+    # for i in range(N_ROLLOUTS):
+    #     disturbance_history = [jnp.zeros((n,), dtype=DTYPE)]
+    #     x = x0.at[-1].set(min_time)
+    #     jax.debug.print("Rolling out iteration {}", i)
 
-        for k in range(N):
-            disturbance_feedback = jnp.zeros((nu,), dtype=jnp.float64)
-            for j in range(k + 1):
-                disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
+    #     for k in range(N):
+    #         disturbance_feedback = jnp.zeros((nu,), dtype=DTYPE)
+    #         for j in range(k + 1):
+    #             disturbance_feedback = disturbance_feedback + Phi_u[k, j] @ disturbance_history[j]
 
-            u = U_pred[k] + disturbance_feedback
-            key, x, w = quadrotor_step_with_disturbance(key, x, u, disturbance_fn(x), dt, i)
+    #         u = U_pred[k] + disturbance_feedback
+    #         key, x, w = quadrotor_step_with_disturbance(key, x, u, disturbance_fn(x), dt, i)
 
-            err = np.abs(np.asarray(X_pred[k + 1] - x))
+    #         err = np.abs(np.asarray(X_pred[k + 1] - x))
 
-            disturbed[i, k, :] = err
-            disturbance_history.append(w)
-            xs[i, k] = np.asarray(x)
+    #         disturbed[i, k, :] = err
+    #         disturbance_history.append(w)
+    #         xs[i, k] = np.asarray(x)
 
-    # -----------------------------
-    # 3D tube visualization
-    # -----------------------------
-    tube = get_trajectory_tubes(Phi_x)
-    lower = X_pred[:, :3] - tube[:, :3]
-    upper = X_pred[:, :3] + tube[:, :3]
+    # # -----------------------------
+    # # 3D tube visualization
+    # # -----------------------------
+    # tube = get_trajectory_tubes(Phi_x)
+    # lower = X_pred[:, :3] - tube[:, :3]
+    # upper = X_pred[:, :3] + tube[:, :3]
 
-    obstacle_centers = jnp.array([
-        [0.0, 0.0, 0.0],
-    ], dtype=jnp.float64)
+    # obstacle_centers = jnp.array([
+    #     [0.0, 0.0, 0.0],
+    # ], dtype=DTYPE)
 
-    obstacle_radii = jnp.array([
-        0.01,
-    ], dtype=jnp.float64)
+    # obstacle_radii = jnp.array([
+    #     0.01,
+    # ], dtype=DTYPE)
 
-    plot_quadrotor_3d(
-        xs=xs,
-        plan=np.asarray(X_pred),
-        lower=np.asarray(lower),
-        upper=np.asarray(upper),
-        centers=np.asarray(obstacle_centers),
-        radii=np.asarray(obstacle_radii),
-        goal_center=np.asarray(terminal_center),
-        goal_half_width=np.asarray(terminal_half_width),
-        tube_stride=1,
-        filename="quadrotor_3d_rollouts_tube.png",
-        tube_alpha=0.08,
-        margin=0.2,
-        rollout_alpha=0.5,
-        title="Minimum-Time Quadrotor: 3D Spherical Obstacles",
-    )
-
-    plot_tube_graph_quadrotor(
-        disturbed=disturbed[:, :, :6],   # position + Euler angles only
-        tube=tube[:, :6],
-        dt=dt,
-        filename="quadrotor_3d_disturbance_vs_tube_size_pose.png",
-    )
-
-def main():
-    N = 110
-    # WAYPOINT_STEPS = jnp.array(
-    #     [35, 75, 110],
-    #     dtype=jnp.int32,
+    # plot_quadrotor_3d(
+    #     xs=xs,
+    #     plan=np.asarray(X_pred),
+    #     lower=np.asarray(lower),
+    #     upper=np.asarray(upper),
+    #     centers=np.asarray(obstacle_centers),
+    #     radii=np.asarray(obstacle_radii),
+    #     goal_center=np.asarray(terminal_center),
+    #     goal_half_width=np.asarray(terminal_half_width),
+    #     tube_stride=1,
+    #     filename="quadrotor_3d_rollouts_tube.png",
+    #     tube_alpha=0.08,
+    #     margin=0.2,
+    #     rollout_alpha=0.5,
+    #     title="Minimum-Time Quadrotor: 3D Spherical Obstacles",
     # )
 
-    # WAYPOINT_CENTERS = jnp.array([
-    #     [0.0, -0.7, -0.2],
-    #     [0.5,  0.4, 0.6],
-    #     [1.0,  0.8, 0.5],
-    # ], dtype=jnp.float64)
+    # plot_tube_graph_quadrotor(
+    #     disturbed=disturbed[:, :, :6],   # position + Euler angles only
+    #     tube=tube[:, :6],
+    #     dt=dt,
+    #     filename="quadrotor_3d_disturbance_vs_tube_size_pose.png",
+    # )
 
-    # WAYPOINT_HALF_WIDTHS = jnp.array([
-    #     [0.10, 0.10, 0.10],
-    #     [0.10, 0.10, 0.10],
-    #     [0.10, 0.10, 0.10],
-    # ], dtype=jnp.float64)
+def main():
+    N = 180
+    nu = 4
 
-    # SEGMENT_LENGTHS = jnp.array([
-    #     WAYPOINT_STEPS[0],
-    #     WAYPOINT_STEPS[1] - WAYPOINT_STEPS[0],
-    #     WAYPOINT_STEPS[2] - WAYPOINT_STEPS[1],
-    # ], dtype=jnp.float64)
+    WAYPOINT_STEPS = jnp.array([
+        15,  30,  45,  60,
+        75,  90, 105, 120,
+        135, 150, 165, 180,
+    ], dtype=jnp.int32)
 
-    N = 160
-    NUM_WAYPOINTS = 8
+    WAYPOINT_CENTERS = jnp.array([
+        [ 1.5,  0.0, 1.2],
+        [ 2.8,  1.5, 1.5],
+        [ 1.8,  3.0, 2.0],
+        [ 0.0,  2.0, 2.5],
+        [-1.8,  3.0, 1.8],
+        [-3.0,  1.2, 1.1],
+        [-1.5,  0.0, 0.8],
+        [ 0.0,  1.5, 1.4],
+        [ 1.8,  0.0, 2.2],
+        [ 0.5, -2.0, 2.6],
+        [-2.0, -2.5, 1.5],
+        [ 0.0,  0.0, 1.2],
+    ], dtype=DTYPE)
 
-    CIRCLE_CENTER = jnp.array([0.0, 0.0, 1.5])
-    CIRCLE_RADIUS = 2.0
-
-    # 8 points around the circle
-    angles = jnp.linspace(
-        0.0,
-        2.0 * jnp.pi,
-        NUM_WAYPOINTS,
-        endpoint=False,
-    )
-
-    WAYPOINT_CENTERS = jnp.stack([
-        CIRCLE_CENTER[0] + CIRCLE_RADIUS * jnp.cos(angles),
-        CIRCLE_CENTER[1] + CIRCLE_RADIUS * jnp.sin(angles),
-        CIRCLE_CENTER[2] * jnp.ones_like(angles),
-    ], axis=1)
-
-    # Equal number of discretization steps per phase
-    WAYPOINT_STEPS = jnp.linspace(
-        N // NUM_WAYPOINTS,
-        N,
-        NUM_WAYPOINTS,
-        dtype=jnp.int32,
+    WAYPOINT_HALF_WIDTHS = 0.20 * jnp.ones(
+        (len(WAYPOINT_STEPS), 3),
+        dtype=DTYPE,
     )
 
     SEGMENT_LENGTHS = jnp.concatenate([
         WAYPOINT_STEPS[:1],
         WAYPOINT_STEPS[1:] - WAYPOINT_STEPS[:-1],
-    ]).astype(jnp.float32)
+    ]).astype(DTYPE)
 
-    WAYPOINT_HALF_WIDTHS = (
-        0.20 * jnp.ones((NUM_WAYPOINTS, 3))
+    INITIAL_DURATIONS = 1.0 * jnp.ones(
+        len(WAYPOINT_STEPS),
+        dtype=DTYPE,
     )
 
-    INITIAL_DURATIONS = (
-        1.0 * jnp.ones(NUM_WAYPOINTS)
-    )
-
-    # INITIAL_DURATIONS = jnp.array([
-    #     2.0,
-    #     2.0,
-    #     2.0
-    # ], dtype=jnp.float64)
-
-    # -----------------------------
-    # Initial / goal
-    # -----------------------------
     x0 = jnp.concatenate([
         jnp.array([
-            2.0, -1.0, 1.5,       # px, py, pz
-            0.0, 0.0, jnp.pi / 2, # phi, theta, psi
-            0.0, 0.0, 0.0,        # vx, vy, vz
-            0.0, 0.0, 0.0,        # p, q, r
-        ]),
+            0.0, -1.0, 1.0,   # px, py, pz
+            0.0,  0.0, 0.0,   # phi, theta, psi
+            0.0,  0.0, 0.0,   # vx, vy, vz
+            0.0,  0.0, 0.0,   # p, q, r
+        ], dtype=DTYPE),
         INITIAL_DURATIONS,
-    ])
+])
 
     reference = build_piecewise_reference(
         x0=x0,
@@ -760,7 +728,19 @@ def main():
     u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
         x0=x0, reference=reference, parameter=parameter
     )
+    # -----------------------------
+    # Control limits
+    # -----------------------------
+    T_hover = MASS * GRAVITY
+    controller.reset(reference, jnp.zeros((N, nu), dtype=DTYPE).at[:, 0].set(T_hover))
     phase_times = X_pred[0, 12:]
+    import time
+    start = time.perf_counter()
+    u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
+        x0=x0, reference=reference, parameter=parameter
+    )
+    end = time.perf_counter()
+    print(end - start)
     min_time = jnp.sum(phase_times)
 
     print("Phase Times:", phase_times)

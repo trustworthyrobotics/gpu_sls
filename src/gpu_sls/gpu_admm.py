@@ -233,12 +233,8 @@ def associative_scan_use_cache_cp_jax(c, p, T: int, cache: ACPScanCache, reverse
 
     return c_out, p_out
 
-def admm_augment_xu(Q, q, R, r, M, C, D, w_bar, y_bar, rho):
+def admm_augment_xu(Q, q, R, r, M, C, D, w_bar, y_bar, rho, CtC, DtD, CtD):
     s_bar = w_bar - y_bar   
-
-    CtC = jnp.einsum('tmi,tmj->tij', C, C)
-    DtD = jnp.einsum('tmi,tmj->tij', D, D)
-    CtD = jnp.einsum('tmi,tmj->tij', C, D)
 
     Ct_s = jnp.einsum('tmi,tm->ti', C, s_bar)
     Dt_s = jnp.einsum('tmi,tm->ti', D, s_bar)
@@ -399,13 +395,33 @@ def adaptive_rho_update(
     *,
     rho_min=1e-4,
     rho_max=1e5,
+    scale_min=0.5,
+    scale_max=2.0,
     eps=1e-12,
 ):
-    """Original residual-ratio rho update without threshold regularization."""
     rd_safe = jnp.maximum(rd_norm, eps)
+
     scale = jnp.sqrt(rp_norm / rd_safe)
-    rho_new = jnp.clip(rho * scale, rho_min, rho_max)
-    updated = jnp.logical_not(jnp.isclose(rho_new, rho))
+
+    # Only update rho if the scale is sufficiently far from 1
+    should_update = (scale < scale_min) | (scale > scale_max)
+
+    rho_candidate = jnp.clip(
+        rho * scale,
+        rho_min,
+        rho_max,
+    )
+
+    rho_new = jnp.where(
+        should_update,
+        rho_candidate,
+        rho,
+    )
+
+    updated = should_update & jnp.logical_not(
+        jnp.isclose(rho_new, rho)
+    )
+
     return rho_new, updated
 
 def rho_update_scaled_duals(
@@ -616,6 +632,10 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     T = A.shape[0] + 1
     window_mask = make_gradient_window_mask(T, L, A.dtype)
 
+    CtC = jnp.einsum('tmi,tmj->tij', C, C)
+    DtD = jnp.einsum('tmi,tmj->tij', D, D)
+    CtD = jnp.einsum('tmi,tmj->tij', C, D)
+
     def one_iter(carry):
         (it, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, 
          x_bar, u_bar, y_bar, w_prev, rho, rho_grad, cache, BRinv, MRinv, P, _, K,
@@ -764,7 +784,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
             operand=None,
         )
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
-            Q, q, R, r, M, C, D, w_new, y_new, rho_new
+            Q, q, R, r, M, C, D, w_new, y_new, rho_new, CtC, DtD, CtD
         )
         tilde_Q, tilde_q = admm_augment_ct_grad(
             tilde_Q, tilde_q,
@@ -821,8 +841,11 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     rho0 = rho
     rho_grad0 = rho_grad
     p_init = jnp.zeros((T + 1, nx), dtype=Q.dtype)
+    CtC = jnp.einsum('tmi,tmj->tij', C, C)
+    DtD = jnp.einsum('tmi,tmj->tij', D, D)
+    CtD = jnp.einsum('tmi,tmj->tij', C, D)
     tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
-        Q, q, R, r, M, C, D, init_w, init_y, rho0, 
+        Q, q, R, r, M, C, D, init_w, init_y, rho0, CtC, DtD, CtD
     )
     tilde_Q, tilde_q = admm_augment_ct_grad(
         tilde_Q, tilde_q, init_a, init_b, rho_grad0, Jh, window_mask,
@@ -858,72 +881,32 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     v = dual_lqr(x_bar, P_final, p_final)
 
     # ---------------------------------------------------------
-    # Recompute the final nominal constraint values
-    # ---------------------------------------------------------
-    z_bar = (
-        jnp.einsum("tmi,ti->tm", C, x_bar)
-        + jnp.einsum("tmi,ti->tm", D, u_bar)
-    )
-
-    # Absolute primal residual for every constraint
-    r_primal = jnp.abs(z_bar - w_bar)
-
-    # Worst nominal primal residual
-    worst_idx = jnp.argmax(r_primal)
-    worst_stage, worst_constraint = jnp.unravel_index(
-        worst_idx,
-        r_primal.shape,
-    )
-
-    # ---------------------------------------------------------
-    # Gradient residual (if enabled)
-    # ---------------------------------------------------------
-    if L > 0:
-        x_window, _ = previous_state_windows(x_bar, L)
-        z_grad = jnp.einsum("kcln,kln->klc", Jh, x_window)
-
-        window_mask_final = make_gradient_window_mask(
-            T + 1,
-            L,
-            A.dtype,
-        )
-
-        r_grad = jnp.abs(
-            window_mask_final[:, :, None]
-            * (z_grad - a_bar)
-        )
-
-        worst_grad = jnp.max(r_grad)
-    else:
-        worst_grad = jnp.asarray(0.0, dtype=Q.dtype)
-
-    # ---------------------------------------------------------
     # Original ADMM summary
     # ---------------------------------------------------------
-    jax.debug.print(
-        "ADMM done: Total Iterations={} converged={} "
-        "rho={:.3e} rp={:.3e} (<= {:.3e}) "
-        "rd={:.3e} (<= {:.3e}) "
-        "Rho0 {:.3e} "
-        "Rho_grad_final {:.3e} "
-        "rp_grad={:.3e} (<= {:.3e}) "
-        "rd_grad={:.3e} (<= {:.3e}) "
-        "Rho_grad0 {:.3e}",
-        it - 1,
-        converged,
-        rho_final,
-        rp_norm,
-        eps_pri,
-        rd_norm,
-        eps_dual,
-        rho0,
-        rho_grad_final,
-        rp_norm_grad,
-        eps_pri_grad,
-        rd_norm_grad,
-        eps_dual_grad,
-        rho_grad0,
-    )
+    # jax.debug.print(
+    #     "ADMM done: Total Iterations={} converged={} "
+    #     "rho={:.3e} rp={:.3e} (<= {:.3e}) "
+    #     "rd={:.3e} (<= {:.3e}) "
+    #     "Rho0 {:.3e} "
+    #     "Rho_grad_final {:.3e} "
+    #     "rp_grad={:.3e} (<= {:.3e}) "
+    #     "rd_grad={:.3e} (<= {:.3e}) "
+    #     "Rho_grad0 {:.3e}",
+    #     it - 1,
+    #     converged,
+    #     rho_final,
+    #     rp_norm,
+    #     eps_pri,
+    #     rd_norm,
+    #     eps_dual,
+    #     rho0,
+    #     rho_grad_final,
+    #     rp_norm_grad,
+    #     eps_pri_grad,
+    #     rd_norm_grad,
+    #     eps_dual_grad,
+    #     rho_grad0,
+    # )
 
     # ---------------------------------------------------------
     # Detailed diagnostics

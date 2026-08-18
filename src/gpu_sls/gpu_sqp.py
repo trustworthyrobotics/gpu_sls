@@ -429,7 +429,6 @@ def compute_search_direction(
     f = -g
     C, D = linearize(constraints)(X, U_pad, t)
     C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
-    # ????
     terminal_control_rows = jnp.linalg.norm(D_all[-1], axis=-1) > 1e-7
 
     D_all = D_all.at[-1].set(jnp.zeros_like(D_all[-1]))
@@ -441,7 +440,6 @@ def compute_search_direction(
             f_all[-1],
         )
     )
-    # ?????
 
     Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[-1]), Q.shape).at[..., 0, 0].set(10.0)
     R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]) * 0.5, R.shape)
@@ -545,7 +543,7 @@ def sqp(
 
             feas_ok = feas <= sqp_config.feas_tol
             step_ok = step <= sqp_config.step_tol * (1.0 + z_norm)
-            jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
+            # jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
             T = U_curr.shape[0]
             U_curr_pad = jnp.pad(U_curr, ((0, 1), (0, 0)))
             t_curr = jnp.arange(T + 1)
