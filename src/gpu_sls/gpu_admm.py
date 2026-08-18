@@ -36,6 +36,7 @@ class ADMMConfig:
     rho_max: int = 1e5
     initial_rho: int = 1.0
     regularized_rho_update: bool = False
+    num_phases: int = 1.0
 
     def tree_flatten(self):
         children = (
@@ -48,6 +49,7 @@ class ADMMConfig:
             self.rho_max,
             self.initial_rho,
             self.regularized_rho_update,
+            self.num_phases
         )
         return children, None
 
@@ -627,19 +629,29 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         _, p = associative_scan_use_cache_cp_jax(c0, p0, T + 1, cache, reverse=True)
         k = get_k(tilde_R, tilde_r, B, P, p, c[1:])
 
-        # ------- Calculate Optimal Time -------
-        dx0 = c[0, :-1]
+        # ------- Calculate Optimal Phase Times -------
+        num_phases = cfg.num_phases
+
+        # Physical initial-state perturbation
+        dx0 = c[0, :-num_phases]
 
         P0 = P[0]
         p0 = p[0]
 
-        P_Tx = P0[-1, :-1]
-        P_TT = P0[-1, -1]
-        p_T = p0[-1]
+        # Partition w.r.t. [dx, dT1, ..., dTn]
+        P_Tx = P0[-num_phases:, :-num_phases]       # (num_phases, nx_phys)
+        P_TT = P0[-num_phases:, -num_phases:]       # (num_phases, num_phases)
+        p_T = p0[-num_phases:]                       # (num_phases,)
 
-        delta_T = -(P_Tx @ dx0 + p_T) / P_TT
+        # Solve:
+        # P_TT @ delta_T = -(P_Tx @ dx0 + p_T)
+        delta_T = -jnp.linalg.solve(
+            P_TT,
+            P_Tx @ dx0 + p_T,
+        )
 
-        dx0_aug = c[0].at[-1].set(delta_T)
+        # Construct augmented initial perturbation
+        dx0_aug = c[0].at[-num_phases:].set(delta_T)
 
         x_bar, u_stage = rollout_gpu(
             K, k, dx0_aug,
@@ -677,9 +689,9 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
             eps_rel_grad=cfg.eps_rel_grad,
         )
 
-        r_primal = jnp.abs(z_bar - w_new)
-        idx = jnp.argmax(r_primal)
-        stage, constraint = jnp.unravel_index(idx, r_primal.shape)
+        # r_primal = jnp.abs(z_bar - w_new)
+        # idx = jnp.argmax(r_primal)
+        # stage, constraint = jnp.unravel_index(idx, r_primal.shape)
 
         # jax.debug.print(
         #     "ADMM it={} worst primal: stage={} constraint={} residual={:.3e} tol={:.3e}",

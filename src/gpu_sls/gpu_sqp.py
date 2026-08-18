@@ -193,17 +193,31 @@ class SQPConfig:
     def tree_unflatten(cls, aux, children):
         return cls(*children)
 
-@partial(jit, static_argnums=(0, 1))
-def model_evaluator_helper_min_time(cost, dynamics,x0, X, U):
+@partial(jit, static_argnums=(0, 1, 2))
+def model_evaluator_helper_min_time(
+    cost,
+    dynamics,
+    num_phases,
+    x0,
+    X,
+    U,
+):
     T = U.shape[0]
-    costs = jax.vmap(cost)(X, jnp.pad(U, [[0, 1], [0, 0]]), jnp.arange(T + 1))
+
+    costs = jax.vmap(cost)(
+        X,
+        jnp.pad(U, [[0, 1], [0, 0]]),
+        jnp.arange(T + 1),
+    )
     g = jnp.sum(costs)
 
-    residual_fn = lambda t: dynamics(X[t], U[t], t) - X[t + 1]
-    initial_residual = jnp.concatenate([
-        x0[:-1] - X[0, :-1],
-        jnp.zeros((1,), dtype=X.dtype),
-    ])
+    residual_fn = lambda t: (
+        dynamics(X[t], U[t], t) - X[t + 1]
+    )
+
+    # Enforce initial condition on physical states only.
+    # The final `num_phases` states are free phase durations.
+    initial_residual = (x0 - X[0]).at[-num_phases:].set(0.0)
 
     c = jnp.vstack([
         initial_residual,
@@ -486,7 +500,7 @@ def sqp(
         _hessian_approx = None
 
     _dynamics = partial(dynamics, parameter=parameter)
-    model_evaluator = partial(model_evaluator_helper_min_time, _cost, _dynamics, x0)
+    model_evaluator = partial(model_evaluator_helper_min_time, _cost, _dynamics, admm_config.num_phases, x0)
 
     def body(i, carry):
         i, X_curr, U_curr, V_curr, w, y, rho, rho_grad0, converged, backoffs, Phi_x, Phi_u, beta_ws, mu_w, Phi_x_I_ws, Phi_u_I_ws, a, b, converged_admm = carry
