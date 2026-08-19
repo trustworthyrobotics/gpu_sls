@@ -36,7 +36,7 @@ class ADMMConfig:
     rho_max: int = 1e5
     initial_rho: int = 1.0
     regularized_rho_update: bool = False
-    num_phases: int = 1.0
+    num_phases: int = 1
 
     def tree_flatten(self):
         children = (
@@ -883,30 +883,30 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     # ---------------------------------------------------------
     # Original ADMM summary
     # ---------------------------------------------------------
-    # jax.debug.print(
-    #     "ADMM done: Total Iterations={} converged={} "
-    #     "rho={:.3e} rp={:.3e} (<= {:.3e}) "
-    #     "rd={:.3e} (<= {:.3e}) "
-    #     "Rho0 {:.3e} "
-    #     "Rho_grad_final {:.3e} "
-    #     "rp_grad={:.3e} (<= {:.3e}) "
-    #     "rd_grad={:.3e} (<= {:.3e}) "
-    #     "Rho_grad0 {:.3e}",
-    #     it - 1,
-    #     converged,
-    #     rho_final,
-    #     rp_norm,
-    #     eps_pri,
-    #     rd_norm,
-    #     eps_dual,
-    #     rho0,
-    #     rho_grad_final,
-    #     rp_norm_grad,
-    #     eps_pri_grad,
-    #     rd_norm_grad,
-    #     eps_dual_grad,
-    #     rho_grad0,
-    # )
+    jax.debug.print(
+        "ADMM done: Total Iterations={} converged={} "
+        "rho={:.3e} rp={:.3e} (<= {:.3e}) "
+        "rd={:.3e} (<= {:.3e}) "
+        "Rho0 {:.3e} "
+        "Rho_grad_final {:.3e} "
+        "rp_grad={:.3e} (<= {:.3e}) "
+        "rd_grad={:.3e} (<= {:.3e}) "
+        "Rho_grad0 {:.3e}",
+        it - 1,
+        converged,
+        rho_final,
+        rp_norm,
+        eps_pri,
+        rd_norm,
+        eps_dual,
+        rho0,
+        rho_grad_final,
+        rp_norm_grad,
+        eps_pri_grad,
+        rd_norm_grad,
+        eps_dual_grad,
+        rho_grad0,
+    )
 
     # ---------------------------------------------------------
     # Detailed diagnostics

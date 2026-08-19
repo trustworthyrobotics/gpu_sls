@@ -22,18 +22,36 @@ class MPCData(PyTreeNode):
     step_height: float
     contact_time: jnp.ndarray
     liftoff: jnp.ndarray
+
+    # Primal SQP warm starts
     X0: jnp.ndarray
     U0: jnp.ndarray
     V0: jnp.ndarray
     W: object
+
+    # Main ADMM warm starts
     w: jnp.ndarray
     y: jnp.ndarray
     rho: jnp.ndarray
+
+    # Gradient ADMM warm starts
+    rho_grad: jnp.ndarray
+    a: jnp.ndarray
+    b: jnp.ndarray
+
+    # Constraint/tube warm starts
     h_ct_ws: jnp.ndarray
     beta_ws: jnp.ndarray
     mu_ws: jnp.ndarray
+
+    # SLS response warm starts
     Phi_x_ws: jnp.ndarray
     Phi_u_ws: jnp.ndarray
+    Phi_x_I_ws: jnp.ndarray
+    Phi_u_I_ws: jnp.ndarray
+
+    # Solver state
+    converged_admm: jnp.ndarray
 
 
 mpx_data = MPCData
@@ -73,35 +91,84 @@ def build_solver_step(
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def _update_warm_start(
-    n_joints, horizon, shift, u_ref, initial_rho, x0,
-    X_prev, U_prev, V_prev, w_prev, y_prev, rho_prev,
-    h_ct_prev, beta_prev, mu_prev, Phi_x_prev, Phi_u_prev,
-    X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, beta, mu,
+    n_joints,
+    horizon,
+    shift,
+    u_ref,
+    initial_rho,
+    x0,
+    X_prev,
+    U_prev,
+    V_prev,
+    w_prev,
+    y_prev,
+    rho_prev,
+    rho_grad_prev,
+    h_ct_prev,
+    beta_prev,
+    mu_prev,
+    Phi_x_prev,
+    Phi_u_prev,
+    Phi_x_I_prev,
+    Phi_u_I_prev,
+    a_prev,
+    b_prev,
+    X,
+    U,
+    V,
+    w,
+    y,
+    rho,
+    rho_grad,
+    backoffs,
+    Phi_x,
+    Phi_u,
+    beta,
+    mu,
+    Phi_x_I,
+    Phi_u_I,
+    a,
+    b,
+    converged_admm,
 ):
-    """Shift the solution for the next MPC step and extract the first command."""
+    """Shift the new GPU-SLS solver state for the next MPC call."""
 
     q_slice = slice(7, 7 + n_joints)
     dq_slice = slice(13 + n_joints, 13 + 2 * n_joints)
     u_fallback_idx = 1 if horizon > 1 else 0
 
-    def shift_trajectory(trajectory):
-        tail = jnp.repeat(trajectory[-1:], shift, axis=0)
-        return jnp.concatenate([trajectory[shift:], tail], axis=0)
+    def shift_trajectory(arr):
+        tail = jnp.repeat(arr[-1:], shift, axis=0)
+        return jnp.concatenate([arr[shift:], tail], axis=0)
 
     def safe_update():
-        shifted_y = shift_trajectory(y)
+        # Match GenericMPC.run(): shift/pad along the horizon axis and
+        # rescale scaled-dual variables if rho changed.
+        y0 = shift_trajectory(y)
+        y0 = rho / rho_prev * y0
+
+        a0 = shift_trajectory(a)
+        b0 = shift_trajectory(b)
+        b0 = rho_grad / rho_grad_prev * b0
+
         return (
             shift_trajectory(U),
             shift_trajectory(X),
             shift_trajectory(V),
             shift_trajectory(w),
-            rho / rho_prev * shifted_y,
+            y0,
             rho,
+            rho_grad,
             shift_trajectory(backoffs),
             shift_trajectory(beta),
             shift_trajectory(mu),
             Phi_x,
             Phi_u,
+            Phi_x_I,
+            Phi_u_I,
+            a0,
+            b0,
+            converged_admm,
             U[0, :n_joints],
             X[0, q_slice],
             X[1, dq_slice],
@@ -115,31 +182,53 @@ def _update_warm_start(
             jnp.zeros_like(w_prev),
             jnp.zeros_like(y_prev),
             jnp.asarray(initial_rho, dtype=rho_prev.dtype),
+            jnp.asarray(initial_rho, dtype=rho_grad_prev.dtype),
             jnp.zeros_like(h_ct_prev),
             jnp.ones_like(beta_prev) * 1e-10,
             jnp.zeros_like(mu_prev),
             jnp.zeros_like(Phi_x_prev),
             jnp.zeros_like(Phi_u_prev),
+            jnp.zeros_like(Phi_x_I_prev),
+            jnp.zeros_like(Phi_u_I_prev),
+            jnp.zeros_like(a_prev),
+            jnp.zeros_like(b_prev),
+            jnp.asarray(False),
             U_prev[u_fallback_idx, :n_joints],
             X_prev[1, q_slice],
             X_prev[1, dq_slice],
         )
 
     valid_solution = _solution_is_valid(
-        X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, beta, mu,
+        X,
+        U,
+        V,
+        w,
+        y,
+        rho,
+        rho_grad,
+        backoffs,
+        Phi_x,
+        Phi_u,
+        beta,
+        mu,
+        Phi_x_I,
+        Phi_u_I,
+        a,
+        b,
     )
+
     return jax.lax.cond(valid_solution, safe_update, unsafe_update)
 
 
 class MPCWrapper:
-    """Minimal MPC API built for `jit` and `vmap`.
+    """MPX-compatible legged MPC wrapper using the new GPU-SLS SQP API.
 
-    The public flow is:
-    `data = wrapper.make_data()`
-    `data, tau = wrapper.run(data, x0, command, contact)`
+    Public flow:
+        data = wrapper.make_data()
+        data, tau = wrapper.run(data, x0, command, contact)
 
-    The public API matches MPX, while the carry also contains every GPU-SLS
-    warm-start value needed to keep repeated calls functional and JIT-safe.
+    The carry contains all warm-start state required by the current
+    gpu_sls.gpu_sqp.sqp interface.
     """
 
     def __init__(
@@ -155,27 +244,31 @@ class MPCWrapper:
         num_constraints=None,
         disturbance=None,
     ):
-        """Create a GPU-SLS-backed wrapper around an MPX legged config.
+        del limited_memory  # Retained for compatibility with MPX.
 
-        Solver/problem arguments can be supplied here or exposed as attributes
-        on ``config``. This keeps existing config-module-based call sites usable
-        while making the new backend dependencies explicit.
-        """
-        del limited_memory  # Retained for compatibility with the MPX constructor.
         self.config = config
         self.nu = getattr(config, "nu", getattr(config, "m", None))
         if self.nu is None:
             raise ValueError("legged config must define `nu` (or MPX-compatible `m`)")
+
         self.mpc_frequency = config.mpc_frequency
         self.shift = int(1 / (config.dt * config.mpc_frequency))
         self.default_contact = jnp.zeros(config.n_contact)
+
         self.qpos_slice = slice(0, 7 + config.n_joints)
-        self.qvel_slice = slice(self.qpos_slice.stop, self.qpos_slice.stop + 6 + config.n_joints)
+        self.qvel_slice = slice(
+            self.qpos_slice.stop,
+            self.qpos_slice.stop + 6 + config.n_joints,
+        )
         self.foot_slice = config.foot_slice
 
+        # ------------------------------------------------------------
+        # MuJoCo / MJX setup
+        # ------------------------------------------------------------
         self.model = mujoco.MjModel.from_xml_path(config.model_path)
         data = mujoco.MjData(self.model)
         mujoco.mj_fwdPosition(self.model, data)
+
         self.data = mujoco.MjData(self.model)
         self.mjx_model = mjx.put_model(self.model)
         robot_mass = data.qM[0]
@@ -193,8 +286,11 @@ class MPCWrapper:
             for name in config.contact_frame
         ]
 
+        # ------------------------------------------------------------
+        # Problem definition
+        # ------------------------------------------------------------
         self.cost = config.cost
-        self.hessian_approx = config.hessian_approx
+        self.hessian_approx = getattr(config, "hessian_approx", None)
         self.dynamics = config.dynamics(
             self.model,
             self.mjx_model,
@@ -216,40 +312,126 @@ class MPCWrapper:
         self.admm_config = problem_value("admm_config", admm_config)
         self.constraints = problem_value("constraints", constraints)
         self.disturbance = problem_value("disturbance", disturbance)
-        self.num_constraints = int(problem_value("num_constraints", num_constraints))
+
         if obstacles is None:
             obstacles = getattr(config, "obstacles", jnp.empty((0, 3)))
         self.obstacles = jnp.asarray(obstacles)
         num_obstacles = self.obstacles.shape[0]
+
+        # Preserve the old explicit num_constraints API, but infer it in the
+        # same way as GenericMPC when it is not supplied.
+        if num_constraints is None:
+            num_constraints = getattr(config, "num_constraints", None)
+
+        if num_constraints is None:
+            x_dummy = jnp.zeros((config.n,), dtype=jnp.asarray(config.initial_state).dtype)
+            u_dummy = jnp.zeros((self.nu,), dtype=jnp.asarray(config.u_ref).dtype)
+            t_dummy = jnp.asarray(0, dtype=jnp.int32)
+            constraint_shape = jax.eval_shape(
+                self.constraints,
+                x_dummy,
+                u_dummy,
+                t_dummy,
+            )
+            num_constraints = constraint_shape.shape[0]
+
+        self.num_constraints = int(num_constraints)
+
         if self.num_constraints < num_obstacles:
             raise ValueError("num_constraints must include all obstacle constraints")
 
-        # The config owns the nominal state layout, including any extra states.
+        # ------------------------------------------------------------
+        # Initial nominal state
+        # ------------------------------------------------------------
+        # The config owns the full state layout, including any auxiliary
+        # states such as foot positions, GRFs, and a min-time T state.
         self.initial_state = jnp.asarray(config.initial_state)
+
+        if self.initial_state.shape[0] != config.n:
+            raise ValueError(
+                "config.initial_state must have length config.n; "
+                f"got {self.initial_state.shape[0]} and {config.n}"
+            )
 
         self.initial_X0 = jnp.tile(self.initial_state, (config.N + 1, 1))
         self.initial_U0 = jnp.tile(config.u_ref, (config.N, 1))
-        self.initial_V0 = jnp.zeros((config.N + 1, config.n))
-        self.initial_liftoff = jnp.zeros(3 * config.n_contact)
-        self.initial_w = jnp.zeros((config.N + 1, self.num_constraints))
+        self.initial_V0 = jnp.zeros((config.N + 1, config.n), dtype=self.initial_X0.dtype)
+        self.initial_liftoff = jnp.zeros(
+            3 * config.n_contact,
+            dtype=self.initial_X0.dtype,
+        )
+
+        # ------------------------------------------------------------
+        # Main ADMM state
+        # ------------------------------------------------------------
+        self.initial_w = jnp.zeros(
+            (config.N + 1, self.num_constraints),
+            dtype=self.initial_X0.dtype,
+        )
         self.initial_y = jnp.zeros_like(self.initial_w)
         self.initial_rho = jnp.asarray(
             self.admm_config.initial_rho,
             dtype=self.initial_w.dtype,
         )
-        regular_constraints = self.num_constraints - num_obstacles
-        self.initial_h_ct_ws = jnp.zeros((config.N + 1, regular_constraints))
-        self.initial_beta_ws = jnp.ones(
-            (config.N + 1, config.N + 1, regular_constraints)
-        ) * 1e-10
-        self.initial_mu_ws = jnp.zeros((config.N + 1, self.num_constraints))
-        self.initial_Phi_x_ws = jnp.zeros(
-            (config.N + 1, config.N + 1, config.n, config.n)
-        )
-        self.initial_Phi_u_ws = jnp.zeros(
-            (config.N, config.N + 1, self.nu, config.n)
+
+        # ------------------------------------------------------------
+        # Gradient ADMM state -- new API
+        # ------------------------------------------------------------
+        self.initial_rho_grad = jnp.asarray(
+            self.admm_config.initial_rho,
+            dtype=self.initial_w.dtype,
         )
 
+        L = self.sls_config.gradient_window
+        self.initial_a = jnp.zeros(
+            (config.N + 1, L, self.num_constraints),
+            dtype=self.initial_X0.dtype,
+        )
+        self.initial_b = jnp.zeros_like(self.initial_a)
+
+        # ------------------------------------------------------------
+        # Constraint / tube warm starts
+        # ------------------------------------------------------------
+        regular_constraints = self.num_constraints - num_obstacles
+
+        self.initial_h_ct_ws = jnp.zeros(
+            (config.N + 1, regular_constraints),
+            dtype=self.initial_X0.dtype,
+        )
+        self.initial_beta_ws = (
+            jnp.ones(
+                (config.N + 1, config.N + 1, regular_constraints),
+                dtype=self.initial_X0.dtype,
+            )
+            * 1e-10
+        )
+        self.initial_mu_ws = jnp.zeros(
+            (config.N + 1, self.num_constraints),
+            dtype=self.initial_X0.dtype,
+        )
+
+        # ------------------------------------------------------------
+        # SLS response warm starts
+        # ------------------------------------------------------------
+        self.initial_Phi_x_ws = jnp.zeros(
+            (config.N + 1, config.N + 1, config.n, config.n),
+            dtype=self.initial_X0.dtype,
+        )
+        self.initial_Phi_u_ws = jnp.zeros(
+            (config.N, config.N + 1, self.nu, config.n),
+            dtype=self.initial_X0.dtype,
+        )
+
+        # Identity/gradient SLS responses -- new API
+        self.initial_Phi_x_I_ws = jnp.zeros_like(self.initial_Phi_x_ws)
+        self.initial_Phi_u_I_ws = jnp.zeros_like(self.initial_Phi_u_ws)
+
+        # Solver convergence state -- new API
+        self.initial_converged_admm = jnp.asarray(False)
+
+        # ------------------------------------------------------------
+        # Solver binding
+        # ------------------------------------------------------------
         solve = build_solver_step(
             self.sls_config,
             self.sqp_config,
@@ -260,10 +442,11 @@ class MPCWrapper:
             self.constraints,
             self.disturbance,
         )
+
         self.solver_mode = "gpu_sls"
         self._solve = jax.jit(solve)
 
-        self._ref_gen = partial(config.reference_generator,mass=robot_mass)
+        self._ref_gen = partial(config.reference_generator, mass=robot_mass)
         self._timer_run = jax.jit(mpc_utils.timer_run)
         self._update_warm_start = partial(
             _update_warm_start,
@@ -292,11 +475,17 @@ class MPCWrapper:
             w=self.initial_w,
             y=self.initial_y,
             rho=self.initial_rho,
+            rho_grad=self.initial_rho_grad,
+            a=self.initial_a,
+            b=self.initial_b,
             h_ct_ws=self.initial_h_ct_ws,
             beta_ws=self.initial_beta_ws,
             mu_ws=self.initial_mu_ws,
             Phi_x_ws=self.initial_Phi_x_ws,
             Phi_u_ws=self.initial_Phi_u_ws,
+            Phi_x_I_ws=self.initial_Phi_x_I_ws,
+            Phi_u_I_ws=self.initial_Phi_u_I_ws,
+            converged_admm=self.initial_converged_admm,
         )
 
     def control_output(self, x0, X, U, reference, parameter):
@@ -304,7 +493,6 @@ class MPCWrapper:
         return U[0, : self.config.n_joints]
 
     def _run_impl(self, data, x0, input, contact):
-
         current_time = data.time + jnp.asarray(
             1 / self.mpc_frequency,
             dtype=data.time.dtype,
@@ -330,8 +518,28 @@ class MPCWrapper:
             current_time=current_time,
         )
 
-        # Reference generation and solver execution stay on the pure JAX path.
-        X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, beta, mu = self._solve(
+        # ------------------------------------------------------------
+        # New gpu_sls.gpu_sqp.sqp API
+        # ------------------------------------------------------------
+        (
+            X,
+            U,
+            V,
+            w,
+            y,
+            rho,
+            rho_grad,
+            backoffs,
+            Phi_x,
+            Phi_u,
+            beta,
+            mu,
+            Phi_x_I,
+            Phi_u_I,
+            a,
+            b,
+            converged_admm,
+        ) = self._solve(
             reference,
             parameter,
             data.W,
@@ -342,26 +550,74 @@ class MPCWrapper:
             data.w,
             data.y,
             data.rho,
+            data.rho_grad,
             self.obstacles,
             data.h_ct_ws,
             data.beta_ws,
             data.mu_ws,
             data.Phi_x_ws,
             data.Phi_u_ws,
+            data.Phi_x_I_ws,
+            data.Phi_u_I_ws,
+            data.a,
+            data.b,
+            data.converged_admm,
         )
+
         valid_solution = _solution_is_valid(
-            X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, beta, mu,
+            X,
+            U,
+            V,
+            w,
+            y,
+            rho,
+            rho_grad,
+            backoffs,
+            Phi_x,
+            Phi_u,
+            beta,
+            mu,
+            Phi_x_I,
+            Phi_u_I,
+            a,
+            b,
         )
+
         tau = jax.lax.cond(
             valid_solution,
             lambda _: self.control_output(x0, X, U, reference, parameter),
-            lambda _: self.control_output(x0, data.X0, data.U0, reference, parameter),
+            lambda _: self.control_output(
+                x0,
+                data.X0,
+                data.U0,
+                reference,
+                parameter,
+            ),
             operand=None,
         )
+
         # Shift the solution so the next call starts from the previous optimum.
         (
-            U0, X0, V0, w0, y0, rho0, h_ct_ws, beta_ws, mu_ws,
-            Phi_x_ws, Phi_u_ws, _, q, dq,
+            U0,
+            X0,
+            V0,
+            w0,
+            y0,
+            rho0,
+            rho_grad0,
+            h_ct_ws,
+            beta_ws,
+            mu_ws,
+            Phi_x_ws,
+            Phi_u_ws,
+            Phi_x_I_ws,
+            Phi_u_I_ws,
+            a0,
+            b0,
+            converged_admm0,
+            _,
+            q,
+            dq,
         ) = self._update_warm_start(
             x0,
             data.X0,
@@ -370,22 +626,33 @@ class MPCWrapper:
             data.w,
             data.y,
             data.rho,
+            data.rho_grad,
             data.h_ct_ws,
             data.beta_ws,
             data.mu_ws,
             data.Phi_x_ws,
             data.Phi_u_ws,
+            data.Phi_x_I_ws,
+            data.Phi_u_I_ws,
+            data.a,
+            data.b,
             X,
             U,
             V,
             w,
             y,
             rho,
+            rho_grad,
             backoffs,
             Phi_x,
             Phi_u,
             beta,
             mu,
+            Phi_x_I,
+            Phi_u_I,
+            a,
+            b,
+            converged_admm,
         )
 
         data = data.replace(
@@ -396,14 +663,21 @@ class MPCWrapper:
             w=w0,
             y=y0,
             rho=rho0,
+            rho_grad=rho_grad0,
+            a=a0,
+            b=b0,
             h_ct_ws=h_ct_ws,
             beta_ws=beta_ws,
             mu_ws=mu_ws,
             Phi_x_ws=Phi_x_ws,
             Phi_u_ws=Phi_u_ws,
+            Phi_x_I_ws=Phi_x_I_ws,
+            Phi_u_I_ws=Phi_u_I_ws,
+            converged_admm=converged_admm0,
             contact_time=contact_time,
             liftoff=liftoff,
         )
+
         return data, tau, q, dq
 
     def run(self, data, x0, input, contact=None):
@@ -414,16 +688,17 @@ class MPCWrapper:
         return data, tau
 
     def reset(self, data, qpos, qvel, foot):
-        """Reset the warm start around the provided measured state."""
+        """Reset all SQP/SLS/ADMM warm-start state around the measured state."""
 
-        # Start from the config initial_state so any extra state entries keep
-        # their configured default value.
+        # Start from config.initial_state so auxiliary entries -- including an
+        # optional minimum-time state -- retain their configured reset values.
         initial_state = (
             self.initial_state
             .at[self.qpos_slice].set(jnp.ravel(qpos))
             .at[self.qvel_slice].set(jnp.ravel(qvel))
             .at[self.foot_slice].set(jnp.ravel(foot))
         )
+
         return data.replace(
             U0=self.initial_U0,
             X0=jnp.tile(initial_state, (self.config.N + 1, 1)),
@@ -431,19 +706,27 @@ class MPCWrapper:
             w=self.initial_w,
             y=self.initial_y,
             rho=self.initial_rho,
+            rho_grad=self.initial_rho_grad,
+            a=self.initial_a,
+            b=self.initial_b,
             h_ct_ws=self.initial_h_ct_ws,
             beta_ws=self.initial_beta_ws,
             mu_ws=self.initial_mu_ws,
             Phi_x_ws=self.initial_Phi_x_ws,
             Phi_u_ws=self.initial_Phi_u_ws,
+            Phi_x_I_ws=self.initial_Phi_x_I_ws,
+            Phi_u_I_ws=self.initial_Phi_u_I_ws,
+            converged_admm=self.initial_converged_admm,
             time=jnp.asarray(0.0, dtype=jnp.float32),
             contact_time=self.config.timer_t,
             liftoff=jnp.ravel(foot),
         )
 
     def foot_positions(self, qpos):
-        """Return the flattened contact-point positions for the provided configuration."""
+        """Return flattened contact-point positions for the provided configuration."""
 
         self.data.qpos = qpos
         mujoco.mj_kinematics(self.model, self.data)
-        return jnp.array([self.data.geom_xpos[idx] for idx in self.contact_id_mj]).flatten()
+        return jnp.array(
+            [self.data.geom_xpos[idx] for idx in self.contact_id_mj]
+        ).flatten()
