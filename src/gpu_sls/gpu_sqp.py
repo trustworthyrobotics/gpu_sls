@@ -184,9 +184,17 @@ class SQPConfig:
     step_tol: float = 1e-4
     warm_start: bool = True
     line_search: bool = True
+    lm_regularization: float = 1e-2
 
     def tree_flatten(self):
-        children = (self.max_sqp_iterations, self.feas_tol, self.step_tol, self.warm_start, self.line_search)
+        children = (
+            self.max_sqp_iterations,
+            self.feas_tol,
+            self.step_tol,
+            self.warm_start,
+            self.line_search,
+            self.lm_regularization,
+        )
         return children, None
 
     @classmethod
@@ -264,36 +272,37 @@ def filter_model_evaluator_factory(
         # Original nonlinear nominal constraints.
         g_base = vectorize(constraints)(X, U_pad, t)
 
-        # C_all, D_all = linearize(constraints)(
-        #     X,
-        #     U_pad,
-        #     t,
+        # # C_all, D_all = linearize(constraints)(
+        # #     X,
+        # #     U_pad,
+        # #     t,
+        # # )
+
+        # # Recompute tightening for this line-search candidate.
+        # # h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_all, D_all)
+        # h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
+        # # h_ct_trial = backoffs
+        # # h_ct_trial = jnp.zeros_like(h_ct_trial)
+        # # Handle the case where the tightening contains only base constraints,
+        # # while g_base may contain additional constraint channels.
+        # n_tight = h_ct_trial.shape[1]
+        # # eps_abs = 0
+        # g_base_tight = (
+        #     g_base[:, :n_tight]
+        #     + h_ct_trial
+        #     + eps_abs
         # )
 
-        # Recompute tightening for this line-search candidate.
-        # h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_all, D_all)
-        h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
-        # h_ct_trial = backoffs
-        # h_ct_trial = jnp.zeros_like(h_ct_trial)
-        # Handle the case where the tightening contains only base constraints,
-        # while g_base may contain additional constraint channels.
-        n_tight = h_ct_trial.shape[1]
-        # eps_abs = 0
-        g_base_tight = (
-            g_base[:, :n_tight]
-            + h_ct_trial
-            + eps_abs
-        )
+        # # Any remaining constraints are evaluated without this tightening.
+        # g_remaining = g_base[:, n_tight:]
 
-        # Any remaining constraints are evaluated without this tightening.
-        g_remaining = g_base[:, n_tight:]
+        # g_all = jnp.concatenate(
+        #     [g_base_tight, g_remaining],
+        #     axis=1,
+        # )
 
-        g_all = jnp.concatenate(
-            [g_base_tight, g_remaining],
-            axis=1,
-        )
-
-        g_viol = jnp.maximum(g_all, 0.0)
+        # g_viol = jnp.maximum(g_all, 0.0)
+        g_viol = jnp.maximum(g_base + eps_abs, 0.0)
 
         c_filter = jnp.concatenate(
             [
@@ -314,28 +323,7 @@ def lagrangian(cost, dynamics, constraints, x0, obstacles, backoffs):
         c3 = jnp.dot(v_prev, lax.select(t == 0, x0 - x, -x))
 
         g_base = constraints(x, u, t)
-        n_base = g_base.shape[0]
-
-        g_base_tight = g_base + backoffs[t, :n_base]
-
-        if obstacles.shape[0] == 0:
-            g_obs_tight = jnp.empty((0,), dtype=g_base.dtype)
-        else:
-            centers = obstacles[:, :2]
-            radii = obstacles[:, 2]
-
-            pos = x[:2]
-            diff = pos[None, :] - centers
-            dist = jnp.linalg.norm(diff, axis=-1) + 1e-6
-            n = diff / dist[:, None]
-
-            hx = jnp.abs(backoffs[t, 0])
-            hy = jnp.abs(backoffs[t, 1])
-
-            obs_backoff = jnp.abs(n[:, 0]) * hx + jnp.abs(n[:, 1]) * hy
-            g_obs_tight = radii - dist + obs_backoff
-
-        g_all = jnp.concatenate([g_base_tight, g_obs_tight], axis=0)
+        g_all = g_base + backoffs[t]
 
         c4 = jnp.dot(lam, g_all)
 
@@ -384,6 +372,7 @@ def compute_search_direction(
     cost, dynamics, hessian_approx,
     constraints, disturbance,
     obstacles,
+    lm_regularization,
     x0, X, U, V, c,
     w, y, rho, rho_grad, 
     h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws,
@@ -405,6 +394,21 @@ def compute_search_direction(
 
     R = R_pad[:-1]
     M = M_pad[:-1]
+
+    # Levenberg-Marquardt regularization of the SQP quadratic model.
+    # Adding lambda * I to both diagonal Hessian blocks is equivalent to
+    # regularizing the full stage Hessian in (x, u), while leaving the
+    # state-control cross term unchanged.
+    lm = jnp.maximum(
+        jnp.asarray(lm_regularization, dtype=Q.dtype),
+        jnp.asarray(jnp.finfo(Q.dtype).eps, dtype=Q.dtype),
+    )
+    # Autodiff can leave tiny asymmetric roundoff in the Hessian.  The LQR
+    # recursion assumes symmetric blocks, so remove it before damping.
+    Q = 0.5 * (Q + jnp.swapaxes(Q, -1, -2))
+    R = 0.5 * (R + jnp.swapaxes(R, -1, -2))
+    Q = Q + lm * jnp.eye(nx, dtype=Q.dtype)
+    R = R + lm.astype(R.dtype) * jnp.eye(nu, dtype=R.dtype)
 
     linearizer = linearize(
         lagrangian(cost, dynamics, constraints, x0, obstacles, h_ct_ws),
@@ -514,11 +518,11 @@ def sqp(
             # warm_flag = jnp.logical_and(warm_flag, jnp.array(i != sls_config.max_initial_sqp_iterations))
             # Turn this off? seems to be more optimal
             w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
-            # w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
+            w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
             a0 = lax.select(jnp.array(False), a, jnp.zeros_like(a))
             # b0 = lax.select(jnp.array(False), b, jnp.zeros_like(b))
-            # a0 = lax.select(warm_flag, a, jnp.zeros_like(a))
+            a0 = lax.select(warm_flag, a, jnp.zeros_like(a))
             b0 = lax.select(warm_flag, b, jnp.zeros_like(b))
             rho0 = lax.select(warm_flag, rho, jnp.asarray(admm_config.initial_rho, dtype=rho.dtype))
             h_ct_ws = backoffs
@@ -527,6 +531,7 @@ def sqp(
                 _cost, _dynamics, _hessian_approx,
                 constraints, disturbance,
                 obstacles,
+                sqp_config.lm_regularization,
                 x0, X_curr, U_curr, V_curr, c,
                 w0, y0, rho0, rho_grad0,
                 h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a0, b0, i

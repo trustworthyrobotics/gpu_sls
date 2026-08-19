@@ -473,14 +473,14 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
     NUM_PHASES = len(WAYPOINT_STEPS)
     n = 12 + NUM_PHASES
     nu = 4
-    TIME_WEIGHT = 1.0
+    TIME_WEIGHT = 0.5
 
     # -----------------------------
     # Cost weights
     # -----------------------------
     W = jnp.concatenate([jnp.array([
-            0.0, 0.0, 0.0,        # position
-            0.0, 0.0, 0.0,        # roll, pitch, yaw
+            0.001, 0.001, 0.001,        # position
+            0.01, 0.01, 0.01,        # roll, pitch, yaw
             0.01, 0.01, 0.01,        # velocities
             0.01, 0.01, 0.01,        # body rates
             0.01, 0.01, 0.01, 0.01,  # control
@@ -573,9 +573,10 @@ def build_controller(N, X_IN, WAYPOINT_STEPS, WAYPOINT_CENTERS, WAYPOINT_HALF_WI
     sqp_cfg = SQPConfig(
         max_sqp_iterations=100,
         warm_start=True,
-        feas_tol=0.2,
+        feas_tol=0.1,
         step_tol=10,
         line_search=True,
+        lm_regularization=1e-2,
     )
 
     controller = GenericMPC(
