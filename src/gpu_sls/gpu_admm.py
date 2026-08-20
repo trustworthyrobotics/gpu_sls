@@ -30,9 +30,10 @@ class ADMMConfig:
     eps_rel: float = 1e-2
     rho_max: int = 1e5
     initial_rho: int = 1.0
+    num_phases: int = 1
 
     def tree_flatten(self):
-        children = (self.rho_update_frequency, self.max_iterations, self.eps_abs, self.eps_rel, self.rho_max, self.initial_rho)
+        children = (self.rho_update_frequency, self.max_iterations, self.eps_abs, self.eps_rel, self.rho_max, self.initial_rho, self.num_phases)
         return children, None
 
     @classmethod
@@ -431,7 +432,31 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         b, p = associative_scan_use_cache_cp_jax(c0, p0, T + 1, cache, reverse=True)
         k = get_k(tilde_R, tilde_r, B, P, p, c[1:])
 
-        x_bar, u_stage = rollout_gpu(K, k, c[0], A, B, c[1:])
+        num_phases = cfg.num_phases
+        if num_phases > 0:
+            # Physical initial-state perturbation
+            dx0 = c[0, :-num_phases]
+
+            P0 = P[0]
+            p0 = p[0]
+
+            # Partition w.r.t. [dx, dT1, ..., dTn]
+            P_Tx = P0[-num_phases:, :-num_phases]
+            P_TT = P0[-num_phases:, -num_phases:]
+            p_T = p0[-num_phases:]
+
+            # P_TT @ delta_T = -(P_Tx @ dx0 + p_T)
+            delta_T = -jnp.linalg.solve(P_TT, P_Tx @ dx0 + p_T)
+            dx0_aug = c[0].at[-num_phases:].set(delta_T)
+        else:
+            # Standard fixed-time optimal control: every initial-state entry
+            # is fixed, and there are no duration variables to eliminate.
+            dx0_aug = c[0]
+
+        x_bar, u_stage = rollout_gpu(
+            K, k, dx0_aug,
+            A, B, c[1:]
+        )
         u_bar = jnp.pad(u_stage, ((0, 1), (0, 0)))
 
         z_bar = (
@@ -535,11 +560,11 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
     out = jax.lax.while_loop(cond_fun, one_iter, init)
 
-    it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, K, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
+    it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, K_term, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
     v = dual_lqr(x_bar, P_final, p_final)
     jax.debug.print(
         "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
         it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
     )
     mu = rho_final * y_bar
-    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, converged
+    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, K_term, converged

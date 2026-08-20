@@ -16,6 +16,7 @@ class SLSConfig:
     max_sls_iterations: int = 1
     sls_primal_tol: float = 1e-2
     enable_fastsls: bool = True
+    enable_tube_mpc: bool = False
     warm_start: bool = True
     rti: bool = False
     initialize_nominal: bool = True
@@ -354,7 +355,7 @@ def sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         w   = lax.select(warm_flag, w, jnp.zeros_like(w))
         y   = lax.select(warm_flag, y, jnp.zeros_like(y))
         rho = lax.select(warm_flag, rho, jnp.array(cfg.initial_rho, dtype=rho.dtype))
-        x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
+        x_curr, u_curr, v_curr, w, y, rho, mu, _, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )
         prev_rho = rho

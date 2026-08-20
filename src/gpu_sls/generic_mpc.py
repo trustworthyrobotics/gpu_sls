@@ -17,7 +17,6 @@ class MPCConfig:
     N: int
     W: jnp.ndarray
     u_ref: jnp.ndarray
-    dt: float
 
 
 class GenericMPC:
@@ -26,7 +25,6 @@ class GenericMPC:
         sls_config, sqp_config, admm_config,
         config, dynamics, constraints, obstacles,
         cost,
-        num_constraints: int,
         disturbance,
         X_in, U_in,
         shift: int = 1,
@@ -38,11 +36,24 @@ class GenericMPC:
         self.shift = shift
         self.obstacles = obstacles
         num_obstacles = self.obstacles.shape[0]
+        x_dummy = jnp.zeros((config.n,), dtype=X_in.dtype)
+        u_dummy = jnp.zeros((config.nu,), dtype=U_in.dtype)
+        t_dummy = jnp.asarray(0, dtype=jnp.int32)
+
+        constraint_shape = jax.eval_shape(
+            constraints,
+            x_dummy,
+            u_dummy,
+            t_dummy,
+        )
+
+        num_constraints = constraint_shape.shape[0]
         self.h_ct_ws = jnp.zeros((config.N + 1, num_constraints - num_obstacles))
         self.beta_ws = jnp.ones((config.N + 1, config.N + 1, num_constraints - num_obstacles)) * 1e-10
         self.mu_ws = jnp.zeros((config.N + 1, num_constraints))
         self.Phi_x_ws = jnp.zeros((config.N + 1, config.N + 1, config.n, config.n))
         self.Phi_u_ws = jnp.zeros((config.N, config.N + 1, config.nu, config.n))
+        self.K_fixed = jnp.zeros((config.N, config.nu, config.n))
 
         self.U0 = U_in
         self.X0 = X_in
@@ -67,15 +78,17 @@ class GenericMPC:
         self._solve = jax.jit(work)
 
     def run(self, x0: jnp.ndarray, reference: jnp.ndarray, parameter: Any):
-        X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, betaN, muN = self._solve(
+        X, U, V, w, y, rho, backoffs, Phi_x, Phi_u, betaN, muN, K_term = self._solve(
             reference,
             parameter,
             self.config.W,
             x0, self.X0, self.U0, self.V0,
             self.w, self.y, self.rho,
             self.obstacles,
-            self.h_ct_ws, self.beta_ws, self.mu_ws, self.Phi_x_ws, self.Phi_u_ws
+            self.h_ct_ws, self.beta_ws, self.mu_ws, self.Phi_x_ws, self.Phi_u_ws, self.K_fixed
         )
+
+        self.K_fixed = K_term
 
         s = self.shift
 
