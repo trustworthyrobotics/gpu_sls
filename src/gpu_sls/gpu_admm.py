@@ -651,27 +651,25 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
         # ------- Calculate Optimal Phase Times -------
         num_phases = cfg.num_phases
+        if num_phases > 0:
+            # Physical initial-state perturbation
+            dx0 = c[0, :-num_phases]
 
-        # Physical initial-state perturbation
-        dx0 = c[0, :-num_phases]
+            P0 = P[0]
+            p0 = p[0]
 
-        P0 = P[0]
-        p0 = p[0]
+            # Partition w.r.t. [dx, dT1, ..., dTn]
+            P_Tx = P0[-num_phases:, :-num_phases]
+            P_TT = P0[-num_phases:, -num_phases:]
+            p_T = p0[-num_phases:]
 
-        # Partition w.r.t. [dx, dT1, ..., dTn]
-        P_Tx = P0[-num_phases:, :-num_phases]       # (num_phases, nx_phys)
-        P_TT = P0[-num_phases:, -num_phases:]       # (num_phases, num_phases)
-        p_T = p0[-num_phases:]                       # (num_phases,)
-
-        # Solve:
-        # P_TT @ delta_T = -(P_Tx @ dx0 + p_T)
-        delta_T = -jnp.linalg.solve(
-            P_TT,
-            P_Tx @ dx0 + p_T,
-        )
-
-        # Construct augmented initial perturbation
-        dx0_aug = c[0].at[-num_phases:].set(delta_T)
+            # P_TT @ delta_T = -(P_Tx @ dx0 + p_T)
+            delta_T = -jnp.linalg.solve(P_TT, P_Tx @ dx0 + p_T)
+            dx0_aug = c[0].at[-num_phases:].set(delta_T)
+        else:
+            # Standard fixed-time optimal control: every initial-state entry
+            # is fixed, and there are no duration variables to eliminate.
+            dx0_aug = c[0]
 
         x_bar, u_stage = rollout_gpu(
             K, k, dx0_aug,

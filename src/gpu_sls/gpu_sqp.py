@@ -223,9 +223,12 @@ def model_evaluator_helper_min_time(
         dynamics(X[t], U[t], t) - X[t + 1]
     )
 
-    # Enforce initial condition on physical states only.
-    # The final `num_phases` states are free phase durations.
-    initial_residual = (x0 - X[0]).at[-num_phases:].set(0.0)
+    # Enforce the complete initial condition for fixed-time problems.  For a
+    # minimum-time problem, only the final `num_phases` duration states are
+    # free at node zero.  Handle zero explicitly because ``-0:`` is ``0:``.
+    initial_residual = x0 - X[0]
+    if num_phases > 0:
+        initial_residual = initial_residual.at[-num_phases:].set(0.0)
 
     c = jnp.vstack([
         initial_residual,

@@ -1,8 +1,8 @@
-"""Minimum-time, multi-phase barrel roll for the Unitree Go2.
+"""Fixed-time, multi-phase barrel-roll baseline for the Unitree Go2.
 
-The contact sequence and number of shooting intervals in each phase stay fixed.
-The physical durations T_i are appended to the whole-body state and optimized
-in the same way as the phase times in plan_drone_racing.
+Every phase has a fixed number of shooting intervals and a fixed physical
+duration.  Unlike quadruped_barrel_roll, this baseline has no duration states
+and no minimum-time objective; it optimizes trajectory quality only.
 
 Use --dry-run to validate callback shapes without compiling the full solver.
 """
@@ -43,7 +43,7 @@ jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
-# Stages encoded by reference_barrel_roll_min_time.
+# Fixed phase schedule encoded by reference_barrel_roll_fixed_time.
 PHASE_NAMES = (
     "stance",
     "lateral_launch",
@@ -52,7 +52,7 @@ PHASE_NAMES = (
     "touchdown",
     "settle",
 )
-NOMINAL_DURATIONS = jnp.array([0.20, 0.20, 0.24, 0.06, 0.10, 0.20])
+FIXED_PHASE_DURATIONS = jnp.array([0.20, 0.20, 0.24, 0.06, 0.10, 0.20])
 PHASE_END_STEPS = jnp.array([10, 20, 32, 35, 40, 50], dtype=jnp.int32)
 SEGMENT_LENGTHS = jnp.concatenate(
     [PHASE_END_STEPS[:1], PHASE_END_STEPS[1:] - PHASE_END_STEPS[:-1]]
@@ -65,15 +65,11 @@ if config.N != int(PHASE_END_STEPS[-1]):
         f"got {config.N}."
     )
 
-MIN_DURATIONS = 0.30 * NOMINAL_DURATIONS
-MAX_DURATIONS = 2.00 * NOMINAL_DURATIONS
-TIME_WEIGHT = 3e4
 FEASIBILITY_TOLERANCE = 2.0e-2
 DYNAMICS_TOLERANCE = 1.5e-1
 
 # Original MPX state: qpos, qvel, foot positions, and GRFs.
 PHYSICAL_N = 13 + 2 * config.n_joints + 6 * config.n_contact
-DURATION_SLICE = slice(PHYSICAL_N, PHYSICAL_N + NUM_PHASES)
 GRF_START = 13 + 2 * config.n_joints + 3 * config.n_contact
 GRF_STOP = GRF_START + 3 * config.n_contact
 
@@ -119,14 +115,14 @@ def phase_index(t):
     return jnp.clip(index, 0, NUM_PHASES - 1)
 
 
-def min_time_barrel_roll_dynamics(model, mjx_model, contact_id, body_id):
-    """Build dynamics with dt_k = T_phase(k) / N_phase(k)."""
+def fixed_time_barrel_roll_dynamics(model, mjx_model, contact_id, body_id):
+    """Build dynamics with a fixed timestep for every scheduled phase."""
 
     n_joints = config.n_joints
 
     def dynamics(x, u, t, parameter):
         phase = phase_index(t)
-        dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
+        dt = FIXED_PHASE_DURATIONS[phase] / SEGMENT_LENGTHS[phase]
 
         qpos = x[: n_joints + 7]
         qvel = x[n_joints + 7 : 2 * n_joints + 13]
@@ -202,14 +198,13 @@ def min_time_barrel_roll_dynamics(model, mjx_model, contact_id, body_id):
             ]
         )
 
-        # Every phase duration is a constant state along the horizon.
-        return jnp.concatenate([physical_next, x[DURATION_SLICE]])
+        return physical_next
 
     return dynamics
 
 
-def min_time_barrel_roll_cost(W, reference, x, u, t):
-    """Whole-body tracking regularization plus sum of phase durations."""
+def fixed_time_barrel_roll_cost(W, reference, x, u, t):
+    """Whole-body tracking objective with no minimum-time term."""
 
     nj = config.n_joints
     nc = config.n_contact
@@ -254,21 +249,13 @@ def min_time_barrel_roll_cost(W, reference, x, u, t):
         + (grf - grf_ref).T @ W["grf"] @ (grf - grf_ref)
         + friction_penalty
     )
-    # Durations are constant states, so charging them at every node would
-    # multiply the intended minimum-time objective by N + 1 and overwhelm the
-    # feasibility terms.  Charge the physical phase-time sum exactly once.
-    time_cost = jnp.where(
-        t == config.N,
-        jnp.dot(W["time"], x[DURATION_SLICE]),
-        jnp.asarray(0.0, dtype=x.dtype),
-    )
-    return 0.5 * stage_cost + time_cost
+    return 0.5 * stage_cost
 
 
 def build_barrel_roll_reference():
     """Pad the existing N-sample barrel reference for the N+1-state SQP."""
 
-    reference, parameter = barrel_mpc_utils.reference_barrel_roll_min_time(
+    reference, parameter = barrel_mpc_utils.reference_barrel_roll_fixed_time(
         config.N,
         config.dt,
         config.n_joints,
@@ -294,7 +281,7 @@ def build_initial_guess(x0, reference):
     X = X.at[:, 7 + nj : 10 + nj].set(reference["dp"])
     X = X.at[:, 10 + nj : 13 + nj].set(reference["omega"])
     phase_ids = phase_index(jnp.arange(config.N, dtype=jnp.int32))
-    node_dts = NOMINAL_DURATIONS[phase_ids] / SEGMENT_LENGTHS[phase_ids]
+    node_dts = FIXED_PHASE_DURATIONS[phase_ids] / SEGMENT_LENGTHS[phase_ids]
     joint_rates = (reference["q"][1:] - reference["q"][:-1]) / node_dts[:, None]
     joint_rates = jnp.concatenate(
         [joint_rates, jnp.zeros((1, nj), dtype=X.dtype)], axis=0
@@ -304,13 +291,11 @@ def build_initial_guess(x0, reference):
         reference["foot"]
     )
     X = X.at[:, GRF_START:GRF_STOP].set(reference["grf"])
-    X = X.at[:, DURATION_SLICE].set(NOMINAL_DURATIONS)
-    # Physical x0 is fixed; only phase durations at node zero are free.
-    return X.at[0, :PHYSICAL_N].set(x0[:PHYSICAL_N])
+    return X.at[0].set(x0)
 
 
 def make_barrel_roll_constraints(reference):
-    """Build hard timing, pose, joint, contact-force, and landing limits."""
+    """Build hard pose, joint, contact-force, and landing limits."""
 
     nj = config.n_joints
     waypoint_positions = reference["p"][PHASE_END_STEPS]
@@ -319,16 +304,12 @@ def make_barrel_roll_constraints(reference):
     cosine_limits = jnp.cos(0.5 * WAYPOINT_ANGLE_TOLERANCES)
 
     def constraints(x, u, t):
-        durations = x[DURATION_SLICE]
         q = x[7 : 7 + nj]
         dp = x[7 + nj : 10 + nj]
         omega = x[10 + nj : 13 + nj]
         dq = x[13 + nj : 13 + 2 * nj]
         grf = x[GRF_START:GRF_STOP].reshape(config.n_contact, 3)
 
-        duration_constraints = jnp.concatenate(
-            [MIN_DURATIONS - durations, durations - MAX_DURATIONS]
-        )
         torque_constraints = jnp.concatenate(
             [u - config.max_torque, config.min_torque - u]
         )
@@ -420,7 +401,6 @@ def make_barrel_roll_constraints(reference):
 
         return jnp.concatenate(
             [
-                duration_constraints,
                 torque_constraints,
                 joint_constraints,
                 position_constraints.reshape(-1),
@@ -435,14 +415,13 @@ def make_barrel_roll_constraints(reference):
     return constraints
 
 
-def make_phase_scaled_disturbance(n, magnitude=0.02):
-    """Disturb base position, scaled by the optimized phase timestep."""
+def make_fixed_time_disturbance(n, magnitude=0.02):
+    """Disturb base position, scaled by the fixed phase timestep."""
 
     def disturbance_at_state(x, t):
         phase = phase_index(t)
-        dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
+        dt = FIXED_PHASE_DURATIONS[phase] / SEGMENT_LENGTHS[phase]
         diagonal = jnp.zeros(n, dtype=x.dtype).at[:3].set(magnitude * dt)
-        diagonal = diagonal.at[DURATION_SLICE].set(0.0)
         return jnp.diag(diagonal)
 
     def disturbance(X):
@@ -458,14 +437,14 @@ def unused_reference_generator(*args, **kwargs):
 
 
 def configure_problem():
-    """Configure the Go2 module for five free duration states."""
+    """Configure the Go2 problem with no free duration states."""
 
     base_state = jnp.asarray(config.initial_state)[:PHYSICAL_N]
-    config.n = PHYSICAL_N + NUM_PHASES
+    config.n = PHYSICAL_N
     config.nu = config.n_joints
-    config.initial_state = jnp.concatenate([base_state, NOMINAL_DURATIONS])
-    config.dynamics = min_time_barrel_roll_dynamics
-    config.cost = min_time_barrel_roll_cost
+    config.initial_state = base_state
+    config.dynamics = fixed_time_barrel_roll_dynamics
+    config.cost = fixed_time_barrel_roll_cost
     config.hessian_approx = None
     config.reference_generator = unused_reference_generator
 
@@ -480,7 +459,6 @@ def configure_problem():
         "contact": jnp.eye(3 * config.n_contact, dtype=dtype) * 50.0,
         "tau": jnp.eye(config.n_joints, dtype=dtype) * 1.0e-2,
         "grf": jnp.eye(3 * config.n_contact, dtype=dtype) * 1.0e-3,
-        "time": jnp.ones(NUM_PHASES, dtype=dtype) * TIME_WEIGHT,
     }
 
 
@@ -549,8 +527,8 @@ def solve_barrel_roll(mpc, data, x0, reference, parameter):
     )
 
 
-def phase_node_times(phase_times):
-    dts = np.asarray(phase_times) / np.asarray(SEGMENT_LENGTHS)
+def fixed_node_times():
+    dts = np.asarray(FIXED_PHASE_DURATIONS) / np.asarray(SEGMENT_LENGTHS)
     transition_phases = np.searchsorted(
         np.asarray(PHASE_END_STEPS), np.arange(config.N), side="right"
     )
@@ -624,14 +602,14 @@ def dry_run(reference, parameter, constraints):
     constraint_shape = jax.eval_shape(
         constraints, x0, U0[0], jnp.asarray(0)
     ).shape
-    print("Barrel-roll minimum-time setup is valid.")
+    print("Barrel-roll fixed-time setup is valid.")
     print(f"State/control dimensions: {config.n}/{config.nu}")
     print(f"Reference/parameter shapes: {reference['p'].shape}/{parameter.shape}")
     print(f"Initial guess shape: {X0.shape}")
     print(f"Constraint count per node: {constraint_shape[0]}")
-    print("Nominal phase times:")
+    print("Fixed phase times:")
     for name, duration, intervals in zip(
-        PHASE_NAMES, NOMINAL_DURATIONS, SEGMENT_LENGTHS
+        PHASE_NAMES, FIXED_PHASE_DURATIONS, SEGMENT_LENGTHS
     ):
         print(
             f"  {name:16s} {float(duration):.3f} s "
@@ -656,7 +634,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         rho_update_frequency=25,
         initial_rho=1.0,
         regularized_rho_update=False,
-        num_phases=NUM_PHASES,
+        num_phases=0,
     )
     sls_config = SLSConfig(
         max_sls_iterations=1,
@@ -683,7 +661,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         admm_config=admm_config,
         constraints=constraints,
         obstacles=jnp.zeros((0, 3), dtype=config.initial_state.dtype),
-        disturbance=make_phase_scaled_disturbance(config.n),
+        disturbance=make_fixed_time_disturbance(config.n),
     )
 
     # Initialize the physical state and feet from the optimizer's model.
@@ -701,7 +679,6 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         .at[mpc.qpos_slice].set(jnp.asarray(model_data.qpos))
         .at[mpc.qvel_slice].set(jnp.asarray(model_data.qvel))
         .at[mpc.foot_slice].set(feet)
-        .at[DURATION_SLICE].set(NOMINAL_DURATIONS)
     )
     data = mpc.make_data()
 
@@ -712,7 +689,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     X.block_until_ready()
     solve_time = timer() - start
 
-    phase_times = np.asarray(X[0, DURATION_SLICE])
+    phase_times = np.asarray(FIXED_PHASE_DURATIONS)
     total_time = float(np.sum(phase_times))
     max_violation, violation_node, violation_index = (
         evaluate_constraint_violation(constraints, X, U)
@@ -723,10 +700,10 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     position_errors, angle_errors = waypoint_diagnostics(reference, X)
 
     print(f"Solve time: {solve_time:.3f} s")
-    print("Optimized phase times:")
+    print("Fixed phase times:")
     for name, duration in zip(PHASE_NAMES, phase_times):
         print(f"  {name:16s} {duration:.6f} s")
-    print(f"Computed minimum barrel-roll time: {total_time:.6f} s")
+    print(f"Fixed barrel-roll time: {total_time:.6f} s")
     print(f"ADMM converged: {bool(np.asarray(converged_admm))}")
     print(
         "Maximum constraint violation: "
@@ -747,9 +724,25 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
             f"orientation={angle_error:.3f} deg"
         )
 
+    if not np.isfinite(max_violation) or max_violation > FEASIBILITY_TOLERANCE:
+        raise RuntimeError(
+            "Refusing to overwrite the trajectory with an infeasible solution: "
+            f"maximum constraint violation {max_violation:.6e} exceeds "
+            f"{FEASIBILITY_TOLERANCE:.6e}."
+        )
+    if (
+        not np.isfinite(max_dynamics_defect)
+        or max_dynamics_defect > DYNAMICS_TOLERANCE
+    ):
+        raise RuntimeError(
+            "Refusing to overwrite the trajectory with an inconsistent solution: "
+            f"maximum dynamics defect {max_dynamics_defect:.6e} exceeds "
+            f"{DYNAMICS_TOLERANCE:.6e}."
+        )
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    result_path = output_dir / "quadruped_barrel_roll_min_time.npz"
+    result_path = output_dir / "quadruped_barrel_roll_no_min_time.npz"
     np.savez(
         result_path,
         X=np.asarray(X),
@@ -757,7 +750,10 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         phase_names=np.asarray(PHASE_NAMES),
         phase_end_steps=np.asarray(PHASE_END_STEPS),
         phase_times=phase_times,
-        node_times=phase_node_times(phase_times),
+        total_time=np.asarray(total_time),
+        node_times=fixed_node_times(),
+        timing_mode=np.asarray("fixed"),
+        fixed_phase_times=np.asarray(True),
         max_constraint_violation=np.asarray(max_violation),
         max_dynamics_defect=np.asarray(max_dynamics_defect),
         waypoint_position_errors=position_errors,
