@@ -825,8 +825,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     n = Q.shape[1]
     nx = Q.shape[-1]
     nu = R.shape[-1]
-    f = f - cfg.eps_abs
-    # f = f
+    # f = f - cfg.eps_abs
+    f = f
     R = jnp.concatenate([R, jnp.zeros((1, nu, nu), dtype=R.dtype)], axis=0)
     r = jnp.concatenate([r, jnp.zeros((1, nu), dtype=r.dtype)], axis=0)
     M = jnp.concatenate([M, jnp.zeros((1, nx, nu), dtype=M.dtype)], axis=0)

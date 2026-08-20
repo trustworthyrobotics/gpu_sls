@@ -305,7 +305,8 @@ def filter_model_evaluator_factory(
         # )
 
         # g_viol = jnp.maximum(g_all, 0.0)
-        g_viol = jnp.maximum(g_base + eps_abs, 0.0)
+        # g_viol = jnp.maximum(g_base + eps_abs, 0.0)
+        g_viol = jnp.maximum(g_base, 0.0)
 
         c_filter = jnp.concatenate(
             [
@@ -540,6 +541,26 @@ def sqp(
                 h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a0, b0, i
             )
 
+            direction_finite = (
+                jnp.all(jnp.isfinite(dX))
+                & jnp.all(jnp.isfinite(dU))
+                & jnp.all(jnp.isfinite(dV))
+                & jnp.all(jnp.isfinite(q))
+                & jnp.all(jnp.isfinite(r))
+                & jnp.all(jnp.isfinite(w1))
+                & jnp.all(jnp.isfinite(y1))
+                & jnp.all(jnp.isfinite(rho1))
+                & jnp.all(jnp.isfinite(rho_grad1))
+                & jnp.all(jnp.isfinite(backoffs1))
+                & jnp.all(jnp.isfinite(Phi_x1))
+                & jnp.all(jnp.isfinite(Phi_u1))
+                & jnp.all(jnp.isfinite(betaN))
+                & jnp.all(jnp.isfinite(muN))
+                & jnp.all(jnp.isfinite(Phi_x_I_next))
+                & jnp.all(jnp.isfinite(Phi_u_I_next))
+                & jnp.all(jnp.isfinite(a1))
+                & jnp.all(jnp.isfinite(b1))
+            )
             step = jnp.maximum(
                 jnp.max(jnp.abs(dX)),
                 jnp.max(jnp.abs(dU))
@@ -564,7 +585,9 @@ def sqp(
 
             D_all = D_all.at[-1].set(jnp.zeros_like(D_all[-1]))
 
-            converged1 = jnp.logical_and(feas_ok, step_ok)
+            converged1 = jnp.logical_and(
+                direction_finite, jnp.logical_and(feas_ok, step_ok)
+            )
             filter_model_evaluator = filter_model_evaluator_factory(
                 model_evaluator=model_evaluator,
                 constraints=constraints,
@@ -594,7 +617,20 @@ def sqp(
             def fullstep_branch(_):
                 return (X_curr + dX, U_curr + dU, V_curr + dV)
 
-            X_next, U_next, V_next = lax.cond(do_ls, ls_branch, fullstep_branch, operand=None)
+            X_next, U_next, V_next = lax.cond(
+                do_ls, ls_branch, fullstep_branch, operand=None
+            )
+            candidate_finite = (
+                jnp.all(jnp.isfinite(X_next))
+                & jnp.all(jnp.isfinite(U_next))
+                & jnp.all(jnp.isfinite(V_next))
+            )
+            failed = jnp.logical_not(
+                jnp.logical_and(direction_finite, candidate_finite)
+            )
+            X_next = lax.select(failed, X_curr, X_next)
+            U_next = lax.select(failed, U_curr, U_next)
+            V_next = lax.select(failed, V_curr, V_next)
 
             # jax.debug.callback(
             #     save_sqp_xz_step_plot,
@@ -605,19 +641,31 @@ def sqp(
             #     ordered=True,
             # )
 
-            w_next = lax.select(converged1, w, w1)
-            y_next = lax.select(converged1, y, y1)
-            a_next = lax.select(converged1, a, a1)
-            b_next = lax.select(converged1, b, b1)
-            rho_next = lax.select(converged1, rho, rho1)
-            rho_grad_next = lax.select(converged1, rho_grad, rho_grad1)
-            backoffs_next = lax.select(converged1, backoffs, backoffs1)
-            Phi_x_next = lax.select(converged1, Phi_x, Phi_x1)
-            Phi_u_next = lax.select(converged1, Phi_u, Phi_u1)
+            keep_previous = jnp.logical_or(converged1, failed)
+            w_next = lax.select(keep_previous, w, w1)
+            y_next = lax.select(keep_previous, y, y1)
+            a_next = lax.select(keep_previous, a, a1)
+            b_next = lax.select(keep_previous, b, b1)
+            rho_next = lax.select(keep_previous, rho, rho1)
+            rho_grad_next = lax.select(keep_previous, rho_grad, rho_grad1)
+            backoffs_next = lax.select(keep_previous, backoffs, backoffs1)
+            Phi_x_next = lax.select(keep_previous, Phi_x, Phi_x1)
+            Phi_u_next = lax.select(keep_previous, Phi_u, Phi_u1)
+            beta_next = lax.select(keep_previous, beta_ws, betaN)
+            mu_next = lax.select(keep_previous, mu_w, muN)
+            Phi_x_I_next = lax.select(
+                keep_previous, Phi_x_I_ws, Phi_x_I_next
+            )
+            Phi_u_I_next = lax.select(
+                keep_previous, Phi_u_I_ws, Phi_u_I_next
+            )
+            converged_admm_next = lax.select(
+                failed, converged_admm, converged_admm_new
+            )
 
             return (i + 1, X_next, U_next, V_next, w_next, y_next, rho_next, rho_grad_next,
-                    jnp.logical_or(converged, converged1),
-                    backoffs_next, Phi_x_next, Phi_u_next, betaN, muN, Phi_x_I_next, Phi_u_I_next, a_next, b_next, converged_admm_new)
+                    jnp.logical_or(converged, jnp.logical_or(converged1, failed)),
+                    backoffs_next, Phi_x_next, Phi_u_next, beta_next, mu_next, Phi_x_I_next, Phi_u_I_next, a_next, b_next, converged_admm_next)
 
         return lax.cond(converged, do_nothing, do_iter, operand=None)
 

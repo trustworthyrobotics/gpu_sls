@@ -67,7 +67,11 @@ if config.N != int(PHASE_END_STEPS[-1]):
 
 MIN_DURATIONS = 0.30 * NOMINAL_DURATIONS
 MAX_DURATIONS = 2.00 * NOMINAL_DURATIONS
-TIME_WEIGHT = 3e4
+# Keep the time objective on the same scale as the trajectory regularization.
+# A much larger weight makes the first SQP model drive every duration toward
+# its lower bound before the nonlinear dynamics and waypoint constraints have
+# become feasible, which stalls convergence at a heavily infeasible rollout.
+TIME_WEIGHT = 1e4
 FEASIBILITY_TOLERANCE = 2.0e-2
 DYNAMICS_TOLERANCE = 1.5e-1
 
