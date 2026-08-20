@@ -222,19 +222,22 @@ def add_obstacle_to_scene(
     scene: mujoco.MjvScene,
     center: np.ndarray,
     size: np.ndarray,
+    rgba: np.ndarray | None = None,
 ) -> None:
     """Append the optimizer's hurdle box to a rendered MuJoCo scene."""
 
     if scene.ngeom >= scene.maxgeom:
         raise RuntimeError("MuJoCo render scene has no room for the obstacle.")
     geom = scene.geoms[scene.ngeom]
+    if rgba is None:
+        rgba = np.array([0.90, 0.20, 0.08, 1.0], dtype=np.float32)
     mujoco.mjv_initGeom(
         geom,
         mujoco.mjtGeom.mjGEOM_BOX,
         0.5 * size,
         center,
         np.eye(3, dtype=np.float64).reshape(-1),
-        np.array([0.90, 0.20, 0.08, 1.0], dtype=np.float32),
+        np.asarray(rgba, dtype=np.float32),
     )
     scene.ngeom += 1
 
@@ -255,7 +258,7 @@ def render_video(
     obstacle_center: np.ndarray,
     obstacle_size: np.ndarray,
 ) -> int:
-    """Render the timed state trajectory and stream frames to ffmpeg."""
+    """Render the trajectory with one obstacle or an array of obstacles."""
 
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required but was not found on PATH.")
@@ -263,6 +266,24 @@ def render_video(
         raise ValueError("fps must be positive.")
     if width <= 0 or height <= 0 or width % 2 or height % 2:
         raise ValueError("width and height must be positive even integers.")
+    obstacle_centers = np.asarray(obstacle_center, dtype=np.float64)
+    obstacle_sizes = np.asarray(obstacle_size, dtype=np.float64)
+    if obstacle_centers.ndim == 1:
+        obstacle_centers = obstacle_centers.reshape(1, -1)
+    if obstacle_sizes.ndim == 1:
+        obstacle_sizes = obstacle_sizes.reshape(1, -1)
+    if (
+        obstacle_centers.ndim != 2
+        or obstacle_sizes.ndim != 2
+        or obstacle_centers.shape[1] != 3
+        or obstacle_sizes.shape[1] != 3
+        or obstacle_centers.shape[0] != obstacle_sizes.shape[0]
+    ):
+        raise ValueError("Obstacle centers and sizes must have shape (K, 3).")
+    if not np.all(np.isfinite(obstacle_centers)) or not np.all(
+        np.isfinite(obstacle_sizes)
+    ) or np.any(obstacle_sizes <= 0.0):
+        raise ValueError("Obstacle geometry must be finite and positive.")
 
     model = mujoco.MjModel.from_xml_path(str(model_path))
     if states.shape[1] < model.nq + model.nv:
@@ -328,7 +349,14 @@ def render_video(
             mujoco.mj_normalizeQuat(model, data.qpos)
             mujoco.mj_forward(model, data)
             renderer.update_scene(data, camera=camera)
-            add_obstacle_to_scene(renderer.scene, obstacle_center, obstacle_size)
+            for obstacle_index, (center, size) in enumerate(zip(
+                obstacle_centers, obstacle_sizes
+            )):
+                color = np.array(
+                    [0.90, 0.20 + 0.08 * (obstacle_index % 2), 0.08, 1.0],
+                    dtype=np.float32,
+                )
+                add_obstacle_to_scene(renderer.scene, center, size, color)
             encoder.stdin.write(renderer.render().tobytes())
 
         encoder.stdin.close()

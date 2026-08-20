@@ -9,8 +9,6 @@ from trajax.optimizers import linearize, quadratize, vectorize
 from matplotlib.patches import Rectangle
 from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.optimizers import (
     parallel_filter_line_search,
-    merit_rho,
-    slope,
 )
 from gpu_sls.gpu_admm import ADMMConfig, constrained_solve
 from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu, tightening_from_nominal_state
