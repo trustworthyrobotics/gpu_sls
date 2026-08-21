@@ -26,6 +26,9 @@ def build_reference_states():
     )
     qpos_qvel_size = 13 + 2 * problem.config.n_joints
     states = np.asarray(state_guess[:, :qpos_qvel_size], dtype=np.float64)
+    states[:, problem.QVEL_START:problem.QVEL_STOP] *= np.asarray(
+        problem.VELOCITY_SCALE
+    )
     node_times = problem.phase_node_times(np.asarray(problem.NOMINAL_DURATIONS))
     return states, node_times
 

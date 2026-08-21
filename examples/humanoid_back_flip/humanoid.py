@@ -54,14 +54,30 @@ NUM_PHASES = len(PHASE_NAMES)
 if config.N != int(PHASE_END_STEPS[-1]):
     raise ValueError(f"Phase layout requires config.N=50; got {config.N}.")
 
-MIN_DURATIONS = 0.35 * NOMINAL_DURATIONS
+MIN_DURATIONS = 0.15 * NOMINAL_DURATIONS
 MAX_DURATIONS = 2.00 * NOMINAL_DURATIONS
-TIME_WEIGHT = 2.0e4
+# A terminal time cost that dominates the tracking terms drives every contact
+# phase to its lower bound and produces an impulsive, visibly unnatural flip.
+# This value still rewards shorter motions while leaving enough curvature from
+# the motion cost to regularize the direct minimum-time solve.
+TIME_WEIGHT = 3.0e3
 PHYSICAL_N = 13 + 2 * config.n_joints + 6 * config.n_contact
 DURATION_SLICE = slice(PHYSICAL_N, PHYSICAL_N + NUM_PHASES)
 FOOT_START = 13 + 2 * config.n_joints
 GRF_START = FOOT_START + 3 * config.n_contact
 GRF_STOP = GRF_START + 3 * config.n_contact
+QVEL_START = 7 + config.n_joints
+QVEL_STOP = 13 + 2 * config.n_joints
+
+# Optimize nondimensional velocity and force coordinates.  Raw H1 joint rates
+# (O(10) rad/s) and contact forces (O(100) N) otherwise dominate the SQP
+# residual beside O(1) positions and quaternions.
+VELOCITY_SCALE = jnp.concatenate([
+    jnp.ones(3) * 3.0,
+    jnp.ones(3) * 20.0,
+    jnp.ones(config.n_joints) * 30.0,
+])
+GRF_SCALE = 500.0
 
 JOINT_MIN = jnp.array([
     -0.43, -0.43, -1.57, -0.26, -0.87,
@@ -80,32 +96,44 @@ TORQUE_LIMIT = jnp.array([
 ])
 
 WAYPOINT_POSITION_HALF_WIDTHS = jnp.array([
-    [0.04, 0.04, 0.04], [0.06, 0.05, 0.05],
-    [0.08, 0.06, 0.07], [0.12, 0.08, 0.10],
-    [0.12, 0.08, 0.10], [0.10, 0.07, 0.08],
-    [0.07, 0.05, 0.06], [0.04, 0.04, 0.04],
+    [0.06, 0.06, 0.06], [0.12, 0.08, 0.12],
+    [0.20, 0.10, 0.25], [0.25, 0.12, 0.25],
+    [0.30, 0.12, 0.30], [0.30, 0.12, 0.25],
+    [0.20, 0.10, 0.20], [0.08, 0.06, 0.08],
 ])
 WAYPOINT_ANGLE_TOLERANCES = jnp.deg2rad(
-    jnp.array([6.0, 10.0, 18.0, 22.0, 18.0, 14.0, 10.0, 6.0])
+    jnp.array([8.0, 15.0, 25.0, 30.0, 35.0, 30.0, 20.0, 8.0])
 )
 WAYPOINT_LINEAR_SPEED_LIMITS = jnp.array(
-    [0.25, 0.8, 3.0, 3.5, 3.5, 2.0, 0.8, 0.25]
+    [0.4, 1.5, 4.0, 5.0, 5.0, 4.0, 2.0, 0.5]
 )
 WAYPOINT_ANGULAR_SPEED_LIMITS = jnp.array(
-    [0.5, 3.0, 25.0, 30.0, 30.0, 10.0, 3.0, 0.5]
+    [0.8, 5.0, 25.0, 30.0, 30.0, 20.0, 8.0, 0.8]
 )
-FINAL_LINEAR_SPEED = 0.25
-FINAL_ANGULAR_SPEED = 0.5
-FINAL_JOINT_SPEED = 1.5
-FINAL_JOINT_POSITION_TOLERANCE = 0.15
+FINAL_LINEAR_SPEED = 0.5
+FINAL_ANGULAR_SPEED = 0.8
+FINAL_JOINT_SPEED = 3.0
+FINAL_JOINT_POSITION_TOLERANCE = 0.25
 MAX_JOINT_SPEED = 50.0
-MIN_BASE_HEIGHT = 0.45
+MIN_BASE_HEIGHT = 0.35
 FRICTION_COEFFICIENT = 0.7
 MAX_NORMAL_FORCE = 900.0
 TANGENTIAL_FORCE_SMOOTHING = 1.0e-4
 CONTACT_SOLVE_REGULARIZATION = 1.0e-3
+CONTACT_POSITION_GAIN = 20.0
+CONTACT_VELOCITY_GAIN = 20.0
 QUATERNION_EPSILON = 1.0e-8
 QUATERNION_NORM_WEIGHT = 1.0e4
+DYNAMICS_TOLERANCE = 1.0e-2
+
+# Joint-space feedback used only to initialize the controls from the analytic
+# reference.  It is not the result of a separate optimization.
+INITIAL_KP = jnp.array(
+    [120.0] * 10 + [80.0] + [35.0] * 8
+)
+INITIAL_KD = jnp.array(
+    [6.0] * 10 + [5.0] + [2.0] * 8
+)
 
 
 def _duration_logits(durations):
@@ -168,7 +196,7 @@ def min_time_backflip_dynamics(model, mjx_model, contact_id, body_id):
         qpos = x[: nj + 7].at[3:7].set(
             safe_normalize_quaternion(x[3:7])
         )
-        qvel = x[nj + 7 : 2 * nj + 13]
+        qvel = x[QVEL_START:QVEL_STOP] * VELOCITY_SCALE
         data = mjx.make_data(model).replace(qpos=qpos, qvel=qvel)
         data = mjx.fwd_position(mjx_model, data)
         data = mjx.fwd_velocity(mjx_model, data)
@@ -187,6 +215,10 @@ def min_time_backflip_dynamics(model, mjx_model, contact_id, body_id):
         contact_mask = jnp.repeat(contact, 3)
         active_jacobian = contact_jacobian * contact_mask[None, :]
         velocity_violation = active_jacobian.T @ qvel
+        target_feet = parameter[
+            t, config.n_contact : config.n_contact + 3 * config.n_contact
+        ]
+        position_violation = contact_mask * (current_feet - target_feet)
         mass_inv_jacobian = jax.scipy.linalg.cho_solve(
             (mass_factor, False), active_jacobian
         )
@@ -200,7 +232,8 @@ def min_time_backflip_dynamics(model, mjx_model, contact_id, body_id):
         rhs = (
             -active_jacobian.T
             @ jax.scipy.linalg.cho_solve((mass_factor, False), tau - bias_force)
-            - 20.0 * velocity_violation
+            - CONTACT_VELOCITY_GAIN * velocity_violation
+            - CONTACT_POSITION_GAIN * position_violation
         )
         raw_grf = jax.scipy.linalg.cho_solve(
             jax.scipy.linalg.cho_factor(projected_mass), rhs
@@ -214,7 +247,9 @@ def min_time_backflip_dynamics(model, mjx_model, contact_id, body_id):
             qpos[:3] + velocity_next[:3] * dt,
             math.quat_integrate(qpos[3:7], velocity_next[3:6], dt),
             qpos[7:] + velocity_next[6:] * dt,
-            velocity_next, current_feet, grf,
+            velocity_next / VELOCITY_SCALE,
+            current_feet,
+            grf / GRF_SCALE,
         ])
         return jnp.concatenate([physical_next, x[DURATION_SLICE]])
 
@@ -226,10 +261,11 @@ def min_time_backflip_cost(W, reference, x, u, t):
     p, quat_raw = x[:3], x[3:7]
     quat = safe_normalize_quaternion(quat_raw)
     q = x[7 : 7 + nj]
-    dp = x[7 + nj : 10 + nj]
-    omega = x[10 + nj : 13 + nj]
-    dq = x[13 + nj : 13 + 2 * nj]
-    feet, grf = x[FOOT_START:GRF_START], x[GRF_START:GRF_STOP]
+    dp = x[7 + nj : 10 + nj] * VELOCITY_SCALE[:3]
+    omega = x[10 + nj : 13 + nj] * VELOCITY_SCALE[3:6]
+    dq = x[13 + nj : 13 + 2 * nj] * VELOCITY_SCALE[6:]
+    feet = x[FOOT_START:GRF_START]
+    grf = x[GRF_START:GRF_STOP] * GRF_SCALE
     qerr = math.quat_sub(quat, reference["quat"][t])
     contact_map = jnp.repeat(reference["contact"][t], 3)
     stage_cost = (
@@ -239,7 +275,8 @@ def min_time_backflip_cost(W, reference, x, u, t):
         + (dp - reference["dp"][t]).T @ W["vel"] @ (dp - reference["dp"][t])
         + (omega - reference["omega"][t]).T @ W["omega"]
         @ (omega - reference["omega"][t])
-        + dq.T @ W["dq"] @ dq
+        + (dq - reference["dq"][t]).T @ W["dq"]
+        @ (dq - reference["dq"][t])
         + (contact_map * (feet - reference["foot"][t])).T
         @ W["contact"] @ (contact_map * (feet - reference["foot"][t]))
         + u.T @ W["tau"] @ u
@@ -292,7 +329,7 @@ def build_backflip_reference():
         )
 
     stand_end, crouch_end, launch_end = 5, 12, 18
-    flight_end, prelanding_end = 34, 37
+    flight_end, prelanding_end, touchdown_end = 34, 37, 42
     launch_duration = float(NOMINAL_DURATIONS[2])
     airborne_duration = float(sum(NOMINAL_DURATIONS[3:6]))
     takeoff_speed = 0.5 * 9.81 * airborne_duration
@@ -315,6 +352,28 @@ def build_backflip_reference():
     active = (nodes > launch_end) & (nodes <= prelanding_end)
     p_ref = p_ref.at[:, 2].set(jnp.where(active, air_z, p_ref[:, 2]))
 
+    # Absorb the landing by returning to a crouch before standing.  Keeping
+    # the pelvis at standing height while commanding deeply bent knees was
+    # kinematically inconsistent with the fixed stance-foot references.
+    alpha = jnp.clip(
+        (nodes - prelanding_end) / (touchdown_end - prelanding_end),
+        0.0,
+        1.0,
+    )
+    alpha = alpha**2 * (3.0 - 2.0 * alpha)
+    touchdown_z = standing_height + alpha * (
+        crouch_height - standing_height
+    )
+    active = (nodes > prelanding_end) & (nodes <= touchdown_end)
+    p_ref = p_ref.at[:, 2].set(jnp.where(active, touchdown_z, p_ref[:, 2]))
+    alpha = jnp.clip(
+        (nodes - touchdown_end) / (config.N - touchdown_end), 0.0, 1.0
+    )
+    alpha = alpha**2 * (3.0 - 2.0 * alpha)
+    settle_z = crouch_height + alpha * (standing_height - crouch_height)
+    active = nodes > touchdown_end
+    p_ref = p_ref.at[:, 2].set(jnp.where(active, settle_z, p_ref[:, 2]))
+
     phase_ids = phase_index(jnp.arange(config.N))
     node_times = jnp.concatenate([
         jnp.asarray([0.0]),
@@ -326,41 +385,92 @@ def build_backflip_reference():
     )
     dp_ref = dp_ref.at[0].set((p_ref[1] - p_ref[0]) / (node_times[1] - node_times[0]))
 
-    launch_angle = -0.30
-    angle = jnp.zeros(config.N + 1)
-    alpha = jnp.clip(
-        (nodes - crouch_end) / (launch_end - crouch_end), 0.0, 1.0
+    # Accelerate the pitch rate while contact can create angular momentum,
+    # preserve it in flight, then remove it during the grounded touchdown.  The
+    # former reference jumped from zero to about -19 rad/s at takeoff and back
+    # to zero one node before contact, making its own dynamics infeasible.
+    launch_start_time = node_times[crouch_end]
+    takeoff_time = node_times[launch_end]
+    contact_time = node_times[prelanding_end]
+    rotation_stop_time = node_times[touchdown_end]
+    rotation_launch_time = takeoff_time - launch_start_time
+    rotation_flight_time = contact_time - takeoff_time
+    rotation_landing_time = rotation_stop_time - contact_time
+    flight_pitch_rate = -2.0 * jnp.pi / (
+        0.5 * rotation_launch_time
+        + rotation_flight_time
+        + 0.5 * rotation_landing_time
     )
-    alpha = alpha**2 * (3.0 - 2.0 * alpha)
-    angle = jnp.where(
-        (nodes >= crouch_end) & (nodes <= launch_end), launch_angle * alpha, angle
+    launch_elapsed = jnp.clip(
+        node_times - launch_start_time, 0.0, rotation_launch_time
     )
-    alpha = jnp.clip((nodes - launch_end) / (flight_end - launch_end), 0.0, 1.0)
-    angle = jnp.where(
-        (nodes > launch_end) & (nodes <= flight_end),
-        launch_angle + (-2.0 * jnp.pi - launch_angle) * alpha, angle,
+    launch_angle = (
+        0.5
+        * flight_pitch_rate
+        / rotation_launch_time
+        * launch_elapsed**2
     )
-    angle = jnp.where(nodes > flight_end, -2.0 * jnp.pi, angle)
+    takeoff_angle = 0.5 * flight_pitch_rate * rotation_launch_time
+    flight_elapsed = jnp.clip(
+        node_times - takeoff_time, 0.0, rotation_flight_time
+    )
+    airborne_angle = takeoff_angle + flight_pitch_rate * flight_elapsed
+    contact_angle = takeoff_angle + flight_pitch_rate * rotation_flight_time
+    landing_elapsed = jnp.clip(
+        node_times - contact_time, 0.0, rotation_landing_time
+    )
+    landing_angle = (
+        contact_angle
+        + flight_pitch_rate * landing_elapsed
+        - 0.5
+        * flight_pitch_rate
+        / rotation_landing_time
+        * landing_elapsed**2
+    )
+    angle = jnp.where(node_times < launch_start_time, 0.0, launch_angle)
+    angle = jnp.where(node_times > takeoff_time, airborne_angle, angle)
+    angle = jnp.where(node_times > contact_time, landing_angle, angle)
+    angle = jnp.where(node_times >= rotation_stop_time, -2.0 * jnp.pi, angle)
     quat_ref = jnp.stack([
         jnp.cos(0.5 * angle), jnp.zeros_like(angle),
         jnp.sin(0.5 * angle), jnp.zeros_like(angle),
     ], axis=1)
-    omega_ref = jnp.zeros((config.N + 1, 3))
-    omega_ref = omega_ref.at[1:-1, 1].set(
-        (angle[2:] - angle[:-2]) / (node_times[2:] - node_times[:-2])
+    launch_rate = flight_pitch_rate * launch_elapsed / rotation_launch_time
+    landing_rate = flight_pitch_rate * (
+        1.0 - landing_elapsed / rotation_landing_time
+    )
+    pitch_rate = jnp.where(
+        (node_times >= launch_start_time) & (node_times <= takeoff_time),
+        launch_rate,
+        0.0,
+    )
+    pitch_rate = jnp.where(
+        (node_times > takeoff_time) & (node_times <= contact_time),
+        flight_pitch_rate,
+        pitch_rate,
+    )
+    pitch_rate = jnp.where(
+        (node_times > contact_time) & (node_times < rotation_stop_time),
+        landing_rate,
+        pitch_rate,
+    )
+    omega_ref = jnp.zeros((config.N + 1, 3)).at[:, 1].set(pitch_rate)
+
+    dq_ref = jnp.zeros((config.N + 1, config.n_joints))
+    dq_ref = dq_ref.at[1:-1].set(
+        (q_ref[2:] - q_ref[:-2])
+        / (node_times[2:, None] - node_times[:-2, None])
     )
 
     contact = jnp.ones((config.N + 1, config.n_contact))
-    contact = contact.at[launch_end:flight_end].set(0.0)
-    contact = contact.at[flight_end:prelanding_end].set(
-        jnp.array([1.0, 0.0, 1.0, 0.0])
-    )
+    contact = contact.at[launch_end:prelanding_end].set(0.0)
     foot_ref = jnp.tile(jnp.asarray(config.p_legs0), (config.N + 1, 1))
     grf_ref = jnp.zeros((config.N + 1, 3 * config.n_contact))
     grf_ref = grf_ref.at[:, 2::3].set(contact * (51.437 * 9.81 / config.n_contact))
     reference = {
         "p": p_ref, "quat": quat_ref, "q": q_ref, "dp": dp_ref,
-        "omega": omega_ref, "foot": foot_ref, "contact": contact,
+        "omega": omega_ref, "dq": dq_ref,
+        "foot": foot_ref, "contact": contact,
         "grf": grf_ref,
     }
     return reference, jnp.concatenate([contact, foot_ref], axis=1)
@@ -372,15 +482,17 @@ def build_initial_guess(x0, reference):
     X = X.at[:, :3].set(reference["p"])
     X = X.at[:, 3:7].set(reference["quat"])
     X = X.at[:, 7 : 7 + nj].set(reference["q"])
-    X = X.at[:, 7 + nj : 10 + nj].set(reference["dp"])
-    X = X.at[:, 10 + nj : 13 + nj].set(reference["omega"])
-    phase_ids = phase_index(jnp.arange(config.N))
-    node_dts = NOMINAL_DURATIONS[phase_ids] / SEGMENT_LENGTHS[phase_ids]
-    joint_rates = (reference["q"][1:] - reference["q"][:-1]) / node_dts[:, None]
-    joint_rates = jnp.concatenate([joint_rates, jnp.zeros((1, nj))], axis=0)
-    X = X.at[:, 13 + nj : 13 + 2 * nj].set(joint_rates)
+    X = X.at[:, 7 + nj : 10 + nj].set(
+        reference["dp"] / VELOCITY_SCALE[:3]
+    )
+    X = X.at[:, 10 + nj : 13 + nj].set(
+        reference["omega"] / VELOCITY_SCALE[3:6]
+    )
+    X = X.at[:, 13 + nj : 13 + 2 * nj].set(
+        reference["dq"] / VELOCITY_SCALE[6:]
+    )
     X = X.at[:, FOOT_START:GRF_START].set(reference["foot"])
-    X = X.at[:, GRF_START:GRF_STOP].set(reference["grf"])
+    X = X.at[:, GRF_START:GRF_STOP].set(reference["grf"] / GRF_SCALE)
     X = X.at[:, DURATION_SLICE].set(NOMINAL_DURATION_LOGITS)
     return X.at[0, :PHYSICAL_N].set(x0[:PHYSICAL_N])
 
@@ -395,10 +507,13 @@ def make_backflip_constraints(reference):
     def constraints(x, u, t):
         durations = phase_durations(x)
         q = x[7 : 7 + nj]
-        dp = x[7 + nj : 10 + nj]
-        omega = x[10 + nj : 13 + nj]
-        dq = x[13 + nj : 13 + 2 * nj]
-        grf = x[GRF_START:GRF_STOP].reshape(config.n_contact, 3)
+        dp = x[7 + nj : 10 + nj] * VELOCITY_SCALE[:3]
+        omega = x[10 + nj : 13 + nj] * VELOCITY_SCALE[3:6]
+        dq = x[13 + nj : 13 + 2 * nj] * VELOCITY_SCALE[6:]
+        grf = (
+            x[GRF_START:GRF_STOP].reshape(config.n_contact, 3)
+            * GRF_SCALE
+        )
         duration_constraints = jnp.concatenate([
             MIN_DURATIONS - durations, durations - MAX_DURATIONS,
         ])
@@ -507,11 +622,11 @@ def configure_problem():
     dtype = config.initial_state.dtype
     config.W = {
         "pos": jnp.diag(jnp.array([80.0, 150.0, 100.0], dtype=dtype)),
-        "rot": jnp.diag(jnp.array([120.0, 500.0, 120.0], dtype=dtype)),
-        "q": jnp.eye(config.n_joints, dtype=dtype) * 3.0,
+        "rot": jnp.diag(jnp.array([120.0, 800.0, 120.0], dtype=dtype)),
+        "q": jnp.eye(config.n_joints, dtype=dtype) * 8.0,
         "vel": jnp.diag(jnp.array([2.0, 3.0, 2.0], dtype=dtype)),
-        "omega": jnp.diag(jnp.array([2.0, 8.0, 2.0], dtype=dtype)),
-        "dq": jnp.eye(config.n_joints, dtype=dtype) * 5.0e-2,
+        "omega": jnp.diag(jnp.array([2.0, 15.0, 2.0], dtype=dtype)),
+        "dq": jnp.eye(config.n_joints, dtype=dtype) * 2.0e-1,
         "contact": jnp.eye(3 * config.n_contact, dtype=dtype) * 80.0,
         "tau": jnp.eye(config.n_joints, dtype=dtype) * 2.0e-3,
         "grf": jnp.eye(3 * config.n_contact, dtype=dtype) * 1.0e-4,
@@ -520,16 +635,26 @@ def configure_problem():
 
 
 def solve_backflip(mpc, data, x0, reference, parameter):
+    # This is a single direct minimum-time optimization.  The analytic motion
+    # reference below is only an initial iterate, not an optimized warm start.
     X_guess = build_initial_guess(x0, reference)
-    U_guess = jnp.tile(config.u_ref, (config.N, 1))
+    nj = config.n_joints
+    q_guess = X_guess[:-1, 7 : 7 + nj]
+    dq_guess = (
+        X_guess[:-1, 13 + nj : 13 + 2 * nj] * VELOCITY_SCALE[6:]
+    )
+    U_guess = (
+        INITIAL_KP * (reference["q"][1:] - q_guess)
+        + INITIAL_KD * (reference["dq"][1:] - dq_guess)
+    )
+    U_guess = jnp.clip(U_guess, -TORQUE_LIMIT, TORQUE_LIMIT)
     predicted_next = jax.vmap(
         lambda x, u, t: mpc.dynamics(x, u, t, parameter)
     )(X_guess[:-1], U_guess, jnp.arange(config.N, dtype=jnp.int32))
-    X_guess = X_guess.at[1:, FOOT_START:GRF_START].set(
-        predicted_next[:, FOOT_START:GRF_START]
-    )
-    X_guess = X_guess.at[1:, GRF_START:GRF_STOP].set(
-        predicted_next[:, GRF_START:GRF_STOP]
+    # Feet and GRFs are algebraic outputs stored in the legacy whole-body state.
+    # Initialize those entries consistently without replacing physical states.
+    X_guess = X_guess.at[1:, FOOT_START:GRF_STOP].set(
+        predicted_next[:, FOOT_START:GRF_STOP]
     )
     return mpc._solve(
         reference, parameter, data.W, x0, X_guess, U_guess, data.V0,
@@ -546,16 +671,6 @@ def phase_node_times(phase_times):
         np.asarray(PHASE_END_STEPS), np.arange(config.N), side="right"
     )
     return np.concatenate([[0.0], np.cumsum(dts[phases])])
-
-
-def refresh_algebraic_states(dynamics, X, U, parameter):
-    """Recompute derived foot positions and GRFs from physical states."""
-    predicted = jax.vmap(
-        lambda x, u, t: dynamics(x, u, t, parameter)
-    )(X[:-1], U, jnp.arange(U.shape[0], dtype=jnp.int32))
-    return X.at[1:, FOOT_START:GRF_STOP].set(
-        predicted[:, FOOT_START:GRF_STOP]
-    )
 
 
 def evaluate_constraint_violation(constraints, X, U):
@@ -610,6 +725,7 @@ def dry_run(reference, parameter, constraints):
     print(f"Reference/parameter shapes: {reference['p'].shape}/{parameter.shape}")
     print(f"Initial guess shape: {X0.shape}")
     print(f"Constraint count per node: {constraint_shape[0]}")
+    print("Optimization stages: 1 (direct minimum time; no optimized warm start)")
     print("Nominal phase times:")
     for name, duration, intervals in zip(
         PHASE_NAMES, NOMINAL_DURATIONS, SEGMENT_LENGTHS
@@ -626,18 +742,20 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
-        eps_abs=1.0e-1, eps_rel=1.0e-3, rho_max=1.0e3,
-        max_iterations=1000, rho_update_frequency=25, initial_rho=1.0,
+        eps_abs=5.0e-2, eps_rel=1.0e-3, rho_max=1.0e4,
+        max_iterations=1500, rho_update_frequency=25, initial_rho=1.0,
         regularized_rho_update=False, num_phases=NUM_PHASES,
     )
     sls_config = SLSConfig(
         max_sls_iterations=1, sls_primal_tol=1.0e-2,
-        enable_fastsls=False, initialize_nominal=True,
-        max_initial_sqp_iterations=75, warm_start=True, rti=False,
+        enable_fastsls=False, initialize_nominal=False,
+        max_initial_sqp_iterations=0, warm_start=False, rti=False,
         gradient_window=0,
     )
     sqp_config = SQPConfig(
-        max_sqp_iterations=0, warm_start=True, feas_tol=1.0e-5,
+        # Reusing ADMM duals between SQP linearizations is internal to this
+        # single solve; no previously optimized trajectory is supplied.
+        max_sqp_iterations=150, warm_start=True, feas_tol=1.0e-5,
         step_tol=1.0e-5, line_search=True, lm_regularization=1.0e-2,
     )
     mpc = mpc_wrapper.MPCWrapper(
@@ -656,7 +774,9 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     x0 = (
         jnp.asarray(config.initial_state)
         .at[mpc.qpos_slice].set(jnp.asarray(model_data.qpos))
-        .at[mpc.qvel_slice].set(jnp.asarray(model_data.qvel))
+        .at[mpc.qvel_slice].set(
+            jnp.asarray(model_data.qvel) / VELOCITY_SCALE
+        )
         .at[mpc.foot_slice].set(feet)
         .at[DURATION_SLICE].set(NOMINAL_DURATION_LOGITS)
     )
@@ -671,7 +791,6 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         raise FloatingPointError(
             "Backflip solver returned a non-finite trajectory; result not saved."
         )
-    X = refresh_algebraic_states(mpc.dynamics, X, U, parameter)
     phase_times = np.asarray(phase_durations(X[0]))
     max_violation, violation_node, violation_index = (
         evaluate_constraint_violation(constraints, X, U)
@@ -694,6 +813,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         f"Maximum dynamics defect: {max_defect:.6e} at transition "
         f"{defect_node}, state {defect_state}"
     )
+    print(f"Dynamics feasible: {max_defect <= DYNAMICS_TOLERANCE}")
     print("Phase-end waypoint errors:")
     for name, position_error, angle_error in zip(
         PHASE_NAMES, position_errors, angle_errors
@@ -708,6 +828,8 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     result_path = output_dir / "humanoid_backflip_min_time.npz"
     X_output = np.asarray(X).copy()
     duration_logits = X_output[:, DURATION_SLICE].copy()
+    X_output[:, QVEL_START:QVEL_STOP] *= np.asarray(VELOCITY_SCALE)
+    X_output[:, GRF_START:GRF_STOP] *= GRF_SCALE
     X_output[:, DURATION_SLICE] = np.asarray(
         jax.vmap(phase_durations)(X)
     )
@@ -721,7 +843,14 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         waypoint_position_errors=position_errors,
         waypoint_orientation_errors_deg=angle_errors,
         phase_duration_logits=duration_logits,
-        reference_version=np.asarray(1),
+        dynamics_feasible=np.asarray(max_defect <= DYNAMICS_TOLERANCE),
+        optimization_stages=np.asarray(1),
+        direct_min_time=np.asarray(True),
+        warm_start_used=np.asarray(False),
+        internal_state_scaling=np.asarray(True),
+        velocity_scale=np.asarray(VELOCITY_SCALE),
+        grf_scale=np.asarray(GRF_SCALE),
+        reference_version=np.asarray(3),
     )
     print(f"Saved trajectory: {result_path}")
 
