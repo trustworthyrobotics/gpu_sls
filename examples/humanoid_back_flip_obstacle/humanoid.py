@@ -43,6 +43,9 @@ jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
+CONTACT_POSITION_GAIN = 200.0
+CONTACT_VELOCITY_GAIN = 30.0
+
 PHASE_NAMES = (
     "stand", "crouch", "launch", "first_half", "second_half",
     "prelanding", "touchdown", "settle",
@@ -60,7 +63,7 @@ NUM_PHASES = len(PHASE_NAMES)
 if config.N != int(PHASE_END_STEPS[-1]):
     raise ValueError(f"Phase layout requires config.N=50; got {config.N}.")
 
-MIN_DURATIONS = 0.35 * NOMINAL_DURATIONS
+MIN_DURATIONS = 0.15 * NOMINAL_DURATIONS
 MAX_DURATIONS = 2.00 * NOMINAL_DURATIONS
 # Keep the time objective moderate so the direct minimum-time solve balances
 # phase shortening against the nonlinear motion and corridor constraints.
@@ -436,8 +439,12 @@ def build_backflip_reference():
     )
 
     contact = jnp.ones((config.N + 1, config.n_contact))
-    contact = contact.at[launch_end:flight_end].set(0.0)
-    contact = contact.at[flight_end:prelanding_end].set(
+
+    # Fully airborne until t = 37
+    contact = contact.at[launch_end:prelanding_end].set(0.0)
+
+    # Partial touchdown from t = 37 through t = 41
+    contact = contact.at[prelanding_end:touchdown_end].set(
         jnp.array([1.0, 0.0, 1.0, 0.0])
     )
     foot_ref = jnp.tile(jnp.asarray(config.p_legs0), (config.N + 1, 1))
@@ -598,6 +605,11 @@ def make_backflip_constraints(reference, obstacle_constraints):
             active[:, None], position_constraints,
             -jnp.ones_like(position_constraints),
         )
+        active = t == PHASE_END_STEPS
+
+        # Do not impose a hard waypoint at t = 34.
+        active = active.at[4].set(False)
+        active = active.at[6].set(False)
         normalized_quat = safe_normalize_quaternion(x[3:7])
         alignment = jnp.abs(waypoint_quaternions @ normalized_quat)
         orientation_constraints = jnp.where(
@@ -849,8 +861,8 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
-        eps_abs=1.0e-1, eps_rel=1.0e-3, rho_max=1.0e3,
-        max_iterations=1000, rho_update_frequency=25, initial_rho=1.0,
+        eps_abs=1.0e-1, eps_rel=1.0e-3, rho_max=1.0e4,
+        max_iterations=2000, rho_update_frequency=25, initial_rho=1.0,
         regularized_rho_update=False, num_phases=NUM_PHASES,
     )
     sls_config = SLSConfig(
