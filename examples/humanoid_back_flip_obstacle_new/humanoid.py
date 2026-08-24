@@ -973,19 +973,19 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
-        eps_abs=5.0e-2, eps_rel=1.0e-3, rho_max=1.0e4,
-        max_iterations=1000, rho_update_frequency=25, initial_rho=1.0,
+        eps_abs=1.0e-2, eps_rel=5.0e-3, rho_max=1.0e4,
+        max_iterations=400, rho_update_frequency=25, initial_rho=1.0,
         regularized_rho_update=False, num_phases=NUM_PHASES,
     )
     sls_config = SLSConfig(
         max_sls_iterations=1, sls_primal_tol=1.0e-2,
         enable_fastsls=False, initialize_nominal=True,
-        max_initial_sqp_iterations=80, warm_start=True, rti=False,
+        max_initial_sqp_iterations=50, warm_start=True, rti=False,
         gradient_window=0,
     )
     sqp_config = SQPConfig(
         max_sqp_iterations=0, warm_start=True, feas_tol=1.0e-5,
-        step_tol=1.0e-5, line_search=True, lm_regularization=5.0e-2,
+        step_tol=1.0e-5, line_search=True, lm_regularization=5.0e-2, # Just changed this 5 -> 1
     )
     mpc = mpc_wrapper.MPCWrapper(
         config, sls_config=sls_config, sqp_config=sqp_config,

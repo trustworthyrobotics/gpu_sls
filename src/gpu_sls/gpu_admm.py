@@ -395,8 +395,8 @@ def adaptive_rho_update(
     *,
     rho_min=1e-4,
     rho_max=1e5,
-    scale_min=0.5,
-    scale_max=2.0,
+    scale_min=0.75,
+    scale_max=1.2,
     eps=1e-12,
 ):
     rd_safe = jnp.maximum(rd_norm, eps)
@@ -405,6 +405,7 @@ def adaptive_rho_update(
 
     # Only update rho if the scale is sufficiently far from 1
     should_update = (scale < scale_min) | (scale > scale_max)
+    # should_update = True
 
     rho_candidate = jnp.clip(
         rho * scale,

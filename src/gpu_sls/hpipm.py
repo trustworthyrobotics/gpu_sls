@@ -94,13 +94,13 @@ class ADMMConfig:
 
     # HPIPM IPM settings.
     mode: str = "robust"                   # speed_abs | speed | balance | robust
-    tol_stat: float = 1e-12
-    tol_eq: float = 1e-12
-    tol_ineq: float = 1e-12
-    tol_comp: float = 1e-12
-    tol_dual_gap: float = 1e-12
+    tol_stat: float = 1e-2
+    tol_eq: float = 1e-2
+    tol_ineq: float = 1e-2
+    tol_comp: float = 1e-2
+    tol_dual_gap: float = 1e-2
     mu0: float = 1e4
-    reg_prim: float = 1e-12
+    reg_prim: float = 1e-2
     warm_start: bool = True
     verbose: bool = True
 
@@ -115,7 +115,8 @@ class ADMMConfig:
     normalize_objective: bool = True
     report_qp_scaling: bool = False
 
-    # HPIPM uses finite numerical bounds internally for one-sided constraints.
+    # Retained for API compatibility.  One-sided constraints are represented
+    # with HPIPM's bound masks, not with a large artificial lower bound.
     hpipm_infinity: float = 1e15
 
     # Native HPIPM partial condensing.  The original N-stage OCP-QP is condensed
@@ -616,32 +617,44 @@ def constrained_solve(
 
     # ------------------------------------------------------------------
     # General inequalities: -inf <= Cx + Du <= f.
-    # We use a large finite lower bound because HPIPM's OCP interface is most
-    # robust with finite numerical bounds.
+    #
+    # HPIPM has explicit masks for inactive sides of a bound.  Using -1e15 as
+    # a surrogate lower bound looks harmless, but it leaves that side active
+    # in the interior-point complementarity equations.  The resulting huge
+    # slack prevents the complementarity residual from converging (even for a
+    # tiny, otherwise trivial QP) and HPIPM returns MAX_ITER with a usable but
+    # officially invalid solution.  Disable the absent lower sides instead.
+    # Likewise, mask +inf upper bounds instead of replacing them by 1e15.
     # ------------------------------------------------------------------
-    hpipm_inf = float(getattr(cfg, "hpipm_infinity", 1e15))
-    if not np.isfinite(hpipm_inf) or hpipm_inf <= 0.0:
-        raise ValueError("cfg.hpipm_infinity must be a positive finite number.")
-
     if nc > 0:
-        lower = -hpipm_inf * np.ones((nc, 1), dtype=np.float64)
+        inactive_lower = np.zeros((nc, 1), dtype=np.float64)
+        lower_mask = np.zeros((nc, 1), dtype=np.float64)
         for k in range(N + 1):
             upper_k = np.asarray(f_np[k], dtype=np.float64).copy()
-            upper_k[np.isposinf(upper_k)] = hpipm_inf
+            upper_mask = np.isfinite(upper_k).astype(np.float64)
+            upper_k[~np.isfinite(upper_k)] = 0.0
             upper_k = upper_k.reshape(nc, 1)
+            upper_mask = upper_mask.reshape(nc, 1)
 
             qp.set("C", C_np[k], k)
             if k < N:
                 qp.set("D", D_np[k], k)
-            qp.set("lg", lower, k)
+            qp.set("lg", inactive_lower, k)
+            qp.set("lg_mask", lower_mask, k)
             qp.set("ug", upper_k, k)
+            qp.set("ug_mask", upper_mask, k)
 
     # ------------------------------------------------------------------
     # Native HPIPM partial condensing + IPM solve.
     # ------------------------------------------------------------------
     qp_sol = hpipm_ocp_qp_sol(dim)
 
-    use_partial_condensing = bool(getattr(cfg, "partial_condensing", True)) and N > 1
+    # The caller commonly passes the legacy gpu_admm.ADMMConfig, which has no
+    # HPIPM-specific fields.  Match this module's declared robust defaults in
+    # that case.  Partial condensing is an explicit speed opt-in: leaving the
+    # original OCP structure intact is more reliable for the badly scaled,
+    # highly constrained minimum-time SQP subproblems.
+    use_partial_condensing = bool(getattr(cfg, "partial_condensing", False)) and N > 1
     cond_ctx = None
     solve_dim = dim
     solve_qp = qp
@@ -667,7 +680,7 @@ def constrained_solve(
             solve_qp = cond_ctx.qp2
             solve_sol = cond_ctx.qp_sol2
 
-    mode = str(getattr(cfg, "mode", "speed"))
+    mode = str(getattr(cfg, "mode", "robust"))
     arg = hpipm_ocp_qp_solver_arg(solve_dim, mode)
 
     arg.set("iter_max", int(getattr(cfg, "max_iterations", 100)))

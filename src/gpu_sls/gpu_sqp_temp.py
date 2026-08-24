@@ -10,7 +10,8 @@ from matplotlib.patches import Rectangle
 from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.optimizers import (
     parallel_filter_line_search,
 )
-from gpu_sls.gpu_admm import ADMMConfig, constrained_solve
+from gpu_sls.gpu_admm import ADMMConfig
+from gpu_sls.hpipm import constrained_solve
 from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu, tightening_from_nominal_state
 
 
@@ -452,34 +453,95 @@ def compute_search_direction(
 
     n_obs = obstacles.shape[0]
 
-    def run_nominal(_):
-        Jh = jnp.zeros((T + 1, nc, sls_config.gradient_window, nx))
-        dX, dU, dV, w1, y1, rho1, rho_grad1, _, a1, b1, converged_admm = constrained_solve(
-            admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, rho_grad, Jh, a, b, sls_config.gradient_window
+    def run_osqp():
+        # Temporary OSQP replacement for the custom ADMM constrained solve.
+        # OSQP is a host/CPU Python solver, while this function is jitted, so
+        # execute it through jax.pure_callback and return arrays with the exact
+        # shapes/dtypes expected by the existing SQP code.
+        Jh = jnp.zeros(
+            (T + 1, nc, sls_config.gradient_window, nx),
+            dtype=Q.dtype,
         )
-        backoffs = jnp.zeros((T + 1, nc - n_obs))
-        Phi_x   = jnp.zeros((T + 1, T + 1, nx, nx))
-        Phi_u   = jnp.zeros((T, T + 1, nu, nx))
-        betaN   = jnp.ones((T + 1, T + 1, nc - n_obs)) * 1e-10
-        muN     = jnp.zeros((T + 1, nc))
-        return dX, dU, dV, w1, y1, rho1, rho_grad1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x, Phi_u, a1, b1, converged_admm
 
-    def run_sls(_):
-        dX, dU, dV, w1, y1, rho1, rho_grad1, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1,  = sls_solve_gpu(
-            admm_config, sls_config, disturbance,
+        result_spec = (
+            jax.ShapeDtypeStruct(X.shape, X.dtype),
+            jax.ShapeDtypeStruct(U.shape, U.dtype),
+            jax.ShapeDtypeStruct(V.shape, V.dtype),
+            jax.ShapeDtypeStruct(w.shape, w.dtype),
+            jax.ShapeDtypeStruct(y.shape, y.dtype),
+            jax.ShapeDtypeStruct((), rho.dtype),
+            jax.ShapeDtypeStruct((), rho_grad.dtype),
+            jax.ShapeDtypeStruct((T + 1, nc), Q.dtype),  # mu, unused here
+            jax.ShapeDtypeStruct(a.shape, a.dtype),
+            jax.ShapeDtypeStruct(b.shape, b.dtype),
+            jax.ShapeDtypeStruct((), jnp.bool_),
+        )
+
+        def _host_osqp_solve(
+            Q_h, q_h, R_h, r_h, M_h, A_h, B_h, c_h,
+            C_h, D_h, f_h, w_h, y_h, rho_h, rho_grad_h,
+            Jh_h, a_h, b_h,
+        ):
+            result = constrained_solve(
+                admm_config,
+                Q_h, q_h, R_h, r_h, M_h,
+                A_h, B_h, c_h,
+                C_h, D_h, f_h,
+                w_h, y_h, rho_h, rho_grad_h,
+                Jh_h, a_h, b_h,
+                sls_config.gradient_window,
+            )
+
+            (
+                dX_h, dU_h, dV_h, w1_h, y1_h,
+                rho1_h, rho_grad1_h, mu_h,
+                a1_h, b1_h, converged_h,
+            ) = result
+
+            # pure_callback requires exact NumPy dtypes matching result_spec.
+            return (
+                np.asarray(dX_h, dtype=np.asarray(Q_h).dtype),
+                np.asarray(dU_h, dtype=np.asarray(R_h).dtype),
+                np.asarray(dV_h, dtype=np.asarray(Q_h).dtype),
+                np.asarray(w1_h, dtype=np.asarray(w_h).dtype),
+                np.asarray(y1_h, dtype=np.asarray(y_h).dtype),
+                np.asarray(rho1_h, dtype=np.asarray(rho_h).dtype),
+                np.asarray(rho_grad1_h, dtype=np.asarray(rho_grad_h).dtype),
+                np.asarray(mu_h, dtype=np.asarray(Q_h).dtype),
+                np.asarray(a1_h, dtype=np.asarray(a_h).dtype),
+                np.asarray(b1_h, dtype=np.asarray(b_h).dtype),
+                np.asarray(converged_h, dtype=np.bool_),
+            )
+
+        (
+            dX, dU, dV, w1, y1,
+            rho1, rho_grad1, _, a1, b1, converged_qp,
+        ) = jax.pure_callback(
+            _host_osqp_solve,
+            result_spec,
             Q, q, R, r, M, A, B, c,
-            C_all, D_all, f_all, w, y, rho, rho_grad,
-            Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a, b,
+            C_all, D_all, f_all,
+            w, y, rho, rho_grad,
+            Jh, a, b,
         )
-        return dX, dU, dV, w1, y1, rho1, rho_grad1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm
 
-    use_nominal = jnp.logical_or(
-        jnp.logical_not(sls_config.enable_fastsls),
-        jnp.logical_and(sls_config.enable_fastsls, sqp_iteration < sls_config.max_initial_sqp_iterations)
-    )
-    dX, dU, dV, w1, y1, rho1, rho_grad1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm = lax.cond(
-        use_nominal, run_nominal, run_sls, operand=None
-    )
+        # This temporary path is nominal-only.  Preserve the legacy return
+        # shapes so the rest of SQP does not need to change.
+        backoffs = jnp.zeros((T + 1, nc - n_obs), dtype=Q.dtype)
+        Phi_x   = jnp.zeros((T + 1, T + 1, nx, nx), dtype=Q.dtype)
+        Phi_u   = jnp.zeros((T, T + 1, nu, nx), dtype=Q.dtype)
+        betaN   = jnp.ones((T + 1, T + 1, nc - n_obs), dtype=Q.dtype) * 1e-10
+        muN     = jnp.zeros((T + 1, nc), dtype=Q.dtype)
+
+        return (
+            dX, dU, dV, w1, y1, rho1, rho_grad1,
+            backoffs, Phi_x, Phi_u, betaN, muN,
+            Phi_x, Phi_u, a1, b1, converged_qp,
+        )
+
+    # TEMPORARY: bypass both the direct custom ADMM solve and FastSLS so every
+    # SQP search direction is generated by the OSQP horizon QP.
+    dX, dU, dV, w1, y1, rho1, rho_grad1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm = run_osqp()
 
     return dX, dU, dV, q, r, w1, y1, rho1, rho_grad1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm
 

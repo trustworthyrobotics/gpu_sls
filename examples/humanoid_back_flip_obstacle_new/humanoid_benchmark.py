@@ -16,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 from timeit import default_timer as timer
+import os
+# os.environ["JAX_PLATFORMS"] = "cpu"
 
 DIR_PATH = Path(__file__).resolve().parent
 sys.path.append(str(DIR_PATH.parent))
@@ -974,14 +976,14 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH, benchmark_runs=BENCHMARK_RU
         return
 
     admm_config = ADMMConfig(
-        eps_abs=5.0e-2, eps_rel=1.0e-3, rho_max=1.0e4,
-        max_iterations=1000, rho_update_frequency=25, initial_rho=1.0,
+        eps_abs=1.0e-2, eps_rel=5.0e-3, rho_max=1.0e4,
+        max_iterations=400, rho_update_frequency=25, initial_rho=1.0,
         regularized_rho_update=False, num_phases=NUM_PHASES,
     )
     sls_config = SLSConfig(
         max_sls_iterations=1, sls_primal_tol=1.0e-2,
         enable_fastsls=False, initialize_nominal=True,
-        max_initial_sqp_iterations=80, warm_start=True, rti=False,
+        max_initial_sqp_iterations=50, warm_start=True, rti=False,
         gradient_window=0,
     )
     sqp_config = SQPConfig(

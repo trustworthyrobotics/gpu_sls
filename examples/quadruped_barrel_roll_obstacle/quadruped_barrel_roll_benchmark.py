@@ -847,7 +847,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     )
     # data = mpc.make_data()
 
-    # start = timer()
+    start = timer()
     # result = solve_barrel_roll(mpc, data, x0, reference, parameter)
     # X, U = result[:2]
     # converged_admm = result[-1]
