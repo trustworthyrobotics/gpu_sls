@@ -18,9 +18,9 @@ import os
 import sys
 from pathlib import Path
 from timeit import default_timer as timer
-
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
+# os.environ["XLA_CLIENT_MEM_FRAC"] = "1.0"
 
 # Configure paths and headless MuJoCo before importing JAX/MuJoCo.
 DIR_PATH = Path(__file__).resolve().parent
@@ -31,12 +31,6 @@ if not os.environ.get("DISPLAY"):
 
 import jax
 import jax.numpy as jnp
-
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-# jax.config.update("jax_disable_jit", True)
-
 import mujoco
 import numpy as np
 from mujoco import mjx
@@ -51,6 +45,9 @@ from gpu_sls.gpu_admm import ADMMConfig
 from gpu_sls.gpu_sls import SLSConfig
 from gpu_sls.gpu_sqp import SQPConfig
 
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 # Stages encoded by reference_barrel_roll_min_time.
@@ -819,7 +816,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         feas_tol=1.0e-5,
         step_tol=1.0e-5,
         line_search=True,
-        lm_regularization=1.0e-2,
+        lm_regularization=1.0e-6,
     )
     mpc = mpc_wrapper.MPCWrapper(
         config,
@@ -848,14 +845,149 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         .at[mpc.foot_slice].set(feet)
         .at[DURATION_SLICE].set(NOMINAL_DURATIONS)
     )
+    # data = mpc.make_data()
+
+    # start = timer()
+    # result = solve_barrel_roll(mpc, data, x0, reference, parameter)
+    # X, U = result[:2]
+    # converged_admm = result[-1]
+    # X.block_until_ready()
+    # solve_time = timer() - start
+
     data = mpc.make_data()
 
-    start = timer()
-    result = solve_barrel_roll(mpc, data, x0, reference, parameter)
+    # ------------------------------------------------------------------
+    # Benchmark: 20 independent solves from identical initialization
+    # ------------------------------------------------------------------
+    NUM_RUNS = 21
+
+    # These are only needed for reset().
+    # solve_barrel_roll() reconstructs the same initial guesses internally.
+    X_reset = build_initial_guess(x0, reference)
+    U_reset = jnp.tile(config.u_ref, (config.N, 1))
+
+    # --------------------------------------------------------------
+    # Warm-up solve: force JIT compilation before collecting timings.
+    # Do NOT include this in the benchmark statistics.
+    # --------------------------------------------------------------
+    print("Compiling / warming up solver...")
+
+    data = mpc.reset(data, X_reset, U_reset)
+
+    warmup_result = solve_barrel_roll(
+        mpc,
+        data,
+        x0,
+        reference,
+        parameter,
+    )
+    X, U = warmup_result[:2]
+    
+    # JAX dispatch is asynchronous. Force completion before stopping
+    # the timer so the measurement reflects the actual solve time.
+    X.block_until_ready()
+
+    solve_time = timer() - start
+
+    # Optimized physical maneuver time
+    phase_times_run = np.asarray(X[0, DURATION_SLICE])
+    optimal_time = float(np.sum(phase_times_run))
+    print(optimal_time)
+
+    warmup_X = warmup_result[0]
+    warmup_X.block_until_ready()
+
+    print("Warm-up complete.")
+    print()
+
+    # --------------------------------------------------------------
+    # Timed experiments
+    # --------------------------------------------------------------
+    solve_times = []
+    optimal_times = []
+
+    last_result = None
+
+    for run_idx in range(NUM_RUNS):
+        data = mpc.reset(data, X_reset, U_reset)
+
+        start = timer()
+
+        result = solve_barrel_roll(
+            mpc,
+            data,
+            x0,
+            reference,
+            parameter,
+        )
+
+        X, U = result[:2]
+
+        # JAX dispatch is asynchronous. Force completion before stopping
+        # the timer so the measurement reflects the actual solve time.
+        X.block_until_ready()
+
+        solve_time = timer() - start
+
+        # Optimized physical maneuver time
+        phase_times_run = np.asarray(X[0, DURATION_SLICE])
+        optimal_time = float(np.sum(phase_times_run))
+        if run_idx != 0:
+            solve_times.append(solve_time)
+            optimal_times.append(optimal_time)
+
+        print(
+            f"Run {run_idx + 1:02d}/{NUM_RUNS}: "
+            f"solve={solve_time:.6f} s, "
+            f"optimal_time={optimal_time:.6f} s"
+        )
+
+        last_result = result
+
+    # --------------------------------------------------------------
+    # Statistics
+    # --------------------------------------------------------------
+    solve_times = np.asarray(solve_times, dtype=np.float64)
+    optimal_times = np.asarray(optimal_times, dtype=np.float64)
+
+    mean_solve_time = np.mean(solve_times)
+    std_solve_time = np.std(solve_times)
+
+    mean_optimal_time = np.mean(optimal_times)
+    std_optimal_time = np.std(optimal_times)
+
+    print()
+    print("=" * 60)
+    print(f"Results over {NUM_RUNS} independent solves")
+    print("=" * 60)
+
+    print(
+        f"Solve time:    "
+        f"{mean_solve_time:.6f} ± {std_solve_time:.6f} s"
+    )
+    print(
+        f"Optimal time:  "
+        f"{mean_optimal_time:.6f} ± {std_optimal_time:.6f} s"
+    )
+
+    print()
+    print(f"Mean solve time:       {mean_solve_time:.6f} s")
+    print(f"Std solve time:        {std_solve_time:.6f} s")
+    print(f"Mean optimal time:     {mean_optimal_time:.6f} s")
+    print(f"Std optimal time:      {std_optimal_time:.6f} s")
+
+    # --------------------------------------------------------------
+    # Continue the rest of the script using the final run
+    # --------------------------------------------------------------
+    result = last_result
     X, U = result[:2]
     converged_admm = result[-1]
-    X.block_until_ready()
-    solve_time = timer() - start
+
+    phase_times = np.asarray(X[0, DURATION_SLICE])
+    total_time = float(np.sum(phase_times))
+
+    # If later code still expects solve_time:
+    solve_time = solve_times[-1]
 
     phase_times = np.asarray(X[0, DURATION_SLICE])
     total_time = float(np.sum(phase_times))

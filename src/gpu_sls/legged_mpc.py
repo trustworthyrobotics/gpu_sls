@@ -457,6 +457,78 @@ class MPCWrapper:
             self.admm_config.initial_rho,
         )
 
+    def reset(self, data, X_in=None, U_in=None):
+        """
+        Reset all MPC/SQP/SLS/ADMM warm-start state.
+
+        If X_in / U_in are provided, use them as the primal SQP initial
+        trajectory. Otherwise fall back to the wrapper's default initial
+        trajectories.
+        """
+
+        # ------------------------------------------------------------
+        # Primal SQP warm starts
+        # ------------------------------------------------------------
+        X0 = self.initial_X0 if X_in is None else jnp.asarray(X_in)
+        U0 = self.initial_U0 if U_in is None else jnp.asarray(U_in)
+
+        if X0.shape != self.initial_X0.shape:
+            raise ValueError(
+                f"X_in must have shape {self.initial_X0.shape}, "
+                f"got {X0.shape}"
+            )
+
+        if U0.shape != self.initial_U0.shape:
+            raise ValueError(
+                f"U_in must have shape {self.initial_U0.shape}, "
+                f"got {U0.shape}"
+            )
+
+        # ------------------------------------------------------------
+        # Reset entire solver workspace
+        # ------------------------------------------------------------
+        return data.replace(
+            # Primal SQP
+            X0=X0,
+            U0=U0,
+            V0=jnp.zeros_like(self.initial_V0),
+
+            # Main ADMM
+            w=jnp.zeros_like(self.initial_w),
+            y=jnp.zeros_like(self.initial_y),
+            rho=jnp.asarray(
+                self.admm_config.initial_rho,
+                dtype=self.initial_rho.dtype,
+            ),
+
+            # Gradient ADMM
+            rho_grad=jnp.asarray(
+                self.admm_config.initial_rho,
+                dtype=self.initial_rho_grad.dtype,
+            ),
+            a=jnp.zeros_like(self.initial_a),
+            b=jnp.zeros_like(self.initial_b),
+
+            # Constraint / tube state
+            h_ct_ws=jnp.zeros_like(self.initial_h_ct_ws),
+            beta_ws=jnp.ones_like(self.initial_beta_ws) * 1e-10,
+            mu_ws=jnp.zeros_like(self.initial_mu_ws),
+
+            # SLS response warm starts
+            Phi_x_ws=jnp.zeros_like(self.initial_Phi_x_ws),
+            Phi_u_ws=jnp.zeros_like(self.initial_Phi_u_ws),
+            Phi_x_I_ws=jnp.zeros_like(self.initial_Phi_x_I_ws),
+            Phi_u_I_ws=jnp.zeros_like(self.initial_Phi_u_I_ws),
+
+            # Solver state
+            converged_admm=jnp.asarray(False),
+
+            # MPC timing state
+            time=jnp.asarray(0.0, dtype=data.time.dtype),
+            contact_time=self.config.timer_t,
+            liftoff=self.initial_liftoff,
+        )
+
     def make_data(self):
         """Allocate the pytree state used by the pure functional API."""
 
@@ -686,41 +758,6 @@ class MPCWrapper:
         contact = self.default_contact if contact is None else jnp.asarray(contact)
         data, tau, _, _ = self._run_impl(data, x0, input, contact)
         return data, tau
-
-    def reset(self, data, qpos, qvel, foot):
-        """Reset all SQP/SLS/ADMM warm-start state around the measured state."""
-
-        # Start from config.initial_state so auxiliary entries -- including an
-        # optional minimum-time state -- retain their configured reset values.
-        initial_state = (
-            self.initial_state
-            .at[self.qpos_slice].set(jnp.ravel(qpos))
-            .at[self.qvel_slice].set(jnp.ravel(qvel))
-            .at[self.foot_slice].set(jnp.ravel(foot))
-        )
-
-        return data.replace(
-            U0=self.initial_U0,
-            X0=jnp.tile(initial_state, (self.config.N + 1, 1)),
-            V0=self.initial_V0,
-            w=self.initial_w,
-            y=self.initial_y,
-            rho=self.initial_rho,
-            rho_grad=self.initial_rho_grad,
-            a=self.initial_a,
-            b=self.initial_b,
-            h_ct_ws=self.initial_h_ct_ws,
-            beta_ws=self.initial_beta_ws,
-            mu_ws=self.initial_mu_ws,
-            Phi_x_ws=self.initial_Phi_x_ws,
-            Phi_u_ws=self.initial_Phi_u_ws,
-            Phi_x_I_ws=self.initial_Phi_x_I_ws,
-            Phi_u_I_ws=self.initial_Phi_u_I_ws,
-            converged_admm=self.initial_converged_admm,
-            time=jnp.asarray(0.0, dtype=jnp.float32),
-            contact_time=self.config.timer_t,
-            liftoff=jnp.ravel(foot),
-        )
 
     def foot_positions(self, qpos):
         """Return flattened contact-point positions for the provided configuration."""

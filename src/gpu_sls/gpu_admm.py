@@ -962,19 +962,19 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         worst_constraint,
     ]
 
-    jax.debug.print(
-        "\nWorst constraint violation:"
-        "\n  timestep index   = {}"
-        "\n  constraint index = {}"
-        "\n  violation        = {:.6e}"
-        "\n  lhs              = {:.6e}"
-        "\n  rhs              = {:.6e}",
-        worst_stage,
-        worst_constraint,
-        worst_violation,
-        z_final[worst_stage, worst_constraint],
-        f[worst_stage, worst_constraint],
-    )
+    # jax.debug.print(
+    #     "\nWorst constraint violation:"
+    #     "\n  timestep index   = {}"
+    #     "\n  constraint index = {}"
+    #     "\n  violation        = {:.6e}"
+    #     "\n  lhs              = {:.6e}"
+    #     "\n  rhs              = {:.6e}",
+    #     worst_stage,
+    #     worst_constraint,
+    #     worst_violation,
+    #     z_final[worst_stage, worst_constraint],
+    #     f[worst_stage, worst_constraint],
+    # )
 
     mu = rho_final * y_bar
 
