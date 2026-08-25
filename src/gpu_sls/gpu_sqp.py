@@ -273,26 +273,26 @@ def filter_model_evaluator_factory(
         # Original nonlinear nominal constraints.
         g_base = vectorize(constraints)(X, U_pad, t)
 
-        # h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
+        h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
 
-        # n_tight = h_ct_trial.shape[1]
-        # eps_abs = 0
-        # g_base_tight = (
-        #     g_base[:, :n_tight]
-        #     + h_ct_trial
-        #     + eps_abs
-        # )
+        n_tight = h_ct_trial.shape[1]
+        eps_abs = 0
+        g_base_tight = (
+            g_base[:, :n_tight]
+            + h_ct_trial
+            + eps_abs
+        )
 
-        # # Any remaining constraints are evaluated without this tightening.
-        # g_remaining = g_base[:, n_tight:]
+        # Any remaining constraints are evaluated without this tightening.
+        g_remaining = g_base[:, n_tight:]
 
-        # g_all = jnp.concatenate(
-        #     [g_base_tight, g_remaining],
-        #     axis=1,
-        # )
-        # g_viol = jnp.maximum(g_all, 0.0)
+        g_all = jnp.concatenate(
+            [g_base_tight, g_remaining],
+            axis=1,
+        )
+        g_viol = jnp.maximum(g_all, 0.0)
 
-        g_viol = jnp.maximum(g_base, 0.0)
+        # g_viol = jnp.maximum(g_base, 0.0)
 
         c_filter = jnp.concatenate(
             [
@@ -558,7 +558,7 @@ def sqp(
 
             feas_ok = feas <= sqp_config.feas_tol
             step_ok = step <= sqp_config.step_tol * (1.0 + z_norm)
-            # jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
+            jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
             T = U_curr.shape[0]
             U_curr_pad = jnp.pad(U_curr, ((0, 1), (0, 0)))
             t_curr = jnp.arange(T + 1)

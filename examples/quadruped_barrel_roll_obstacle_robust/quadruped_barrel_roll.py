@@ -902,7 +902,6 @@ def plot_rollout_deviation_vs_tubes(
     for state_index, label in enumerate(labels):
         error_i = deviation_plot[:, state_index]
         tube_i = tube_plot[:, state_index]
-        outside_i = np.abs(error_i) > tube_i + 1.0e-12
 
         fig, ax = plt.subplots(figsize=(9.5, 4.8))
 
@@ -934,16 +933,6 @@ def plot_rollout_deviation_vs_tubes(
             label="- tube",
         )
         ax.axhline(0.0, linewidth=0.8, alpha=0.5)
-
-        if np.any(outside_i):
-            ax.scatter(
-                time_plot[outside_i],
-                error_i[outside_i],
-                marker="x",
-                s=28,
-                label="outside tube",
-                zorder=5,
-            )
 
         # Draw phase boundaries when the corresponding node is present in the
         # comparison time vector.
