@@ -415,13 +415,14 @@ def reference_barrel_roll_min_time(
     q0,
     lateral_displacement=-0.60,
 ):
-    """Six-phase airborne barrel-roll reference crossing a lateral obstacle.
+    """Six-phase barrel-roll reference with a contact-free obstacle crossing.
 
     Lateral velocity ramps from zero during launch and remains constant in
     flight.  Consequently the midpoint of ``lateral_displacement`` is crossed
     near the middle of the rolling flight phase, rather than during stance.
-    The reference ends just above the ground with every foot still in flight;
-    it deliberately contains no pre-landing, touchdown, or settling contacts.
+    The post-roll phases retain their base and joint-position references, but
+    all feet remain inactive after liftoff so they do not impose contact
+    kinematics, GRFs, or friction constraints.
     """
 
     del n_joints
@@ -441,11 +442,11 @@ def reference_barrel_roll_min_time(
     # while the same joint pose places the model at 0.27 m makes the feet and
     # base mutually inconsistent before optimization begins.
     base_height = 0.27
-    floating_height = 0.27
+    landing_height = 0.27
     takeoff_time = n2 * dt
     airborne_time = (n3 + n4) * dt
     takeoff_speed = (
-        floating_height - base_height + 0.5 * 9.81 * airborne_time**2
+        landing_height - base_height + 0.5 * 9.81 * airborne_time**2
     ) / (airborne_time + 0.5 * takeoff_time)
     launch_acceleration = takeoff_speed / takeoff_time
     takeoff_height = (
@@ -492,15 +493,13 @@ def reference_barrel_roll_min_time(
     p3, p4 = p34[:n3], p34[n3:]
     dp3, dp4 = dp34[:n3], dp34[n3:]
 
-    # The last two phases retain the convergent examples' timing scaffold but
-    # represent a floating terminal posture rather than touchdown/settling.
-    p5, dp5 = base_block(n5, lateral_displacement, 0.0, floating_height, 0.0)
-    p6, dp6 = base_block(n6, lateral_displacement, 0.0, floating_height, 0.0)
+    p5, dp5 = base_block(n5, lateral_displacement, 0.0, landing_height, 0.0)
+    p6, dp6 = base_block(n6, lateral_displacement, 0.0, landing_height, 0.0)
 
     # Rotate only after liftoff.  Rolling rapidly while the launch feet are
     # constrained makes the reference kinematically inconsistent and demands
-    # tensile contact forces.  Complete the roll before the post-roll flight
-    # phases with a sign-continuous -identity quaternion and zero angular rate.
+    # tensile contact forces.  At the first pre-landing state the attitude is
+    # sign-continuous identity and the commanded rate is zero.
     roll_duration = n3 * dt
     ramp_time = min(0.08, 0.25 * roll_duration)
     max_rate = 2.0 * jnp.pi / (roll_duration - ramp_time)
@@ -537,14 +536,17 @@ def reference_barrel_roll_min_time(
         [rate, jnp.zeros_like(rate), jnp.zeros_like(rate)], axis=1
     )
 
-    def identity_quat(count):
-        return jnp.tile(jnp.array([1.0, 0.0, 0.0, 0.0]), (count, 1))
+    def identity_quat(count, sign=1.0):
+        # Preserve quaternion-cover continuity through the full roll.  The
+        # post-roll attitude is identity, but it must use -identity to remain
+        # continuous with a trajectory that has accumulated 2*pi of roll.
+        return jnp.tile(jnp.array([sign, 0.0, 0.0, 0.0]), (count, 1))
 
     quat_ref = jnp.concatenate(
         [
             identity_quat(n1 + n2),
             quat_roll,
-            -identity_quat(n4 + n5 + n6),
+            identity_quat(n4 + n5 + n6, sign=-1.0),
         ],
         axis=0,
     )
@@ -557,10 +559,8 @@ def reference_barrel_roll_min_time(
         axis=0,
     )
 
-    # Extend the legs while they are pushing against the ground, tuck through
-    # the obstacle-crossing portion of flight, then return to the nominal
-    # standing joint pose while still airborne.  This final extension changes
-    # posture only; it does not introduce a landing contact.
+    # Preserve the existing landing-shaped posture references even though the
+    # feet stay in flight.  These are pose targets only, not contact commands.
     extended_leg_q = jnp.array([0.0, 0.55, -1.10])
     tucked_leg_q = jnp.array([0.0, 1.25, -2.45])
     # The roll travels in -y.  Keep the +y (left) legs extended for launch
@@ -569,6 +569,7 @@ def reference_barrel_roll_min_time(
         [extended_leg_q, tucked_leg_q, extended_leg_q, tucked_leg_q]
     )
     tuck_q = jnp.tile(tucked_leg_q, n_contact)
+    landing_q = jnp.tile(jnp.array([0.0, 1.10, -2.10]), n_contact)
 
     def blend(start, end, count, endpoint=False):
         alpha = jnp.linspace(0.0, 1.0, count, endpoint=endpoint)
@@ -579,8 +580,9 @@ def reference_barrel_roll_min_time(
             jnp.tile(q0, (n1, 1)),
             blend(q0, launch_q, n2),
             blend(launch_q, tuck_q, n3),
-            blend(tuck_q, q0, n4 + n5, endpoint=True),
-            jnp.tile(q0, (n6, 1)),
+            blend(tuck_q, landing_q, n4),
+            jnp.tile(landing_q, (n5, 1)),
+            blend(landing_q, q0, n6, endpoint=True),
         ],
         axis=0,
     )

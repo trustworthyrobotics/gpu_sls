@@ -182,7 +182,7 @@ class SQPConfig:
     step_tol: float = 1e-4
     warm_start: bool = True
     line_search: bool = True
-    lm_regularization: float = 1e-2
+    lm_regularization: float = 0.0
 
     def tree_flatten(self):
         children = (
@@ -276,10 +276,11 @@ def filter_model_evaluator_factory(
         h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
 
         n_tight = h_ct_trial.shape[1]
-        eps_abs = 0
+        # eps_abs = 0
         g_base_tight = (
             g_base[:, :n_tight]
             + h_ct_trial
+            # + backoffs
             + eps_abs
         )
 
@@ -435,7 +436,7 @@ def compute_search_direction(
         )
     )
 
-    Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[-1]), Q.shape).at[..., 0, 0].set(10.0)
+    Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[-1]), Q.shape).at[..., 0, 0].set(5.0)
     R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]) * 0.5, R.shape)
 
     n_obs = obstacles.shape[0]
@@ -443,7 +444,7 @@ def compute_search_direction(
     def run_nominal(_):
         Jh = jnp.zeros((T + 1, nc, sls_config.gradient_window, nx))
         dX, dU, dV, w1, y1, rho1, rho_grad1, _, a1, b1, converged_admm = constrained_solve(
-            admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, rho_grad, Jh, a, b, sls_config.gradient_window
+            admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, rho_grad, Jh, a, b, sls_config.gradient_window, just_nominal=True,
         )
         backoffs = jnp.zeros((T + 1, nc - n_obs))
         Phi_x   = jnp.zeros((T + 1, T + 1, nx, nx))

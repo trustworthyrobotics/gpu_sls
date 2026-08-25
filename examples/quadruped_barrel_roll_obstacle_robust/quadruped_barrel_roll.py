@@ -1,12 +1,13 @@
-"""Minimum-time Go2 barrel roll with nonlinear rollout-versus-SLS-tube validation.
+"""Minimum-time Go2 barrel roll with open-loop nonlinear rollout-versus-SLS-tube validation.
 
 The contact sequence and number of shooting intervals in each phase stay fixed.
 The physical durations T_i are appended to the whole-body state and optimized
 in the same way as the phase times in plan_drone_racing.
 
-The reference starts and ends on opposite sides of a hurdle.  Smooth hard
-constraints keep conservative trunk and foot envelopes outside the hurdle,
-so the obstacle affects the optimized motion rather than only the rendering.
+The reference starts and ends on opposite sides of a hurdle, with the final
+state still airborne just above the ground.  Smooth hard constraints keep
+conservative trunk and foot envelopes outside the hurdle, so the obstacle
+affects the optimized motion rather than only the rendering.
 
 Use --dry-run to validate callback shapes without compiling the full solver.
 """
@@ -58,12 +59,12 @@ from gpu_sls.gpu_sqp import SQPConfig
 PHASE_NAMES = (
     "stance",
     "lateral_launch",
-    "flight",
-    "prelanding",
-    "touchdown",
-    "settle",
+    "rolling_flight",
+    "post_roll_flight",
+    "terminal_float",
+    "float_hold",
 )
-NOMINAL_DURATIONS = jnp.array([0.20, 0.20, 0.24, 0.06, 0.10, 0.20])
+NOMINAL_DURATIONS = jnp.array([0.20, 0.20, 0.24, 0.06, 0.02, 0.02])
 PHASE_END_STEPS = jnp.array([10, 20, 32, 35, 40, 50], dtype=jnp.int32)
 SEGMENT_LENGTHS = jnp.concatenate(
     [PHASE_END_STEPS[:1], PHASE_END_STEPS[1:] - PHASE_END_STEPS[:-1]]
@@ -91,7 +92,6 @@ TIME_WEIGHT = 1e4
 FEASIBILITY_TOLERANCE = 5.0e-2
 DYNAMICS_TOLERANCE = 2.5e-1
 OBSTACLE_TOLERANCE = 5.0e-3
-
 # Original MPX state: qpos, qvel, foot positions, and GRFs.
 PHYSICAL_N = 13 + 2 * config.n_joints + 6 * config.n_contact
 DURATION_SLICE = slice(PHYSICAL_N, PHYSICAL_N + NUM_PHASES)
@@ -116,9 +116,8 @@ WAYPOINT_ANGULAR_SPEED_LIMITS = jnp.array(
     [5.0, 20.0, 8.0, 3.0, 1.5, 1.0]
 )
 WAYPOINT_LINEAR_SPEED_LIMITS = jnp.array(
-    [1.5, 2.5, 2.5, 1.5, 0.6, 0.25]
+    [1.5, 2.5, 2.5, 3.0, 5.0, 5.0]
 )
-FINAL_LINEAR_SPEED = 0.25
 FINAL_ANGULAR_SPEED = 1.0
 FINAL_JOINT_SPEED = 2.0
 FINAL_JOINT_POSITION_TOLERANCE = 0.20
@@ -187,7 +186,7 @@ def min_time_barrel_roll_dynamics(model, mjx_model, contact_id, body_id):
         current_feet = jnp.concatenate(feet)
 
         # Solve only the active contact constraints. Masking forces after a
-        # four-foot solve gives incorrect forces for flight and staged landing.
+        # four-foot solve gives incorrect forces for flight.
         contact_mask = jnp.repeat(contact, 3)
         active_jacobian = contact_jacobian * contact_mask[None, :]
         velocity_violation = active_jacobian.T @ qvel
@@ -410,11 +409,13 @@ def make_obstacle_clearance_constraints():
 
 
 def make_barrel_roll_constraints(reference, obstacle_constraints):
-    """Build hard timing, pose, obstacle, force, and landing limits."""
+    """Build hard timing, pose, obstacle, force, and airborne-end limits."""
 
     nj = config.n_joints
     waypoint_positions = reference["p"][PHASE_END_STEPS]
     waypoint_quaternions = reference["quat"][PHASE_END_STEPS]
+    # The final waypoint uses the nominal standing joint pose from the
+    # reference, but the terminal contact mode remains fully airborne.
     terminal_joints = reference["q"][-1]
     cosine_limits = jnp.cos(0.5 * WAYPOINT_ANGLE_TOLERANCES)
 
@@ -508,7 +509,6 @@ def make_barrel_roll_constraints(reference, obstacle_constraints):
 
         final_constraints = jnp.concatenate(
             [
-                jnp.abs(dp) - FINAL_LINEAR_SPEED,
                 jnp.abs(omega) - FINAL_ANGULAR_SPEED,
                 jnp.abs(q - terminal_joints) - FINAL_JOINT_POSITION_TOLERANCE,
                 jnp.abs(dq) - FINAL_JOINT_SPEED,
@@ -542,7 +542,7 @@ def make_phase_scaled_disturbance(n, magnitude=0.02):
     def disturbance_at_state(x, t):
         phase = phase_index(t)
         dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
-        diagonal = jnp.zeros(n, dtype=x.dtype).at[:3].set(magnitude * dt)
+        diagonal = jnp.zeros(n, dtype=x.dtype).at[:2].set(magnitude * dt)
         diagonal = diagonal.at[DURATION_SLICE].set(0.0)
         return jnp.diag(diagonal)
 
@@ -704,31 +704,46 @@ def get_trajectory_tubes(Phi_x):
     return jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1)
 
 
-def rollout_optimized_dynamics(dynamics, X_nominal, U, parameter):
-    """Sequentially roll out the exact experiment dynamics.
+def rollout_solved_controls(
+    dynamics,
+    X_optimized,
+    U,
+    parameter,
+):
+    """Roll out the nonlinear dynamics using only the solved controls.
 
-    This deliberately does NOT use mjx.step.  Starting from the optimized
-    initial state, it repeatedly evaluates the same dynamics callback used by
-    the optimizer:
+    Starting from the optimized initial state, recursively apply
 
-        x_roll[k+1] = dynamics(x_roll[k], U[k], k, parameter)
+        x_{k+1} = dynamics(x_k, U[k], k, parameter)
 
-    Using X_nominal[0] is important because the phase-duration states at node
-    zero are optimization variables.
+    with no SLS feedback, no disturbance injection, and no shooting-defect
+    compensation.  The difference between this rollout and X_optimized is
+    therefore the accumulated open-loop nonlinear shooting/rollout drift.
     """
-    x = jnp.asarray(X_nominal[0])
-    states = [x]
 
-    for k in range(U.shape[0]):
-        x = dynamics(
-            x,
-            U[k],
-            jnp.asarray(k, dtype=jnp.int32),
-            parameter,
+    def run(X_optimized, U, parameter):
+        x_initial = X_optimized[0]
+
+        def step(x, inputs):
+            k, u = inputs
+            x_next = dynamics(x, u, k, parameter)
+            return x_next, x_next
+
+        scan_inputs = (
+            jnp.arange(U.shape[0], dtype=jnp.int32),
+            U,
         )
-        states.append(x)
+        _, rollout_tail = jax.lax.scan(
+            step,
+            x_initial,
+            scan_inputs,
+        )
+        X_rollout = jnp.concatenate(
+            [x_initial[None, :], rollout_tail], axis=0
+        )
+        return X_rollout
 
-    return jnp.stack(states, axis=0)
+    return jax.jit(run)(X_optimized, U, parameter)
 
 
 def build_state_labels(n_state):
@@ -843,6 +858,8 @@ def plot_rollout_deviation_vs_tubes(
     Phi_x,
     node_times,
     output_dir,
+    *,
+    comparison_label="open-loop nonlinear rollout - optimized trajectory",
 ):
     """Plot signed nonlinear rollout error against +/- SLS tube per state."""
     X_nominal = np.asarray(X_nominal)
@@ -880,9 +897,9 @@ def plot_rollout_deviation_vs_tubes(
     ratio[~positive_tube & (abs_deviation > 1.0e-12)] = np.inf
 
     print("")
-    print("Nonlinear dynamics rollout versus SLS tubes")
-    print(f"  X nominal shape:    {X_nominal.shape}")
-    print(f"  X rollout shape:    {X_rollout.shape}")
+    print("Open-loop nonlinear rollout versus SLS tubes")
+    print(f"  tube-center shape:   {X_nominal.shape}")
+    print(f"  rollout shape:       {X_rollout.shape}")
     print(f"  Phi_x shape:        {np.asarray(Phi_x).shape}")
     print(f"  tube radius shape:  {tubes.shape}")
     print(f"  compared shape:     {deviation_plot.shape}")
@@ -916,7 +933,7 @@ def plot_rollout_deviation_vs_tubes(
             time_plot,
             error_i,
             linewidth=1.8,
-            label="dynamics rollout - optimized trajectory",
+            label=comparison_label,
         )
         ax.plot(
             time_plot,
@@ -983,7 +1000,7 @@ def plot_rollout_deviation_vs_tubes(
     )
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("State dimension")
-    ax.set_title("Rollout tube excess: |x_rollout - X| - tube")
+    ax.set_title("Open-loop rollout tube excess: |x_rollout - X| - tube")
     fig.colorbar(image, ax=ax, label="Tube excess")
     fig.tight_layout()
     fig.savefig(
@@ -1101,6 +1118,8 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
+        # Tighter ADMM tolerances repeatedly hit the 1,000-iteration cap on
+        # this problem without removing the nonlinear shooting drift.
         eps_abs=1.0e-1,
         eps_rel=1.0e-3,
         rho_max=1.0e6,
@@ -1113,9 +1132,9 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     sls_config = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1.0e-2,
-        enable_fastsls=True,
+        enable_fastsls=False,
         initialize_nominal=True,
-        max_initial_sqp_iterations=50,
+        max_initial_sqp_iterations=0,
         warm_start=True,
         rti=False,
         gradient_window=0,
@@ -1128,6 +1147,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         line_search=True,
         lm_regularization=1.0e-2,
     )
+    disturbance = make_phase_scaled_disturbance(config.n)
     mpc = mpc_wrapper.MPCWrapper(
         config,
         sls_config=sls_config,
@@ -1135,7 +1155,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         admm_config=admm_config,
         constraints=constraints,
         obstacles=jnp.zeros((0, 3), dtype=config.initial_state.dtype),
-        disturbance=make_phase_scaled_disturbance(config.n),
+        disturbance=disturbance,
     )
 
     # Initialize the physical state and feet from the optimizer's model.
@@ -1163,14 +1183,16 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     # Current MPC solve API:
     #   X, U, V, w, y, rho, rho_grad, backoffs, Phi_x, Phi_u, ...
     Phi_x = result[8]
+    Phi_u = result[9]
     converged_admm = result[-1]
     X.block_until_ready()
     solve_time = timer() - start
 
-    # IMPORTANT: this is a sequential rollout of mpc.dynamics itself.
-    # It never calls mjx.step.
+    # Pure open-loop nonlinear rollout of the solved control sequence.  This
+    # intentionally applies no SLS feedback, no disturbance, and no affine
+    # shooting-defect correction.
     rollout_start = timer()
-    X_rollout = rollout_optimized_dynamics(
+    X_rollout = rollout_solved_controls(
         mpc.dynamics,
         X,
         U,
@@ -1178,6 +1200,16 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     )
     X_rollout.block_until_ready()
     rollout_time = timer() - rollout_start
+
+    rollout_deviation = X_rollout - X
+    max_rollout_drift = float(jnp.max(jnp.abs(rollout_deviation)))
+    max_physical_rollout_drift = float(
+        jnp.max(jnp.abs(rollout_deviation[:, :GRF_START]))
+    )
+    max_grf_rollout_drift = float(
+        jnp.max(jnp.abs(rollout_deviation[:, GRF_START:GRF_STOP]))
+    )
+    tube_radii = get_trajectory_tubes(Phi_x)
 
     phase_times = np.asarray(X[0, DURATION_SLICE])
     total_time = float(np.sum(phase_times))
@@ -1211,6 +1243,12 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
 
     print(f"Solve time: {solve_time:.3f} s")
     print(f"Dynamics rollout time: {rollout_time:.3f} s")
+    print(
+        "Open-loop solved-control rollout drift: "
+        f"all={max_rollout_drift:.6e}, "
+        f"physical/feet={max_physical_rollout_drift:.6e}, "
+        f"GRF={max_grf_rollout_drift:.6e}"
+    )
     print("Optimized phase times:")
     for name, duration in zip(PHASE_NAMES, phase_times):
         print(f"  {name:16s} {duration:.6f} s")
@@ -1254,6 +1292,14 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         Phi_x,
         node_times,
         rollout_plot_dir,
+        comparison_label="open-loop nonlinear rollout - optimized trajectory",
+    )
+    open_loop_rollout_inside_tube = bool(
+        np.all(rollout_diagnostics["inside_tube"])
+    )
+    print(
+        "Open-loop solved-control rollout inside SLS tube: "
+        f"{open_loop_rollout_inside_tube}"
     )
 
     result_path = (
@@ -1263,10 +1309,21 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     np.savez(
         result_path,
         X=np.asarray(X),
+        X_tube_center=np.asarray(X),
         U=np.asarray(U),
+        # Backward-compatible key used by render_barrel_rollout.py.
         X_rollout=np.asarray(X_rollout),
+        rollout_deviation=np.asarray(rollout_deviation),
+        max_rollout_drift=np.asarray(max_rollout_drift),
+        max_physical_rollout_drift=np.asarray(
+            max_physical_rollout_drift
+        ),
+        max_grf_rollout_drift=np.asarray(max_grf_rollout_drift),
+        open_loop_rollout_inside_tube=np.asarray(
+            open_loop_rollout_inside_tube
+        ),
         Phi_x=np.asarray(Phi_x),
-        rollout_deviation=rollout_diagnostics["deviation"],
+        Phi_u=np.asarray(Phi_u),
         rollout_deviation_compared=rollout_diagnostics["deviation_compared"],
         tube_radii=rollout_diagnostics["tube_radii"],
         tube_radii_compared=rollout_diagnostics["tube_radii_compared"],
@@ -1291,7 +1348,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         lateral_displacement=np.asarray(LATERAL_DISPLACEMENT),
         feasible=np.asarray(is_feasible),
         admm_converged=np.asarray(bool(np.asarray(converged_admm))),
-        reference_version=np.asarray(4),
+        reference_version=np.asarray(8),
     )
     print(f"Saved trajectory: {result_path}")
     if not is_feasible:

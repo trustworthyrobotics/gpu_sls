@@ -1,0 +1,3 @@
+experiment,enable_fastsls,gradient_window,min_time_s,mean_disturbance,max_disturbance,fraction_below_transition,max_dynamics_defect,max_constraint_violation,max_tightened_constraint_violation
+no_gradient,True,0,2.11067867,0.811399102,1,0.196078431,0.0422768593,0,0.0510010049
+gradient_aware,True,10,1.88012171,0.168295622,0.999999881,0.823529412,0.0180379152,0,0.0510010049

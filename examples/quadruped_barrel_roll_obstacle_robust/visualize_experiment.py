@@ -96,7 +96,12 @@ def load_experiment(path: Path):
             "The solve script must save Phi_x in addition to X."
         )
 
-    X = np.asarray(data["X"])
+    # Tube containment is centered on the nominal trajectory used by the SLS
+    # linearization.  Older result files store the same trajectory as X.
+    trajectory_key = (
+        "X_tube_center" if "X_tube_center" in data else "X"
+    )
+    X = np.asarray(data[trajectory_key])
     Phi_x = jnp.asarray(data["Phi_x"])
     tubes = np.asarray(get_trajectory_tubes(Phi_x))
 

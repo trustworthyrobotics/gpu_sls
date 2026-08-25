@@ -16,6 +16,14 @@ jnp.set_printoptions(
 from gpu_sls.gpu_admm import constrained_solve
 from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlqr_gpu
 
+
+# Keep the square-root regularization used by the tube tightening and its
+# dual-derived controller weights identical.  Using a smaller value in
+# ``get_etas`` makes a freshly initialized beta (or an unaffected constraint)
+# look artificially singular at the nominal-to-robust handoff.
+BETA_REGULARIZATION = 1e-6
+
+
 @dataclass(frozen=True)
 class SLSConfig:
     max_sls_iterations: int = 1
@@ -228,7 +236,7 @@ def get_betas(C, D, Phi_x, Phi_u):
     return beta
 
 @jax.jit
-def get_constraint_tightenings(betas, eps_beta=1e-6):
+def get_constraint_tightenings(betas, eps_beta=BETA_REGULARIZATION):
     T1, _, _ = betas.shape
 
     s = jnp.sqrt(jnp.maximum(betas, eps_beta))
@@ -243,7 +251,7 @@ def get_constraint_tightenings(betas, eps_beta=1e-6):
     return h_ct
 
 @jax.jit
-def get_etas(mus, betas, eps=1e-12):
+def get_etas(mus, betas, eps=BETA_REGULARIZATION):
     Tp1 = mus.shape[0]
     T = Tp1 - 1
 
@@ -452,8 +460,9 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
     E = disturbance_fn(primal_pos)
     num_obstacles = obstacles.shape[0]
     T   = Tp1 - 1
-    # beta0 = jnp.ones((Tp1, Tp1, nc - num_obstacles), dtype=Q.dtype) * 1e-10
-    # h_ct0 = jnp.zeros((Tp1, nc - num_obstacles))
+    num_regular_constraints = f.shape[1] - num_obstacles
+    C_box = C[:, :num_regular_constraints, :]
+    D_box = D[:, :num_regular_constraints, :]
     x0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
     u0 = jnp.zeros((T, nu),  dtype=Q.dtype)
     v0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
@@ -464,13 +473,65 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
     max_iter = jnp.array(sls_config.max_sls_iterations, dtype=jnp.int32)
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
-    h_ct0 = h_ct_ws
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, rho_grad, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, Phi_x_I_ws, Phi_u_I_ws, a_init, b_init)
-
     I = jnp.eye(nx)
 
     # Recommended (no unnecessary copies until needed)
     I_batch = jnp.broadcast_to(I, (Tp1, nx, nx))
+
+    def initialize_response(_):
+        """Build a finite unconstrained response before the first robust QP.
+
+        The nominal SQP branch deliberately returns zero response matrices.
+        Reusing those zeros makes the first robust QP untightened and then
+        forms controller weights from its new multipliers and the placeholder
+        beta=1e-10.  Initialize the response with eta=0 instead, so beta and
+        h_ct describe the actual linearized nominal dynamics at the handoff.
+        """
+        eta_stage0 = jnp.zeros(
+            (T, T, num_regular_constraints), dtype=Q.dtype
+        )
+        eta_f0 = jnp.zeros((T, num_regular_constraints), dtype=Q.dtype)
+        P0, K_kj0 = get_controller(
+            Q_bar, R_bar, A, B, C_box, D_box, eta_stage0, eta_f0
+        )
+        Phi_x_I0, Phi_u_I0 = forward_rollout(I_batch, A, B, P0, K_kj0)
+        Phi_x0 = jnp.einsum("kjab,jbc->kjac", Phi_x_I0, E)
+        Phi_u0 = jnp.einsum("kjab,jbc->kjac", Phi_u_I0, E)
+        beta0 = get_betas(C_box, D_box, Phi_x0, Phi_u0)
+        h_ct0 = get_constraint_tightenings(beta0)
+        return beta0, h_ct0, Phi_x0, Phi_u0, Phi_x_I0, Phi_u_I0
+
+    def reuse_response(_):
+        return (
+            beta_ws,
+            h_ct_ws,
+            Phi_x_ws,
+            Phi_u_ws,
+            Phi_x_I_ws,
+            Phi_u_I_ws,
+        )
+
+    response_initialized = (
+        jnp.all(jnp.isfinite(beta_ws))
+        & jnp.all(jnp.isfinite(h_ct_ws))
+        & jnp.all(jnp.isfinite(Phi_x_ws))
+        & jnp.all(jnp.isfinite(Phi_u_ws))
+        & jnp.all(jnp.isfinite(Phi_x_I_ws))
+        & jnp.all(jnp.isfinite(Phi_u_I_ws))
+        & jnp.any(jnp.abs(Phi_x_I_ws) > 0.0)
+    )
+    beta0, h_ct0, Phi_x0, Phi_u0, Phi_x_I0, Phi_u_I0 = lax.cond(
+        response_initialized,
+        reuse_response,
+        initialize_response,
+        operand=None,
+    )
+
+    carry0 = (
+        i0, beta0, x0, u0, v0, w, y, rho, rho_grad,
+        converged0, converged0, h_ct0, Phi_x0, Phi_u0, mu_ws,
+        Phi_x_I0, Phi_u_I0, a_init, b_init,
+    )
 
     def cond_fn(carry):
         i, _, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, _, _ = carry
@@ -480,7 +541,6 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
         i, beta, x_curr, u_curr, v_curr, w, y, rho, rho_grad, converged, _, h_ct, _, _, mu, Phi_x_I, Phi_u_I, a, b = carry
         x_prev = x_curr
         u_prev = u_curr
-        num_regular_constraints = f.shape[1] - num_obstacles
         tightened_constraints = f[:, :num_regular_constraints] - h_ct
         tightened_constraints_all = add_obstacle_tightenings(obstacles, primal_pos, h_ct, tightened_constraints)
         warm_flag = jnp.array(bool(sls_config.warm_start))
@@ -488,9 +548,6 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
         w   = lax.select(warm_flag, w, jnp.zeros_like(w))
         y   = lax.select(warm_flag, y, jnp.zeros_like(y))
         rho = lax.select(warm_flag, rho, jnp.array(cfg.initial_rho, dtype=rho.dtype))
-        C_box = C[:, :num_regular_constraints, :]
-        D_box = D[:, :num_regular_constraints, :]
-
         Phi_x_window = make_phi_windows(Phi_x_I, L)
         Phi_u_window = make_phi_windows(Phi_u_I, L)
 

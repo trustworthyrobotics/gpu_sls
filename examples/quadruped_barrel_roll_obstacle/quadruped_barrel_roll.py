@@ -20,7 +20,7 @@ from pathlib import Path
 from timeit import default_timer as timer
 
 import os
-os.environ["JAX_PLATFORMS"] = "cpu"
+# os.environ["JAX_PLATFORMS"] = "cpu"
 
 # Configure paths and headless MuJoCo before importing JAX/MuJoCo.
 DIR_PATH = Path(__file__).resolve().parent

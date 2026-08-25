@@ -353,6 +353,8 @@ def plot_rocket_side_view_tubes_goal_obstacles(
     tube_stride: int = 1,
     ground_height: float = 0.0,
     filename: str = 'rocket_side_view_tubes.png',
+    title: str = 'Rocket trajectory and SLS tubes — side view',
+    terminal_visible_fraction: float = 0.35,
 ) -> None:
     plan = _as_np(plan)
     lower = _as_np(lower)
@@ -363,29 +365,168 @@ def plot_rocket_side_view_tubes_goal_obstacles(
     goal_half_width = _as_np(goal_half_width)
 
     fig, ax = plt.subplots(figsize=(9, 6.2))
-    ax.plot(plan[:, 0], plan[:, 2], linewidth=2.2, label='Nominal plan')
-    ax.scatter(plan[0, 0], plan[0, 2], s=42, label='Start')
-    ax.scatter(plan[-1, 0], plan[-1, 2], s=55, marker='*', label='Terminal')
 
+    # ---------------------------------------------------------
+    # Nominal trajectory
+    # ---------------------------------------------------------
+    ax.plot(
+        plan[:, 0],
+        plan[:, 2],
+        linewidth=2.2,
+        label='Nominal plan',
+    )
+
+    ax.scatter(
+        plan[0, 0],
+        plan[0, 2],
+        s=42,
+        label='Start',
+    )
+
+    ax.scatter(
+        plan[-1, 0],
+        plan[-1, 2],
+        s=55,
+        marker='*',
+        label='Terminal',
+    )
+
+    # ---------------------------------------------------------
+    # SLS tubes
+    # ---------------------------------------------------------
     stride = max(1, int(tube_stride))
+
     for k in range(0, min(len(lower), len(upper)), stride):
         w = upper[k, 0] - lower[k, 0]
         h = upper[k, 2] - lower[k, 2]
-        if np.isfinite([lower[k, 0], lower[k, 2], w, h]).all():
-            ax.add_patch(Rectangle((lower[k, 0], lower[k, 2]), w, h, alpha=0.06, linewidth=0.0))
 
+        if np.isfinite(
+            [lower[k, 0], lower[k, 2], w, h]
+        ).all():
+            ax.add_patch(
+                Rectangle(
+                    (lower[k, 0], lower[k, 2]),
+                    w,
+                    h,
+                    alpha=0.06,
+                    linewidth=0.0,
+                )
+            )
+
+    # ---------------------------------------------------------
+    # Obstacles
+    # ---------------------------------------------------------
     for c, r in zip(centers, radii):
-        ax.add_patch(Circle((c[0], c[2]), float(r), alpha=0.22))
+        ax.add_patch(
+            Circle(
+                (c[0], c[2]),
+                float(r),
+                alpha=0.22,
+            )
+        )
 
-    goal_lo = np.array([goal_center[0] - goal_half_width[0], goal_center[2] - goal_half_width[2]])
-    goal_size = np.array([2.0 * goal_half_width[0], 2.0 * goal_half_width[2]])
-    ax.add_patch(Rectangle(goal_lo, goal_size[0], goal_size[1], alpha=0.16, label='Goal set'))
+    # ---------------------------------------------------------
+    # Terminal set
+    # ---------------------------------------------------------
+    goal_lo = np.array([
+        goal_center[0] - goal_half_width[0],
+        goal_center[2] - goal_half_width[2],
+    ])
 
-    ax.axhline(float(ground_height), linewidth=1.2, linestyle='--', label='Ground')
+    goal_size = np.array([
+        2.0 * goal_half_width[0],
+        2.0 * goal_half_width[2],
+    ])
+
+    ax.add_patch(
+        Rectangle(
+            goal_lo,
+            goal_size[0],
+            goal_size[1],
+            alpha=0.16,
+            label='Goal set',
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Ground
+    # ---------------------------------------------------------
+    ax.axhline(
+        float(ground_height),
+        linewidth=1.2,
+        linestyle='--',
+        label='Ground',
+    )
+
+    # ---------------------------------------------------------
+    # Crop plot around trajectory.
+    #
+    # Only show part of the terminal set on the right-hand side.
+    # Matplotlib automatically clips the rectangle at the axis.
+    # ---------------------------------------------------------
+    x_data_min = min(
+        np.min(lower[:, 0]),
+        np.min(plan[:, 0]),
+    )
+
+    x_data_max = max(
+        np.max(upper[:, 0]),
+        np.max(plan[:, 0]),
+    )
+
+    z_data_min = min(
+        np.min(lower[:, 2]),
+        np.min(plan[:, 2]),
+        ground_height,
+    )
+
+    z_data_max = max(
+        np.max(upper[:, 2]),
+        np.max(plan[:, 2]),
+    )
+
+    x_span = max(x_data_max - x_data_min, 1.0)
+    z_span = max(z_data_max - z_data_min, 1.0)
+
+    x_margin = 0.05 * x_span
+    z_margin = 0.08 * z_span
+
+    # Near/left edge of terminal set
+    goal_x_min = goal_center[0] - goal_half_width[0]
+
+    # Only expose this fraction of the terminal set.
+    goal_visible_x = (
+        goal_x_min
+        + terminal_visible_fraction * 2.0 * goal_half_width[0]
+    )
+
+    x_right = max(
+        x_data_max + x_margin,
+        goal_visible_x,
+    )
+
+    ax.set_xlim(
+        x_data_min - x_margin,
+        x_right,
+    )
+
+    ax.set_ylim(
+        z_data_min - z_margin,
+        z_data_max + z_margin,
+    )
+
+    # ---------------------------------------------------------
+    # Labels
+    # ---------------------------------------------------------
     ax.set_xlabel('x [m]')
     ax.set_ylabel('z [m]')
-    ax.set_title('Rocket trajectory and SLS tubes — side view')
-    ax.axis('equal')
+    ax.set_title(title)
+
+    # Do NOT use ax.axis('equal') here, because it can expand
+    # the limits and reveal the entire terminal set again.
+    ax.set_aspect('equal', adjustable='box')
+
     ax.grid(True, alpha=0.25)
     ax.legend(loc='best')
+
     _save(fig, filename)

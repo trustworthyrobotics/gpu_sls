@@ -1,8 +1,12 @@
-"""Minimum-time, multi-phase barrel roll for the Unitree Go2.
+"""Minimum-time Unitree Go2 barrel roll over a central obstacle.
 
 The contact sequence and number of shooting intervals in each phase stay fixed.
 The physical durations T_i are appended to the whole-body state and optimized
 in the same way as the phase times in plan_drone_racing.
+
+The reference starts and ends on opposite sides of a hurdle.  Smooth hard
+constraints keep conservative trunk and foot envelopes outside the hurdle,
+so the obstacle affects the optimized motion rather than only the rendering.
 The post-roll phases preserve their pose targets without requiring contacts or
 ground-reaction forces.
 
@@ -17,6 +21,9 @@ import sys
 from pathlib import Path
 from timeit import default_timer as timer
 
+import os
+# os.environ["JAX_PLATFORMS"] = "cpu"
+
 # Configure paths and headless MuJoCo before importing JAX/MuJoCo.
 DIR_PATH = Path(__file__).resolve().parent
 sys.path.append(str(DIR_PATH.parent))
@@ -26,8 +33,15 @@ if not os.environ.get("DISPLAY"):
 
 import jax
 import jax.numpy as jnp
+
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_disable_jit", True)
+
 import mujoco
 import numpy as np
+import matplotlib.pyplot as plt
 from mujoco import mjx
 from mujoco.mjx._src import math
 
@@ -40,9 +54,6 @@ from gpu_sls.gpu_admm import ADMMConfig
 from gpu_sls.gpu_sls import SLSConfig
 from gpu_sls.gpu_sqp import SQPConfig
 
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 # Stages encoded by reference_barrel_roll_min_time.
@@ -74,8 +85,14 @@ MAX_DURATIONS = 2.00 * NOMINAL_DURATIONS
 # its lower bound before the nonlinear dynamics and waypoint constraints have
 # become feasible, which stalls convergence at a heavily infeasible rollout.
 TIME_WEIGHT = 1e4
-FEASIBILITY_TOLERANCE = 2.0e-2
-DYNAMICS_TOLERANCE = 1.5e-1
+# The constraint vector mixes meters/radians with force limits, while the
+# dynamics vector also contains algebraic GRF states measured in newtons.
+# These tolerances correspond to 5 cm/rad for generic constraints and 0.25 N
+# for the worst algebraic shooting defect.  Obstacle clearance uses its own
+# much tighter dimensionless tolerance below.
+FEASIBILITY_TOLERANCE = 5.0e-2
+DYNAMICS_TOLERANCE = 2.5e-1
+OBSTACLE_TOLERANCE = 5.0e-3
 
 # Original MPX state: qpos, qvel, foot positions, and GRFs.
 PHYSICAL_N = 13 + 2 * config.n_joints + 6 * config.n_contact
@@ -118,6 +135,24 @@ FRICTION_COEFFICIENT = 0.5
 MAX_NORMAL_FORCE = 250.0
 TANGENTIAL_FORCE_SMOOTHING = 1.0e-4
 CONTACT_SOLVE_REGULARIZATION = 1.0e-6
+
+# The roll moves in -y.  A thin hurdle spans x and sits halfway between the
+# initial and final base positions.  Sizes are full MuJoCo box dimensions.
+LATERAL_DISPLACEMENT = -0.60
+OBSTACLE_SIZE = jnp.array([0.80, 0.05, 0.16])
+OBSTACLE_CENTER = jnp.array(
+    [0.0, 0.5 * LATERAL_DISPLACEMENT, 0.5 * OBSTACLE_SIZE[2]]
+)
+BASE_CLEARANCE_RADIUS = 0.17
+FOOT_CLEARANCE_RADIUS = 0.02
+JOINT_CLEARANCE_RADIUS = 0.035
+SUPERELLIPSOID_POWER = 4
+SUPERELLIPSOID_SCALE = 2.0 ** (1.0 / SUPERELLIPSOID_POWER)
+LEG_JOINT_NAMES = tuple(
+    f"{leg}_{joint}_joint"
+    for leg in ("FL", "FR", "RL", "RR")
+    for joint in ("hip", "thigh", "calf")
+)
 
 
 def phase_index(t):
@@ -281,6 +316,7 @@ def build_barrel_roll_reference():
         config.n_contact,
         config.p_legs0,
         config.q0,
+        LATERAL_DISPLACEMENT,
     )
     reference = {
         name: jnp.concatenate([value, value[-1:]], axis=0)
@@ -315,8 +351,68 @@ def build_initial_guess(x0, reference):
     return X.at[0, :PHYSICAL_N].set(x0[:PHYSICAL_N])
 
 
-def make_barrel_roll_constraints(reference):
-    """Build hard timing, pose, joint, force, and airborne-end limits."""
+def make_obstacle_clearance_constraints():
+    """Build differentiable trunk, joint, and foot hurdle constraints.
+
+    The hurdle's y-z rectangle is inflated by a clearance around the base and
+    each robot point, then enclosed by a smooth fourth-order superellipse.
+    Treating the hurdle as infinite along x is conservative for this lateral
+    maneuver.
+    """
+
+    model = mujoco.MjModel.from_xml_path(config.model_path)
+    mjx_model = mjx.put_model(model)
+    joint_ids = []
+    for name in LEG_JOINT_NAMES:
+        joint_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, name
+        )
+        if joint_id < 0:
+            raise ValueError(f"Could not find required leg joint: {name}")
+        joint_ids.append(joint_id)
+    joint_ids = jnp.asarray(joint_ids, dtype=jnp.int32)
+
+    nj = config.n_joints
+    nc = config.n_contact
+    feet_start = 13 + 2 * nj
+
+    def inflated_superellipse(points, clearance):
+        radii = (
+            (0.5 * OBSTACLE_SIZE[1:] + clearance)
+            * SUPERELLIPSOID_SCALE
+        )
+        normalized = (points[:, 1:] - OBSTACLE_CENTER[1:]) / radii
+        radial_power = jnp.sum(
+            normalized**SUPERELLIPSOID_POWER, axis=-1
+        )
+        # This bounded form has the same zero boundary and feasible set as
+        # 1 - radial_power, but avoids enormous residuals and Jacobians far
+        # from the obstacle during SQP trial steps.
+        return 2.0 / (1.0 + radial_power) - 1.0
+
+    def constraints(x):
+        qpos = x[: nj + 7]
+        kinematics = mjx.make_data(model).replace(qpos=qpos)
+        kinematics = mjx.fwd_position(mjx_model, kinematics)
+        joint_positions = kinematics.xanchor[joint_ids]
+        feet = x[feet_start : feet_start + 3 * nc].reshape(nc, 3)
+
+        base_constraint = inflated_superellipse(
+            x[:3][None, :], BASE_CLEARANCE_RADIUS
+        )
+        joint_constraints = inflated_superellipse(
+            joint_positions, JOINT_CLEARANCE_RADIUS
+        )
+        foot_constraints = inflated_superellipse(feet, FOOT_CLEARANCE_RADIUS)
+        return jnp.concatenate(
+            [base_constraint, joint_constraints, foot_constraints]
+        )
+
+    return constraints
+
+
+def make_barrel_roll_constraints(reference, obstacle_constraints):
+    """Build hard timing, pose, obstacle, force, and airborne-end limits."""
 
     nj = config.n_joints
     waypoint_positions = reference["p"][PHASE_END_STEPS]
@@ -371,18 +467,35 @@ def make_barrel_roll_constraints(reference):
             cosine_limits - alignment,
             -jnp.ones_like(alignment),
         )
+        # Keep all phase-end rate constraints unchanged except at the terminal
+        # node: because this formulation intentionally ends while airborne, do
+        # not require the base linear velocity to be near zero at t == N.
+        waypoint_linear_speed_constraints = (
+            jnp.abs(dp)[None, :] - WAYPOINT_LINEAR_SPEED_LIMITS[:, None]
+        )
+        linear_speed_active = active & (PHASE_END_STEPS != config.N)
+        waypoint_linear_speed_constraints = jnp.where(
+            linear_speed_active[:, None],
+            waypoint_linear_speed_constraints,
+            -jnp.ones_like(waypoint_linear_speed_constraints),
+        )
+
+        waypoint_angular_speed_constraints = (
+            jnp.abs(omega)[None, :]
+            - WAYPOINT_ANGULAR_SPEED_LIMITS[:, None]
+        )
+        waypoint_angular_speed_constraints = jnp.where(
+            active[:, None],
+            waypoint_angular_speed_constraints,
+            -jnp.ones_like(waypoint_angular_speed_constraints),
+        )
+
         waypoint_rate_constraints = jnp.concatenate(
             [
-                jnp.abs(dp)[None, :] - WAYPOINT_LINEAR_SPEED_LIMITS[:, None],
-                jnp.abs(omega)[None, :]
-                - WAYPOINT_ANGULAR_SPEED_LIMITS[:, None],
+                waypoint_linear_speed_constraints,
+                waypoint_angular_speed_constraints,
             ],
             axis=1,
-        )
-        waypoint_rate_constraints = jnp.where(
-            active[:, None],
-            waypoint_rate_constraints,
-            -jnp.ones_like(waypoint_rate_constraints),
         )
 
         # Hard unilateral contact and friction cone. Inactive feet are omitted;
@@ -414,9 +527,11 @@ def make_barrel_roll_constraints(reference):
             -jnp.ones_like(contact_force_constraints),
         )
 
+        # The horizon terminates in midair, so the base may have nonzero
+        # translational velocity.  Keep the terminal attitude-rate and joint
+        # settling requirements, but do not impose a landing-speed condition.
         final_constraints = jnp.concatenate(
             [
-                jnp.abs(dp) - FINAL_LINEAR_SPEED,
                 jnp.abs(omega) - FINAL_ANGULAR_SPEED,
                 jnp.abs(q - terminal_joints) - FINAL_JOINT_POSITION_TOLERANCE,
                 jnp.abs(dq) - FINAL_JOINT_SPEED,
@@ -437,6 +552,7 @@ def make_barrel_roll_constraints(reference):
                 contact_force_constraints.reshape(-1),
                 final_constraints,
                 jnp.reshape(MIN_BASE_HEIGHT - x[2], (1,)),
+                obstacle_constraints(x),
             ]
         )
 
@@ -449,7 +565,7 @@ def make_phase_scaled_disturbance(n, magnitude=0.02):
     def disturbance_at_state(x, t):
         phase = phase_index(t)
         dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
-        diagonal = jnp.zeros(n, dtype=x.dtype).at[:3].set(magnitude * dt)
+        diagonal = jnp.zeros(n, dtype=x.dtype).at[:2].set(magnitude * dt)
         diagonal = diagonal.at[DURATION_SLICE].set(0.0)
         return jnp.diag(diagonal)
 
@@ -460,13 +576,149 @@ def make_phase_scaled_disturbance(n, magnitude=0.02):
     return disturbance
 
 
+
+def get_trajectory_tubes(Phi_x):
+    """Return the per-node, per-state SLS tube radius."""
+    return jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1)
+
+
+def rollout_zero_disturbance(dynamics, x0, U, parameter):
+    """Roll out the exact nonlinear dynamics with the optimized controls.
+
+    No disturbance is injected here.  This is therefore the open-loop nonlinear
+    rollout implied by x0 and U, and its deviation from the multiple-shooting
+    trajectory X measures nonlinear / shooting consistency rather than a
+    disturbance response.
+    """
+
+    def step(x, inputs):
+        u, t = inputs
+        x_next = dynamics(x, u, t, parameter)
+        return x_next, x_next
+
+    _, successors = jax.lax.scan(
+        step,
+        x0,
+        (U, jnp.arange(U.shape[0], dtype=jnp.int32)),
+    )
+    return jnp.concatenate([x0[None, :], successors], axis=0)
+
+
+def state_dimension_names():
+    """Human-readable labels for every augmented state dimension."""
+    nj = config.n_joints
+    nc = config.n_contact
+
+    names = [
+        "base_x", "base_y", "base_z",
+        "quat_w", "quat_x", "quat_y", "quat_z",
+    ]
+    names += [f"q_{i}" for i in range(nj)]
+    names += [
+        "v_x", "v_y", "v_z", "omega_x", "omega_y", "omega_z",
+    ]
+    names += [f"dq_{i}" for i in range(nj)]
+    names += [f"foot_{i}_{axis}" for i in range(nc) for axis in ("x", "y", "z")]
+    names += [f"grf_{i}_{axis}" for i in range(nc) for axis in ("x", "y", "z")]
+    names += [f"duration_{name}" for name in PHASE_NAMES]
+
+    if len(names) != config.n:
+        return [f"state_{i}" for i in range(config.n)]
+    return names
+
+
+def align_tubes_to_states(Phi_x, num_state_nodes):
+    """Align get_trajectory_tubes(Phi_x) with x_0, ..., x_N."""
+    tubes = get_trajectory_tubes(Phi_x)
+
+    if tubes.shape[0] == num_state_nodes:
+        return tubes
+    if tubes.shape[0] == num_state_nodes - 1:
+        # The initial state is fixed, so its disturbance tube is exactly zero.
+        return jnp.concatenate(
+            [jnp.zeros((1, tubes.shape[1]), dtype=tubes.dtype), tubes], axis=0
+        )
+
+    raise ValueError(
+        "Cannot align Phi_x tubes with the state trajectory: "
+        f"tube nodes={tubes.shape[0]}, state nodes={num_state_nodes}."
+    )
+
+
+def plot_zero_rollout_vs_tubes(
+    X_optimized,
+    X_rollout,
+    Phi_x,
+    phase_times,
+    output_path,
+):
+    """Plot |zero-disturbance nonlinear rollout - optimized X| vs tube radius.
+
+    Every augmented state dimension is placed in its own subplot, while all
+    subplots are saved into one PNG.
+    """
+    X_optimized_np = np.asarray(X_optimized)
+    X_rollout_np = np.asarray(X_rollout)
+    tubes_np = np.asarray(align_tubes_to_states(Phi_x, X_optimized_np.shape[0]))
+
+    if X_rollout_np.shape != X_optimized_np.shape:
+        raise ValueError(
+            f"Rollout shape {X_rollout_np.shape} does not match optimized "
+            f"trajectory shape {X_optimized_np.shape}."
+        )
+    if tubes_np.shape != X_optimized_np.shape:
+        raise ValueError(
+            f"Tube shape {tubes_np.shape} does not match state trajectory "
+            f"shape {X_optimized_np.shape}."
+        )
+
+    deviation = np.abs(X_rollout_np - X_optimized_np)
+    times = phase_node_times(phase_times)
+    names = state_dimension_names()
+
+    n_states = X_optimized_np.shape[1]
+    n_cols = 5
+    n_rows = int(np.ceil(n_states / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.6 * n_cols, 2.8 * n_rows),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for i, ax in enumerate(axes.flat):
+        if i >= n_states:
+            ax.axis("off")
+            continue
+
+        ax.plot(times, deviation[:, i], label="|rollout - optimized|")
+        ax.plot(times, tubes_np[:, i], "--", label="tube radius")
+        ax.set_title(f"{i}: {names[i]}", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        if i % n_cols == 0:
+            ax.set_ylabel("magnitude")
+        if i >= (n_rows - 1) * n_cols:
+            ax.set_xlabel("time [s]")
+
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2)
+    fig.suptitle(
+        "Zero-disturbance nonlinear rollout deviation vs. SLS tube size",
+        y=0.999,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.995))
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return deviation, tubes_np
+
 def unused_reference_generator(*args, **kwargs):
     del args, kwargs
     raise RuntimeError("This one-shot experiment supplies its reference directly.")
 
 
 def configure_problem():
-    """Configure the Go2 module for five free duration states."""
+    """Configure the Go2 module for six free duration states."""
 
     base_state = jnp.asarray(config.initial_state)[:PHYSICAL_N]
     config.n = PHYSICAL_N + NUM_PHASES
@@ -493,6 +745,8 @@ def configure_problem():
 
 
 def solve_barrel_roll(mpc, data, x0, reference, parameter):
+    """Solve the minimum-time problem directly from the nominal reference."""
+
     X_guess = build_initial_guess(x0, reference)
     U_guess = jnp.tile(config.u_ref, (config.N, 1))
 
@@ -531,30 +785,68 @@ def solve_barrel_roll(mpc, data, x0, reference, parameter):
         projected_grf.reshape(config.N, -1)
     )
 
-    return mpc._solve(
-        reference,
-        parameter,
-        data.W,
-        x0,
-        X_guess,
-        U_guess,
+    def run_solver(W, X, U, workspace):
+        (
+            V,
+            w,
+            y,
+            rho,
+            rho_grad,
+            backoffs,
+            Phi_x,
+            Phi_u,
+            beta,
+            mu,
+            Phi_x_I,
+            Phi_u_I,
+            a,
+            b,
+            converged_admm,
+        ) = workspace
+        return mpc._solve(
+            reference,
+            parameter,
+            W,
+            x0,
+            X,
+            U,
+            V,
+            w,
+            y,
+            rho,
+            rho_grad,
+            mpc.obstacles,
+            backoffs,
+            beta,
+            mu,
+            Phi_x,
+            Phi_u,
+            Phi_x_I,
+            Phi_u_I,
+            a,
+            b,
+            converged_admm,
+        )
+
+    initial_workspace = (
         data.V0,
         data.w,
         data.y,
         data.rho,
         data.rho_grad,
-        mpc.obstacles,
         data.h_ct_ws,
-        data.beta_ws,
-        data.mu_ws,
         data.Phi_x_ws,
         data.Phi_u_ws,
+        data.beta_ws,
+        data.mu_ws,
         data.Phi_x_I_ws,
         data.Phi_u_I_ws,
         data.a,
         data.b,
         data.converged_admm,
     )
+
+    return run_solver(data.W, X_guess, U_guess, initial_workspace)
 
 
 def phase_node_times(phase_times):
@@ -632,11 +924,15 @@ def dry_run(reference, parameter, constraints):
     constraint_shape = jax.eval_shape(
         constraints, x0, U0[0], jnp.asarray(0)
     ).shape
-    print("Barrel-roll minimum-time setup is valid.")
+    print("Obstacle barrel-roll minimum-time setup is valid.")
     print(f"State/control dimensions: {config.n}/{config.nu}")
     print(f"Reference/parameter shapes: {reference['p'].shape}/{parameter.shape}")
     print(f"Initial guess shape: {X0.shape}")
     print(f"Constraint count per node: {constraint_shape[0]}")
+    print(
+        "Obstacle center/size: "
+        f"{np.asarray(OBSTACLE_CENTER)} / {np.asarray(OBSTACLE_SIZE)} m"
+    )
     print("Nominal phase times:")
     for name, duration, intervals in zip(
         PHASE_NAMES, NOMINAL_DURATIONS, SEGMENT_LENGTHS
@@ -650,14 +946,15 @@ def dry_run(reference, parameter, constraints):
 def main(*, dry_run_only=False, output_dir=DIR_PATH):
     configure_problem()
     reference, parameter = build_barrel_roll_reference()
-    constraints = make_barrel_roll_constraints(reference)
+    obstacle_constraints = make_obstacle_clearance_constraints()
+    constraints = make_barrel_roll_constraints(reference, obstacle_constraints)
 
     if dry_run_only:
         dry_run(reference, parameter, constraints)
         return
 
     admm_config = ADMMConfig(
-        eps_abs=5.0e-2,
+        eps_abs=1.0e-1,
         eps_rel=1.0e-3,
         rho_max=1.0e6,
         max_iterations=1000,
@@ -669,15 +966,15 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     sls_config = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1.0e-2,
-        enable_fastsls=False,
+        enable_fastsls=True,
         initialize_nominal=True,
-        max_initial_sqp_iterations=25,
+        max_initial_sqp_iterations=50,
         warm_start=True,
         rti=False,
         gradient_window=0,
     )
     sqp_config = SQPConfig(
-        max_sqp_iterations=3,
+        max_sqp_iterations=50,
         warm_start=True,
         feas_tol=1.0e-5,
         step_tol=1.0e-5,
@@ -716,6 +1013,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     start = timer()
     result = solve_barrel_roll(mpc, data, x0, reference, parameter)
     X, U = result[:2]
+    Phi_x = result[8]
     converged_admm = result[-1]
     X.block_until_ready()
     solve_time = timer() - start
@@ -729,6 +1027,26 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         mpc.dynamics, X, U, parameter
     )
     position_errors, angle_errors = waypoint_diagnostics(reference, X)
+    obstacle_values = jax.vmap(obstacle_constraints)(X)
+    max_obstacle_violation = float(jnp.max(jnp.maximum(obstacle_values, 0.0)))
+    max_base_obstacle_violation = float(
+        jnp.max(jnp.maximum(obstacle_values[:, 0], 0.0))
+    )
+    max_joint_obstacle_violation = float(
+        jnp.max(jnp.maximum(obstacle_values[:, 1 : 1 + len(LEG_JOINT_NAMES)], 0.0))
+    )
+    max_foot_obstacle_violation = float(
+        jnp.max(
+            jnp.maximum(obstacle_values[:, 1 + len(LEG_JOINT_NAMES) :], 0.0)
+        )
+    )
+    is_feasible = bool(
+        np.isfinite(max_violation)
+        and np.isfinite(max_dynamics_defect)
+        and max_violation <= FEASIBILITY_TOLERANCE
+        and max_dynamics_defect <= DYNAMICS_TOLERANCE
+        and max_obstacle_violation <= OBSTACLE_TOLERANCE
+    )
 
     print(f"Solve time: {solve_time:.3f} s")
     print("Optimized phase times:")
@@ -746,6 +1064,14 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         f"{max_dynamics_defect:.6e} at transition {defect_node}, "
         f"state {defect_state}"
     )
+    print(f"Maximum obstacle violation: {max_obstacle_violation:.6e}")
+    print(
+        "Base/joint/foot obstacle violations: "
+        f"{max_base_obstacle_violation:.6e} / "
+        f"{max_joint_obstacle_violation:.6e} / "
+        f"{max_foot_obstacle_violation:.6e}"
+    )
+    print(f"Trajectory feasible: {is_feasible}")
     print("Phase-end waypoint errors:")
     for name, position_error, angle_error in zip(
         PHASE_NAMES, position_errors, angle_errors
@@ -757,11 +1083,31 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    result_path = output_dir / "quadruped_barrel_roll_min_time.npz"
+
+    X_rollout = rollout_zero_disturbance(mpc.dynamics, X[0], U, parameter)
+    X_rollout.block_until_ready()
+    rollout_plot_path = output_dir / "quadruped_barrel_roll_zero_rollout_vs_tubes.png"
+    rollout_deviation, trajectory_tubes = plot_zero_rollout_vs_tubes(
+        X,
+        X_rollout,
+        Phi_x,
+        phase_times,
+        rollout_plot_path,
+    )
+    print(f"Saved zero-disturbance rollout/tube plot: {rollout_plot_path}")
+    print(
+        "Maximum zero-disturbance rollout deviation: "
+        f"{float(np.max(rollout_deviation)):.6e}"
+    )
+
+    result_path = output_dir / "quadruped_barrel_roll_obstacle_min_time.npz"
     np.savez(
         result_path,
         X=np.asarray(X),
         U=np.asarray(U),
+        X_zero_disturbance_rollout=np.asarray(X_rollout),
+        zero_rollout_deviation=np.asarray(rollout_deviation),
+        trajectory_tubes=np.asarray(trajectory_tubes),
         phase_names=np.asarray(PHASE_NAMES),
         phase_end_steps=np.asarray(PHASE_END_STEPS),
         phase_times=phase_times,
@@ -770,9 +1116,23 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         max_dynamics_defect=np.asarray(max_dynamics_defect),
         waypoint_position_errors=position_errors,
         waypoint_orientation_errors_deg=angle_errors,
-        reference_version=np.asarray(3),
+        obstacle_center=np.asarray(OBSTACLE_CENTER),
+        obstacle_size=np.asarray(OBSTACLE_SIZE),
+        max_obstacle_violation=np.asarray(max_obstacle_violation),
+        max_base_obstacle_violation=np.asarray(max_base_obstacle_violation),
+        max_joint_obstacle_violation=np.asarray(max_joint_obstacle_violation),
+        max_foot_obstacle_violation=np.asarray(max_foot_obstacle_violation),
+        lateral_displacement=np.asarray(LATERAL_DISPLACEMENT),
+        feasible=np.asarray(is_feasible),
+        admm_converged=np.asarray(bool(np.asarray(converged_admm))),
+        reference_version=np.asarray(4),
     )
-    print(f"Saved feasible trajectory: {result_path}")
+    print(f"Saved trajectory: {result_path}")
+    if not is_feasible:
+        print(
+            "WARNING: trajectory exceeds the configured feasibility "
+            "tolerances; do not treat it as a valid motion plan."
+        )
 
 
 if __name__ == "__main__":

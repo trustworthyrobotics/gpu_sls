@@ -407,15 +407,20 @@ def reference_barell_roll(N,dt,n_joints,n_contact,foot0,q0):
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
 def reference_barrel_roll_min_time(N, dt, n_joints, n_contact, foot0, q0):
-    """Six-phase barrel-roll reference with a staged, low-rate landing."""
+    """Six-phase barrel-roll reference with a contact-free ending.
+
+    The post-roll phases retain their base and joint-position references, but
+    all feet remain inactive after liftoff so they do not impose contact
+    kinematics, GRFs, or friction constraints.
+    """
 
     del n_joints
     counts = (
         int(0.20 / dt),  # stance
         int(0.20 / dt),  # lateral launch
-        int(0.24 / dt),  # flight
-        int(0.06 / dt),  # opposite-side pre-landing contact
-        int(0.10 / dt),  # full touchdown
+        int(0.24 / dt),  # rolling flight
+        int(0.06 / dt),  # post-roll flight
+        int(0.10 / dt),  # terminal posture transition
     )
     n1, n2, n3, n4, n5 = counts
     n6 = N - sum(counts)
@@ -539,9 +544,8 @@ def reference_barrel_roll_min_time(N, dt, n_joints, n_contact, foot0, q0):
         axis=0,
     )
 
-    # Extend the legs while they are pushing against the ground, tuck only
-    # after liftoff, extend for first contact, absorb in a crouch, and return
-    # to nominal stance during settle.
+    # Preserve the existing landing-shaped posture references even though the
+    # feet stay in flight.  These are pose targets only, not contact commands.
     launch_q = jnp.tile(jnp.array([0.0, 0.55, -1.10]), n_contact)
     tuck_q = jnp.tile(jnp.array([0.0, 1.25, -2.45]), n_contact)
     landing_q = jnp.tile(jnp.array([0.0, 1.10, -2.10]), n_contact)
@@ -566,9 +570,7 @@ def reference_barrel_roll_min_time(N, dt, n_joints, n_contact, foot0, q0):
         [
             jnp.ones((n1, n_contact)),
             jnp.tile(jnp.array([0, 1, 0, 1]), (n2, 1)),
-            jnp.zeros((n3, n_contact)),
-            jnp.tile(jnp.array([1, 0, 1, 0]), (n4, 1)),
-            jnp.ones((n5 + n6, n_contact)),
+            jnp.zeros((n3 + n4 + n5 + n6, n_contact)),
         ],
         axis=0,
     )

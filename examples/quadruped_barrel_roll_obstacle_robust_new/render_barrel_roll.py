@@ -1,11 +1,11 @@
-"""Render the nonlinear dynamics rollout from the barrel-roll tube experiment.
+"""Render a minimum-time quadruped barrel roll over a central hurdle.
 
-The renderer visualizes X_rollout saved by the rollout-vs-tube experiment.
-It uses the saved physical node times, interpolates between shooting nodes,
-and applies quaternion SLERP to keep the roll smooth.
+The renderer visualizes the optimized state trajectory saved by
+quadruped_barrel_roll.py. It uses the saved physical node times, interpolates
+between shooting nodes, and applies quaternion SLERP to keep the roll smooth.
 
 Example:
-    python render_barrel_rollout.py quadruped_barrel_roll_obstacle_min_time_rollout_tube_test.npz
+    python render_barrel_roll.py quadruped_barrel_roll_obstacle_min_time.npz
 """
 
 from __future__ import annotations
@@ -26,10 +26,9 @@ import numpy as np
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "quadruped_barrel_roll_obstacle_min_time_rollout_tube_test.npz"
+DEFAULT_INPUT = SCRIPT_DIR / "quadruped_barrel_roll_obstacle_min_time.npz"
 DEFAULT_OBSTACLE_CENTER = np.array([0.0, -0.30, 0.08])
 DEFAULT_OBSTACLE_SIZE = np.array([0.80, 0.05, 0.16])
-AIRBORNE_PHASE_NAMES = ("stance", "lateral_launch", "flight")
 
 
 def resolve_model_path(model_path: Path | None) -> Path:
@@ -88,56 +87,27 @@ def reconstruct_node_times(
 def load_trajectory(
     filename: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load X_rollout, timing, and obstacle geometry from the rollout experiment."""
+    """Load trajectory timing and obstacle geometry from an experiment NPZ."""
 
     filename = filename.expanduser().resolve()
     if not filename.is_file():
         raise FileNotFoundError(f"Trajectory file does not exist: {filename}")
 
     with np.load(filename, allow_pickle=False) as result:
-        if "X_rollout" not in result:
-            available = ", ".join(result.files)
-            raise ValueError(
-                f"{filename} does not contain X_rollout. "
-                f"Available arrays: {available}"
-            )
-        rollout_key = (
-            "X_disturbed_rollout"
-            if "X_disturbed_rollout" in result
-            else "X_rollout"
-        )
-        states = np.asarray(result[rollout_key], dtype=np.float64)
+        if "X" not in result:
+            raise ValueError(f"{filename} does not contain an X trajectory.")
+        states = np.asarray(result["X"], dtype=np.float64)
         if states.ndim != 2 or states.shape[0] < 2:
-            raise ValueError(
-                "X_rollout must have shape (N + 1, nx) with N >= 1."
-            )
+            raise ValueError("X must have shape (N + 1, nx) with N >= 1.")
         if "phase_times" not in result:
             raise ValueError(f"{filename} does not contain phase_times.")
-        phase_times = np.asarray(
-            result["phase_times"], dtype=np.float64
-        ).reshape(-1)
-        if phase_times.size == 5:
+        phase_times = np.asarray(result["phase_times"], dtype=np.float64)
+        if phase_times.size != 6:
             raise ValueError(
                 "This is a legacy five-phase trajectory with the known "
                 "touchdown artifact. Re-run quadruped_barrel_roll.py to "
-                "generate the current three-phase airborne result before "
-                "rendering."
+                "generate the corrected six-phase result before rendering."
             )
-        if phase_times.size not in (3, 6):
-            raise ValueError(
-                "Unsupported barrel-roll phase layout: expected the current "
-                "three-phase airborne format or the historical corrected "
-                f"six-phase format, but found {phase_times.size} phases."
-            )
-        if phase_times.size == 3 and "phase_names" in result:
-            phase_names = tuple(
-                str(name) for name in np.asarray(result["phase_names"]).reshape(-1)
-            )
-            if phase_names != AIRBORNE_PHASE_NAMES:
-                raise ValueError(
-                    "The three-phase trajectory must use phases "
-                    f"{AIRBORNE_PHASE_NAMES}; found {phase_names}."
-                )
 
         if "node_times" in result:
             node_times = np.asarray(result["node_times"], dtype=np.float64)
@@ -318,7 +288,7 @@ def render_video(
     model = mujoco.MjModel.from_xml_path(str(model_path))
     if states.shape[1] < model.nq + model.nv:
         raise ValueError(
-            f"X_rollout has {states.shape[1]} columns, but model nq + nv is "
+            f"X has {states.shape[1]} columns, but model nq + nv is "
             f"{model.nq + model.nv}."
         )
 
@@ -413,7 +383,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=None,
-        help="Output MP4 path; defaults to <trajectory>_rollout.mp4.",
+        help="Output MP4 path; defaults to the trajectory name with .mp4.",
     )
     parser.add_argument(
         "--model",
@@ -441,9 +411,7 @@ def main() -> None:
     output_path = (
         args.output.expanduser().resolve()
         if args.output is not None
-        else trajectory_path.with_name(
-            trajectory_path.stem + "_rollout.mp4"
-        )
+        else trajectory_path.with_suffix(".mp4")
     )
     states, node_times, phase_times, obstacle_center, obstacle_size = (
         load_trajectory(trajectory_path)
@@ -465,7 +433,7 @@ def main() -> None:
         obstacle_size=obstacle_size,
     )
 
-    print(f"Loaded rollout trajectory: {trajectory_path}")
+    print(f"Loaded trajectory: {trajectory_path}")
     print(f"Model: {model_path}")
     print(f"Phase times: {phase_times}")
     print(f"Duration: {node_times[-1]:.6f} s")

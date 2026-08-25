@@ -628,7 +628,11 @@ def previous_state_windows(
 
     return x_window, valid
 
-def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, rho_grad, Jh, a, b, L):
+def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, rho_grad, Jh, a, b, L, just_nominal=False):
+    # Runtime JAX boolean. Keep this dynamic (do not make it a static JIT arg)
+    # so callers can switch between nominal initialization and robust solves.
+    just_nominal = jnp.asarray(just_nominal, dtype=jnp.bool_)
+
     rho_max = cfg.rho_max
     T = A.shape[0] + 1
     window_mask = make_gradient_window_mask(T, L, A.dtype)
@@ -678,16 +682,44 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         )
         u_bar = jnp.pad(u_stage, ((0, 1), (0, 0)))
 
-        # -------- Project onto constraint set -------- 
-        z_bar = jnp.einsum('tmi,ti->tm', C, x_bar) + jnp.einsum('tmi,ti->tm', D, u_bar)
-        x_window, valid = previous_state_windows(x_bar, L)
-        z_grad = jnp.einsum("kcln,kln->klc", Jh, x_window)
-        w_new, a_new = project(z_bar + y_bar, z_grad + b_prev, f, rho, rho_grad, window_mask)
-        # jax.debug.print("{}", a_new)
+        # -------- Project onto constraint set --------
+        z_bar = (
+            jnp.einsum('tmi,ti->tm', C, x_bar)
+            + jnp.einsum('tmi,ti->tm', D, u_bar)
+        )
 
-        # # -------- Dual update (scaled form) -------- 
+        def nominal_projection(_):
+            # During nominal initialization, keep the ordinary nominal split
+            # z_bar <= f, but completely disable the gradient split.
+            w_new = jnp.minimum(z_bar + y_bar, f)
+            z_grad = jnp.zeros_like(a_prev)
+            a_new = a_prev
+            b_new = b_prev
+            return w_new, a_new, b_new, z_grad
+
+        def robust_projection(_):
+            x_window, _ = previous_state_windows(x_bar, L)
+            z_grad = jnp.einsum("kcln,kln->klc", Jh, x_window)
+            w_new, a_new = project(
+                z_bar + y_bar,
+                z_grad + b_prev,
+                f,
+                rho,
+                rho_grad,
+                window_mask,
+            )
+            b_new = b_prev + window_mask[:, :, None] * (z_grad - a_new)
+            return w_new, a_new, b_new, z_grad
+
+        w_new, a_new, b_new, z_grad = lax.cond(
+            just_nominal,
+            nominal_projection,
+            robust_projection,
+            operand=None,
+        )
+
+        # Nominal dual update remains active in both modes.
         y_new = y_bar + (z_bar - w_new)
-        b_new = b_prev + window_mask[:, :, None] * (z_grad - a_new)
 
         # -------- Termination + Rho/Cache Update -------- 
         rp_norm, rd_norm, eps_pri, eps_dual, rp_grad_norm, rd_grad_norm, eps_grad_pri, eps_grad_dual = admm_residuals(
@@ -732,7 +764,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
             & (rd_grad_norm <= eps_grad_dual)
         )
 
-        converged = nominal_converged & gradient_converged
+        # Gradient residuals are irrelevant during nominal initialization.
+        converged = nominal_converged & (just_nominal | gradient_converged)
         do_rho_update = (it % cfg.rho_update_frequency) == 0
 
         def update_fn(_):
@@ -744,12 +777,23 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
                 rho_max,
             )
             if L > 0:
-                rho_grad_upd, b_upd, updated_grad = rho_update_scaled_duals(
-                    rp_grad_norm,
-                    rd_grad_norm,
-                    rho_grad,
-                    b_new,
-                    rho_max,
+                def update_gradient_rho(_):
+                    return rho_update_scaled_duals(
+                        rp_grad_norm,
+                        rd_grad_norm,
+                        rho_grad,
+                        b_new,
+                        rho_max,
+                    )
+
+                def skip_gradient_rho(_):
+                    return rho_grad, b_new, jnp.array(False)
+
+                rho_grad_upd, b_upd, updated_grad = lax.cond(
+                    just_nominal,
+                    skip_gradient_rho,
+                    update_gradient_rho,
+                    operand=None,
                 )
             else:
                 rho_grad_upd = rho_grad
@@ -785,11 +829,22 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
             Q, q, R, r, M, C, D, w_new, y_new, rho_new, CtC, DtD, CtD
         )
-        tilde_Q, tilde_q = admm_augment_ct_grad(
-            tilde_Q, tilde_q,
-            a_new, b_new,
-            rho_grad_new,
-            Jh, window_mask
+        def add_gradient_augmentation(_):
+            return admm_augment_ct_grad(
+                tilde_Q, tilde_q,
+                a_new, b_new,
+                rho_grad_new,
+                Jh, window_mask
+            )
+
+        def skip_gradient_augmentation(_):
+            return tilde_Q, tilde_q
+
+        tilde_Q, tilde_q = lax.cond(
+            just_nominal,
+            skip_gradient_augmentation,
+            add_gradient_augmentation,
+            operand=None,
         )
 
         def cache_update(_):
@@ -826,8 +881,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     n = Q.shape[1]
     nx = Q.shape[-1]
     nu = R.shape[-1]
-    # f = f - cfg.eps_abs
-    f = f
+    f = f - cfg.eps_abs
+    # f = f
     R = jnp.concatenate([R, jnp.zeros((1, nu, nu), dtype=R.dtype)], axis=0)
     r = jnp.concatenate([r, jnp.zeros((1, nu), dtype=r.dtype)], axis=0)
     M = jnp.concatenate([M, jnp.zeros((1, nx, nu), dtype=M.dtype)], axis=0)
@@ -846,8 +901,19 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
         Q, q, R, r, M, C, D, init_w, init_y, rho0, CtC, DtD, CtD
     )
-    tilde_Q, tilde_q = admm_augment_ct_grad(
-        tilde_Q, tilde_q, init_a, init_b, rho_grad0, Jh, window_mask,
+    def add_initial_gradient_augmentation(_):
+        return admm_augment_ct_grad(
+            tilde_Q, tilde_q, init_a, init_b, rho_grad0, Jh, window_mask,
+        )
+
+    def skip_initial_gradient_augmentation(_):
+        return tilde_Q, tilde_q
+
+    tilde_Q, tilde_q = lax.cond(
+        just_nominal,
+        skip_initial_gradient_augmentation,
+        add_initial_gradient_augmentation,
+        operand=None,
     )
 
     elems_acp, BRinv, MRinv = generate_leaf(tilde_Q, tilde_R, tilde_M, A, B)
@@ -963,19 +1029,19 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         worst_constraint,
     ]
 
-    # jax.debug.print(
-    #     "\nWorst constraint violation:"
-    #     "\n  timestep index   = {}"
-    #     "\n  constraint index = {}"
-    #     "\n  violation        = {:.6e}"
-    #     "\n  lhs              = {:.6e}"
-    #     "\n  rhs              = {:.6e}",
-    #     worst_stage,
-    #     worst_constraint,
-    #     worst_violation,
-    #     z_final[worst_stage, worst_constraint],
-    #     f[worst_stage, worst_constraint],
-    # )
+    jax.debug.print(
+        "\nWorst constraint violation:"
+        "\n  timestep index   = {}"
+        "\n  constraint index = {}"
+        "\n  violation        = {:.6e}"
+        "\n  lhs              = {:.6e}"
+        "\n  rhs              = {:.6e}",
+        worst_stage,
+        worst_constraint,
+        worst_violation,
+        z_final[worst_stage, worst_constraint],
+        f[worst_stage, worst_constraint],
+    )
 
     mu = rho_final * y_bar
 
