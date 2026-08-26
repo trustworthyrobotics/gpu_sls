@@ -624,7 +624,7 @@ def main(*, gradient_window: int = 0, output_dir: Path | str = Path(".")):
     # -----------------------------
     admm_cfg = ADMMConfig(
         eps_abs=2e-2,
-        eps_rel=1e-3,
+        eps_rel=5e-4,
         eps_abs_grad=1e-2,
         eps_rel_grad=1e-3,
         rho_max=1e3,

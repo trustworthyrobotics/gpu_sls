@@ -559,18 +559,95 @@ def make_barrel_roll_constraints(reference, obstacle_constraints):
     return constraints
 
 
-def make_phase_scaled_disturbance(n, magnitude=0.02):
-    """Disturb base position, scaled by the optimized phase timestep."""
+# def make_phase_scaled_disturbance(n, magnitude=0.02):
+#     """Disturb base position, scaled by the optimized phase timestep."""
+
+#     def disturbance_at_state(x, t):
+#         phase = phase_index(t)
+#         dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
+#         diagonal = jnp.zeros(n, dtype=x.dtype).at[:2].set(magnitude * dt)
+#         diagonal = diagonal.at[DURATION_SLICE].set(0.0)
+#         return jnp.diag(diagonal)
+
+#     def disturbance(X):
+#         return jax.vmap(disturbance_at_state)(X, jnp.arange(X.shape[0]))
+
+#     disturbance.at_state = disturbance_at_state
+#     return disturbance
+
+def make_phase_scaled_disturbance(
+    n,
+    position_magnitude=0.02,
+    velocity_magnitude=0.05,
+    joint_velocity_magnitude=0.05,
+):
+    """
+    Disturb:
+        base x, y
+        base vx, vy
+        all joint velocities dq
+
+    Do not disturb:
+        base z
+        quaternion
+        joint angles
+        base vz
+        angular velocity
+        feet
+        GRFs
+        phase durations
+    """
+
+    nj = config.n_joints
+
+    # State layout:
+    #
+    # [0:3]               base position
+    # [3:7]               quaternion
+    # [7:7+nj]            joint angles
+    # [7+nj:13+nj]        vx, vy, vz, wx, wy, wz
+    # [13+nj:13+2*nj]     joint velocities dq
+    # ...
+
+    vel_start = 7 + nj
+    joint_vel_start = 13 + nj
 
     def disturbance_at_state(x, t):
         phase = phase_index(t)
         dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
-        diagonal = jnp.zeros(n, dtype=x.dtype).at[:2].set(magnitude * dt)
-        diagonal = diagonal.at[DURATION_SLICE].set(0.0)
+
+        diagonal = jnp.zeros(n, dtype=x.dtype)
+
+        # Horizontal base position.
+        diagonal = diagonal.at[0].set(
+            position_magnitude * dt
+        )
+        diagonal = diagonal.at[1].set(
+            position_magnitude * dt
+        )
+
+        # Horizontal base velocity.
+        diagonal = diagonal.at[vel_start + 0].set(
+            velocity_magnitude * dt
+        )
+        diagonal = diagonal.at[vel_start + 1].set(
+            velocity_magnitude * dt
+        )
+
+        # All joint velocities.
+        diagonal = diagonal.at[
+            joint_vel_start : joint_vel_start + nj
+        ].set(
+            joint_velocity_magnitude * dt
+        )
+
         return jnp.diag(diagonal)
 
     def disturbance(X):
-        return jax.vmap(disturbance_at_state)(X, jnp.arange(X.shape[0]))
+        return jax.vmap(disturbance_at_state)(
+            X,
+            jnp.arange(X.shape[0]),
+        )
 
     disturbance.at_state = disturbance_at_state
     return disturbance
@@ -954,7 +1031,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
-        eps_abs=1.0e-1,
+        eps_abs=1.0e-2,
         eps_rel=1.0e-3,
         rho_max=1.0e6,
         max_iterations=1000,
@@ -979,7 +1056,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         feas_tol=1.0e-5,
         step_tol=1.0e-5,
         line_search=True,
-        lm_regularization=1.0e-2,
+        lm_regularization=5.0e-2,
     )
     mpc = mpc_wrapper.MPCWrapper(
         config,

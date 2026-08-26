@@ -1010,38 +1010,38 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     #
     # violation > 0 means constraint is violated
     # ---------------------------------------------------------
-    z_final = (
-        jnp.einsum("tmi,ti->tm", C, x_bar)
-        + jnp.einsum("tmi,ti->tm", D, u_bar)
-    )
+    # z_final = (
+    #     jnp.einsum("tmi,ti->tm", C, x_bar)
+    #     + jnp.einsum("tmi,ti->tm", D, u_bar)
+    # )
 
-    constraint_residual = z_final - f
-    constraint_violation = jnp.maximum(constraint_residual, 0.0)
+    # constraint_residual = z_final - f
+    # constraint_violation = jnp.maximum(constraint_residual, 0.0)
 
-    worst_flat_idx = jnp.argmax(constraint_violation)
-    worst_stage, worst_constraint = jnp.unravel_index(
-        worst_flat_idx,
-        constraint_violation.shape,
-    )
+    # worst_flat_idx = jnp.argmax(constraint_violation)
+    # worst_stage, worst_constraint = jnp.unravel_index(
+    #     worst_flat_idx,
+    #     constraint_violation.shape,
+    # )
 
-    worst_violation = constraint_violation[
-        worst_stage,
-        worst_constraint,
-    ]
+    # worst_violation = constraint_violation[
+    #     worst_stage,
+    #     worst_constraint,
+    # ]
 
-    jax.debug.print(
-        "\nWorst constraint violation:"
-        "\n  timestep index   = {}"
-        "\n  constraint index = {}"
-        "\n  violation        = {:.6e}"
-        "\n  lhs              = {:.6e}"
-        "\n  rhs              = {:.6e}",
-        worst_stage,
-        worst_constraint,
-        worst_violation,
-        z_final[worst_stage, worst_constraint],
-        f[worst_stage, worst_constraint],
-    )
+    # jax.debug.print(
+    #     "\nWorst constraint violation:"
+    #     "\n  timestep index   = {}"
+    #     "\n  constraint index = {}"
+    #     "\n  violation        = {:.6e}"
+    #     "\n  lhs              = {:.6e}"
+    #     "\n  rhs              = {:.6e}",
+    #     worst_stage,
+    #     worst_constraint,
+    #     worst_violation,
+    #     z_final[worst_stage, worst_constraint],
+    #     f[worst_stage, worst_constraint],
+    # )
 
     mu = rho_final * y_bar
 
