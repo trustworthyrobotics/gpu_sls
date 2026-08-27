@@ -84,7 +84,7 @@ MAX_DURATIONS = 2.00 * NOMINAL_DURATIONS
 # A much larger weight makes the first SQP model drive every duration toward
 # its lower bound before the nonlinear dynamics and waypoint constraints have
 # become feasible, which stalls convergence at a heavily infeasible rollout.
-TIME_WEIGHT = 1e4
+TIME_WEIGHT = 1e2
 # The constraint vector mixes meters/radians with force limits, while the
 # dynamics vector also contains algebraic GRF states measured in newtons.
 # These tolerances correspond to 5 cm/rad for generic constraints and 0.25 N
@@ -635,11 +635,11 @@ def make_phase_scaled_disturbance(
         )
 
         # All joint velocities.
-        diagonal = diagonal.at[
-            joint_vel_start : joint_vel_start + nj
-        ].set(
-            joint_velocity_magnitude * dt
-        )
+        # diagonal = diagonal.at[
+        #     joint_vel_start : joint_vel_start + nj
+        # ].set(
+        #     joint_velocity_magnitude * dt
+        # )
 
         return jnp.diag(diagonal)
 
@@ -1031,27 +1031,27 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
-        eps_abs=1.0e-2,
+        eps_abs=1.0e-3,
         eps_rel=1.0e-3,
         rho_max=1.0e6,
-        max_iterations=1000,
+        max_iterations=3000,
         rho_update_frequency=25,
-        initial_rho=1.0,
+        initial_rho=25.0,
         regularized_rho_update=False,
         num_phases=NUM_PHASES,
     )
     sls_config = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1.0e-2,
-        enable_fastsls=True,
+        enable_fastsls=False,
         initialize_nominal=True,
-        max_initial_sqp_iterations=50,
+        max_initial_sqp_iterations=200,
         warm_start=True,
         rti=False,
         gradient_window=0,
     )
     sqp_config = SQPConfig(
-        max_sqp_iterations=50,
+        max_sqp_iterations=0,
         warm_start=True,
         feas_tol=1.0e-5,
         step_tol=1.0e-5,

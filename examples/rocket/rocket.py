@@ -623,12 +623,12 @@ def main(*, gradient_window: int = 0, output_dir: Path | str = Path(".")):
     # Solver configs
     # -----------------------------
     admm_cfg = ADMMConfig(
-        eps_abs=2e-2,
+        eps_abs=5e-2,
         eps_rel=1e-3,
         eps_abs_grad=1e-2,
         eps_rel_grad=1e-3,
         rho_max=1e3,
-        max_iterations=1000,
+        max_iterations=400,
         rho_update_frequency=25,
         initial_rho=1e-2,
         regularized_rho_update=False,

@@ -436,9 +436,6 @@ def compute_search_direction(
         )
     )
 
-    Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[-1]), Q.shape).at[..., 0, 0].set(5.0)
-    R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]) * 0.5, R.shape)
-
     n_obs = obstacles.shape[0]
 
     def run_nominal(_):

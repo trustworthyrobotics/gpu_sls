@@ -26,6 +26,7 @@ if not os.environ.get("DISPLAY"):
 import jax
 import jax.numpy as jnp
 import mujoco
+import matplotlib.pyplot as plt
 import numpy as np
 from mujoco import mjx
 from mujoco.mjx._src import math
@@ -37,31 +38,16 @@ from gpu_sls.gpu_sls import SLSConfig
 from gpu_sls.gpu_sqp import SQPConfig
 import mpx.utils.sim as sim_utils
 
-cache_dir = Path.home() / ".cache" / "jax_gpu_sls"
-cache_dir.mkdir(parents=True, exist_ok=True)
-
-jax.config.update(
-    "jax_compilation_cache_dir",
-    str(cache_dir),
-)
-jax.config.update(
-    "jax_persistent_cache_min_entry_size_bytes",
-    -1,
-)
-jax.config.update(
-    "jax_persistent_cache_min_compile_time_secs",
-    0,
-)
-jax.config.update(
-    "jax_persistent_cache_enable_xla_caches",
-    "all",
-)
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 CONTACT_POSITION_GAIN = 200.0
 CONTACT_VELOCITY_GAIN = 30.0
 
 PHASE_NAMES = (
-    "crouch", "launch", "flight_early", "flight_late", "landing", "settle",
+    "crouch", "launch", "flight_early", "flight_late",
+    "landing_approach", "preimpact_float",
 )
 
 # Six phases are enough to express the task.  Removing the stand/prelanding/
@@ -119,9 +105,12 @@ TORQUE_LIMIT = jnp.array([
 # shapes the rest of the backflip, while hard constraints only encode the
 # topology of the motion: upside-down in flight, translated landing, and a
 # settled terminal pose.
-WAYPOINT_POSITION_ACTIVE = jnp.array([False, False, True, False, True, True])
+# With no landing contact, node 44 is only a visual approach waypoint.  Do not
+# hard-constrain its position/rate: braking a floating base without an external
+# contact force would make the direct solve unnecessarily restrictive.
+WAYPOINT_POSITION_ACTIVE = jnp.array([False, False, True, False, False, True])
 WAYPOINT_ORIENTATION_ACTIVE = jnp.array([False, False, True, False, False, True])
-WAYPOINT_RATE_ACTIVE = jnp.array([False, False, False, False, True, True])
+WAYPOINT_RATE_ACTIVE = jnp.array([False, False, False, False, False, False])
 
 WAYPOINT_POSITION_HALF_WIDTHS = jnp.array([
     [0.25, 0.15, 0.20],
@@ -148,6 +137,9 @@ FINAL_JOINT_SPEED = 2.0
 FINAL_JOINT_POSITION_TOLERANCE = 0.25
 MAX_JOINT_SPEED = 50.0
 MIN_BASE_HEIGHT = 0.43
+# Terminal pose is intentionally pre-impact: the feet finish slightly above the
+# floor and the contact schedule remains zero through the landing approach.
+FLOAT_CLEARANCE = 0.05
 FRICTION_COEFFICIENT = 0.7
 MAX_NORMAL_FORCE = 900.0
 TANGENTIAL_FORCE_SMOOTHING = 1.0e-4
@@ -467,6 +459,29 @@ def build_backflip_reference():
         jnp.where((nodes > takeoff) & (nodes <= landing_start), air_z, p_ref[:, 2])
     )
 
+    # After the flip, approach a visually landed pose that remains slightly above
+    # the floor.  This is a reference only; there is deliberately no contact
+    # stabilization or GRF during this interval.
+    floating_height = standing_height + FLOAT_CLEARANCE
+    landing_alpha = jnp.clip(
+        (nodes - landing_start) / max(touchdown - landing_start, 1), 0.0, 1.0
+    )
+    landing_alpha = landing_alpha * landing_alpha * (3.0 - 2.0 * landing_alpha)
+    landing_z = (
+        p_ref[landing_start, 2]
+        + landing_alpha * (floating_height - p_ref[landing_start, 2])
+    )
+    p_ref = p_ref.at[:, 2].set(
+        jnp.where(
+            (nodes > landing_start) & (nodes < touchdown),
+            landing_z,
+            p_ref[:, 2],
+        )
+    )
+    p_ref = p_ref.at[:, 2].set(
+        jnp.where(nodes >= touchdown, floating_height, p_ref[:, 2])
+    )
+
     # Horizontal reference is physically interpretable: accelerate during launch,
     # coast through flight, and brake during landing.
     launch_time_total = node_times[takeoff] - node_times[crouch_end]
@@ -536,14 +551,15 @@ def build_backflip_reference():
     )
 
     contact = jnp.ones((config.N + 1, config.n_contact))
-    contact = contact.at[takeoff:landing_start].set(0.0)
-    contact = contact.at[landing_start:touchdown].set(
-        jnp.array([1.0, 0.0, 1.0, 0.0])
-    )
+    # No physical landing contact.  From takeoff onward the humanoid is fully
+    # airborne, including the visual landing approach and terminal pre-impact pose.
+    # Therefore the contact Jacobian is masked out and the generated GRF is zero.
+    contact = contact.at[takeoff:].set(0.0)
 
     foot_ref = jnp.tile(jnp.asarray(config.p_legs0), (config.N + 1, 1))
     landing_foot_offset = jnp.tile(
-        jnp.array([BACKWARD_DISPLACEMENT, 0.0, 0.0]), config.n_contact
+        jnp.array([BACKWARD_DISPLACEMENT, 0.0, FLOAT_CLEARANCE]),
+        config.n_contact,
     )
     foot_ref = foot_ref + jnp.where(
         (nodes >= landing_start)[:, None], landing_foot_offset[None, :], 0.0
@@ -752,19 +768,14 @@ def make_backflip_constraints(reference, obstacle_constraints):
             normalized_quat, waypoint_quaternions[-1]
         )
         final_constraints = jnp.concatenate([
-            # Scale the tight angular bound to O(1).  In raw radians, even a
-            # multi-degree error is smaller than ADMM's absolute tolerance.
-            # The squared norm bounds the total rotation, not just its three
-            # axis-angle components independently.
+            # Keep only terminal pose constraints.  Terminal linear velocity,
+            # angular velocity, and joint velocity are intentionally unconstrained.
             jnp.array([
                 jnp.sum(terminal_orientation_error**2)
                 / FINAL_ORIENTATION_TOLERANCE**2
                 - 1.0
             ]),
-            jnp.abs(dp) - FINAL_LINEAR_SPEED,
-            jnp.abs(omega) - FINAL_ANGULAR_SPEED,
             jnp.abs(q - terminal_joints) - FINAL_JOINT_POSITION_TOLERANCE,
-            jnp.abs(dq) - FINAL_JOINT_SPEED,
         ])
         final_constraints = jnp.where(
             t == config.N, final_constraints, -jnp.ones_like(final_constraints)
@@ -785,7 +796,7 @@ def make_phase_scaled_disturbance(n, magnitude=0.02):
     def disturbance_at_state(x, t):
         phase = phase_index(t)
         dt = phase_durations(x)[phase] / SEGMENT_LENGTHS[phase]
-        diagonal = jnp.zeros(n, dtype=x.dtype).at[:3].set(magnitude * dt)
+        diagonal = jnp.zeros(n, dtype=x.dtype).at[:2].set(magnitude * dt)
         diagonal = diagonal.at[DURATION_SLICE].set(0.0)
         return jnp.diag(diagonal)
 
@@ -898,6 +909,145 @@ def phase_node_times(phase_times):
     return np.concatenate([[0.0], np.cumsum(dts[phases])])
 
 
+def get_trajectory_tubes(Phi_x):
+    """Return the per-node, per-state SLS tube radius."""
+    return jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1)
+
+
+def rollout_zero_disturbance(dynamics, x0, U, parameter):
+    """Roll out the exact nonlinear dynamics using the optimized controls.
+
+    The experiment's disturbance map is not part of ``dynamics`` itself, so this
+    is a zero-disturbance open-loop rollout.  Its deviation from optimized X is
+    therefore the nonlinear/multiple-shooting consistency error.
+    """
+
+    def step(x, inputs):
+        u, t = inputs
+        x_next = dynamics(x, u, t, parameter)
+        return x_next, x_next
+
+    _, successors = jax.lax.scan(
+        step,
+        x0,
+        (U, jnp.arange(U.shape[0], dtype=jnp.int32)),
+    )
+    return jnp.concatenate([x0[None, :], successors], axis=0)
+
+
+def state_dimension_names():
+    """Human-readable labels for every augmented H1 state dimension."""
+    nj = config.n_joints
+    nc = config.n_contact
+
+    names = [
+        "base_x", "base_y", "base_z",
+        "quat_w", "quat_x", "quat_y", "quat_z",
+    ]
+    names += [f"q_{i}" for i in range(nj)]
+    names += [
+        "v_x_scaled", "v_y_scaled", "v_z_scaled",
+        "omega_x_scaled", "omega_y_scaled", "omega_z_scaled",
+    ]
+    names += [f"dq_{i}_scaled" for i in range(nj)]
+    names += [f"foot_{i}_{axis}" for i in range(nc) for axis in ("x", "y", "z")]
+    names += [f"grf_{i}_{axis}_scaled" for i in range(nc) for axis in ("x", "y", "z")]
+    names += [f"duration_logit_{name}" for name in PHASE_NAMES]
+
+    if len(names) != config.n:
+        return [f"state_{i}" for i in range(config.n)]
+    return names
+
+
+def align_tubes_to_states(Phi_x, num_state_nodes):
+    """Align get_trajectory_tubes(Phi_x) with x_0, ..., x_N."""
+    tubes = get_trajectory_tubes(Phi_x)
+
+    if tubes.shape[0] == num_state_nodes:
+        return tubes
+    if tubes.shape[0] == num_state_nodes - 1:
+        # x_0 is fixed, so its rollout deviation and disturbance tube are zero.
+        return jnp.concatenate(
+            [jnp.zeros((1, tubes.shape[1]), dtype=tubes.dtype), tubes],
+            axis=0,
+        )
+
+    raise ValueError(
+        "Cannot align Phi_x tubes with the state trajectory: "
+        f"tube nodes={tubes.shape[0]}, state nodes={num_state_nodes}."
+    )
+
+
+def plot_zero_rollout_vs_tubes(
+    X_optimized,
+    X_rollout,
+    Phi_x,
+    phase_times,
+    output_path,
+):
+    """Plot |X_rollout - X_optimized| and the SLS tube for every state.
+
+    Every augmented state dimension gets its own subplot, and all subplots are
+    saved into a single PNG.
+    """
+    X_optimized_np = np.asarray(X_optimized)
+    X_rollout_np = np.asarray(X_rollout)
+    tubes_np = np.asarray(
+        align_tubes_to_states(Phi_x, X_optimized_np.shape[0])
+    )
+
+    if X_rollout_np.shape != X_optimized_np.shape:
+        raise ValueError(
+            f"Rollout shape {X_rollout_np.shape} does not match optimized "
+            f"trajectory shape {X_optimized_np.shape}."
+        )
+    if tubes_np.shape != X_optimized_np.shape:
+        raise ValueError(
+            f"Tube shape {tubes_np.shape} does not match optimized "
+            f"trajectory shape {X_optimized_np.shape}."
+        )
+
+    deviation = np.abs(X_rollout_np - X_optimized_np)
+    times = phase_node_times(phase_times)
+    names = state_dimension_names()
+
+    n_states = X_optimized_np.shape[1]
+    n_cols = 5
+    n_rows = int(np.ceil(n_states / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.6 * n_cols, 2.8 * n_rows),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for i, ax in enumerate(axes.flat):
+        if i >= n_states:
+            ax.axis("off")
+            continue
+
+        ax.plot(times, deviation[:, i], label="|rollout - optimized|")
+        ax.plot(times, tubes_np[:, i], "--", label="tube radius")
+        ax.set_title(f"{i}: {names[i]}", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        if i % n_cols == 0:
+            ax.set_ylabel("internal-state magnitude")
+        if i >= (n_rows - 1) * n_cols:
+            ax.set_xlabel("time [s]")
+
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2)
+    fig.suptitle(
+        "Zero-disturbance nonlinear rollout deviation vs. SLS tube size",
+        y=0.999,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.995))
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return deviation, tubes_np
+
+
 def refresh_algebraic_states(dynamics, X, U, parameter):
     """Recompute derived foot positions and GRFs from physical states."""
     predicted = jax.vmap(
@@ -989,18 +1139,18 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
-        eps_abs=1.0e-2, eps_rel=5.0e-3, rho_max=1.0e4,
+        eps_abs=1.0e-2, eps_rel=1.0e-4, rho_max=1.0e4,
         max_iterations=400, rho_update_frequency=25, initial_rho=1.0,
         regularized_rho_update=False, num_phases=NUM_PHASES,
     )
     sls_config = SLSConfig(
         max_sls_iterations=1, sls_primal_tol=1.0e-2,
         enable_fastsls=False, initialize_nominal=True,
-        max_initial_sqp_iterations=100, warm_start=True, rti=False,
+        max_initial_sqp_iterations=50, warm_start=True, rti=False,
         gradient_window=0,
     )
     sqp_config = SQPConfig(
-        max_sqp_iterations=0, warm_start=True, feas_tol=1.0e-5,
+        max_sqp_iterations=50, warm_start=True, feas_tol=1.0e-5,
         step_tol=1.0e-5, line_search=True, lm_regularization=5.0e-2, # Just changed this 5 -> 1
     )
     mpc = mpc_wrapper.MPCWrapper(
@@ -1029,6 +1179,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     start = timer()
     result = solve_backflip(mpc, data, x0, reference, parameter)
     X, U = result[:2]
+    Phi_x = result[8]
     converged_admm = result[-1]
     X.block_until_ready()
     solve_time = timer() - start
@@ -1115,6 +1266,26 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Compare the optimized multiple-shooting trajectory against a sequential
+    # zero-disturbance rollout of the exact nonlinear dynamics.  Keep everything
+    # in solver coordinates here so it is directly comparable with Phi_x.
+    X_rollout = rollout_zero_disturbance(mpc.dynamics, X[0], U, parameter)
+    X_rollout.block_until_ready()
+    rollout_plot_path = output_dir / "humanoid_backflip_zero_rollout_vs_tubes.png"
+    rollout_deviation, trajectory_tubes = plot_zero_rollout_vs_tubes(
+        X,
+        X_rollout,
+        Phi_x,
+        phase_times,
+        rollout_plot_path,
+    )
+    print(f"Saved zero-disturbance rollout/tube plot: {rollout_plot_path}")
+    print(
+        "Maximum zero-disturbance rollout deviation: "
+        f"{float(np.max(rollout_deviation)):.6e}"
+    )
+
     result_path = output_dir / "humanoid_backflip_obstacle_min_time.npz"
     X_output = np.asarray(X).copy()
     duration_logits = X_output[:, DURATION_SLICE].copy()
@@ -1125,6 +1296,10 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     )
     np.savez(
         result_path, X=X_output, U=np.asarray(U),
+        Phi_x=np.asarray(Phi_x),
+        X_zero_disturbance_rollout=np.asarray(X_rollout),
+        zero_rollout_deviation=np.asarray(rollout_deviation),
+        trajectory_tubes=np.asarray(trajectory_tubes),
         phase_names=np.asarray(PHASE_NAMES),
         phase_end_steps=np.asarray(PHASE_END_STEPS), phase_times=phase_times,
         node_times=phase_node_times(phase_times),
