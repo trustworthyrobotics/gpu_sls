@@ -37,7 +37,7 @@ config.update(
 # -----------------------------
 MASS = 1.0
 GRAVITY = 9.81
-E_MAG = 2.5
+E_MAG = 15.0
 JX = 0.02
 JY = 0.02
 JZ = 0.04

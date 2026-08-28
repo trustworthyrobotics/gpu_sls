@@ -37,7 +37,6 @@ class ADMMConfig:
     initial_rho: int = 1.0
     regularized_rho_update: bool = False
     num_phases: int = 1
-    slack_weight: float = 1e4
 
     def tree_flatten(self):
         children = (
@@ -50,8 +49,7 @@ class ADMMConfig:
             self.rho_max,
             self.initial_rho,
             self.regularized_rho_update,
-            self.num_phases,
-            self.slack_weight,
+            self.num_phases
         )
         return children, None
 
@@ -586,21 +584,7 @@ def project(
     rho: float,
     rho_grad: float,
     window_mask: jnp.ndarray,
-    slack_weight: float,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """
-    Slack-augmented projection for
-
-        w_k + sum_l a_{k,l} <= f_k + s_k,
-        s_k >= 0,
-
-    with quadratic slack penalty
-
-        0.5 * slack_weight * ||s||^2.
-
-    The slack is analytically eliminated in the proximal projection, so it
-    does not increase the LQR state/control dimension.
-    """
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     grad_sum = jnp.einsum(
         "kl,klc->kc",
         window_mask,
@@ -612,25 +596,19 @@ def project(
     denominator = (
         1.0 / rho
         + num_grad_terms / rho_grad
-        + 1.0 / slack_weight
     )
 
     mu = jnp.maximum(
         (z_bar + grad_sum - f_ct) / denominator[:, None],
         0.0,
-    )
+    ) 
 
     z_bar_new = z_bar - mu / rho
 
-    z_grad_new = (
-        z_grad
-        - window_mask[:, :, None] * mu[:, None, :] / rho_grad
-    )
-    z_grad_new = window_mask[:, :, None] * z_grad_new
+    z_grad_new = z_grad - window_mask[:, :, None] * mu[:, None, :] / rho_grad
+    z_grad_new = (window_mask[:, :, None] * z_grad_new)
 
-    slack = mu / slack_weight
-
-    return z_bar_new, z_grad_new, slack
+    return z_bar_new, z_grad_new
 
 def previous_state_windows(
     x_bar: jnp.ndarray,
@@ -666,7 +644,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     def one_iter(carry):
         (it, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, 
          x_bar, u_bar, y_bar, w_prev, rho, rho_grad, cache, BRinv, MRinv, P, _, K,
-         a_prev, b_prev, _,
+         a_prev, b_prev,
          _, _, _, _, _, _, _, _, _) = carry
 
         # -------- Solve unconstrained LQR subproblem --------
@@ -711,52 +689,29 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         )
 
         def nominal_projection(_):
-            # Soft nominal projection:
-            #
-            #   w <= f + s,  s >= 0
-            #
-            # with 0.5 * slack_weight * ||s||^2.
-            v = z_bar + y_bar
-            violation = jnp.maximum(v - f, 0.0)
-
-            denominator = (
-                1.0 / rho
-                + 1.0 / cfg.slack_weight
-            )
-
-            mu = violation / denominator
-            w_new = v - mu / rho
-            slack_new = mu / cfg.slack_weight
-
-            # During nominal initialization, disable the gradient split.
+            # During nominal initialization, keep the ordinary nominal split
+            # z_bar <= f, but completely disable the gradient split.
+            w_new = jnp.minimum(z_bar + y_bar, f)
             z_grad = jnp.zeros_like(a_prev)
             a_new = a_prev
             b_new = b_prev
-
-            return w_new, a_new, b_new, z_grad, slack_new
+            return w_new, a_new, b_new, z_grad
 
         def robust_projection(_):
             x_window, _ = previous_state_windows(x_bar, L)
             z_grad = jnp.einsum("kcln,kln->klc", Jh, x_window)
-
-            w_new, a_new, slack_new = project(
+            w_new, a_new = project(
                 z_bar + y_bar,
                 z_grad + b_prev,
                 f,
                 rho,
                 rho_grad,
                 window_mask,
-                cfg.slack_weight,
             )
+            b_new = b_prev + window_mask[:, :, None] * (z_grad - a_new)
+            return w_new, a_new, b_new, z_grad
 
-            b_new = (
-                b_prev
-                + window_mask[:, :, None] * (z_grad - a_new)
-            )
-
-            return w_new, a_new, b_new, z_grad, slack_new
-
-        w_new, a_new, b_new, z_grad, slack_new = lax.cond(
+        w_new, a_new, b_new, z_grad = lax.cond(
             just_nominal,
             nominal_projection,
             robust_projection,
@@ -913,7 +868,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, cache_new, BRinv, MRinv, P, K = lax.cond(rho_updated, cache_update, no_cache_update, operand=None)
 
         return (it + 1, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, x_bar, u_bar, y_new, w_new,
-                rho_new, rho_grad_new, cache_new, BRinv, MRinv, P, p, K, a_new, b_new, slack_new,
+                rho_new, rho_grad_new, cache_new, BRinv, MRinv, P, p, K, a_new, b_new,
                 rp_norm, rd_norm, eps_pri, eps_dual, rp_grad_norm, rd_grad_norm, eps_grad_pri, eps_grad_dual, converged)
 
     # --- loop condition: keep going until max_iters OR converged ---
@@ -937,7 +892,6 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     init_y = y
     init_a = a
     init_b = b
-    init_slack = jnp.zeros_like(f)
     rho0 = rho
     rho_grad0 = rho_grad
     p_init = jnp.zeros((T + 1, nx), dtype=Q.dtype)
@@ -973,7 +927,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         jnp.array(rho0, dtype=Q.dtype),
         jnp.array(rho_grad0, dtype=Q.dtype),
         cache, BRinv, MRinv, P, p_init, K,
-        init_a, init_b, init_slack,
+        init_a, init_b,
         jnp.array(jnp.inf, dtype=Q.dtype),
         jnp.array(jnp.inf, dtype=Q.dtype),
         jnp.array(jnp.inf, dtype=Q.dtype),
@@ -987,8 +941,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
     out = jax.lax.while_loop(cond_fun, one_iter, init)
 
-    (it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, rho_grad_final, _, _, _, P_final, p_final, K, a_bar, b_bar, slack_final,
-     rp_norm, rd_norm, eps_pri, eps_dual, rp_norm_grad, rd_norm_grad, eps_pri_grad, eps_dual_grad, converged) = out
+    (it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, rho_grad_final, _, _, _, P_final, p_final, K, a_bar, b_bar, rp_norm, rd_norm, eps_pri, eps_dual,
+     rp_norm_grad, rd_norm_grad, eps_pri_grad, eps_dual_grad, converged) = out
     v = dual_lqr(x_bar, P_final, p_final)
 
     # ---------------------------------------------------------
@@ -1047,13 +1001,6 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     # )
 
     mu = rho_final * y_bar
-
-    jax.debug.print(
-        "Slack: max={:.3e} mean={:.3e} weight={:.3e}",
-        jnp.max(slack_final),
-        jnp.mean(slack_final),
-        cfg.slack_weight,
-    )
 
         # ---------------------------------------------------------
     # Worst actual constraint violation
