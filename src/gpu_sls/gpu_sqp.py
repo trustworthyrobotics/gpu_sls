@@ -514,8 +514,9 @@ def sqp(
         def do_iter(_):
             g, c = model_evaluator(X_curr, U_curr)
             feas = jnp.max(jnp.abs(c))
-            warm_flag = jnp.logical_and(jnp.array(bool(sqp_config.warm_start)), converged_admm)
-            # warm_flag = jnp.array(bool(sqp_config.warm_start))
+            warm_flag = jnp.logical_and(
+                jnp.array(bool(sqp_config.warm_start)), converged_admm
+            )
             # warm_flag = jnp.logical_and(warm_flag, jnp.array(i != sls_config.max_initial_sqp_iterations))
             # Turn this off? seems to be more optimal
             w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
@@ -586,6 +587,17 @@ def sqp(
             converged1 = jnp.logical_and(
                 direction_finite, jnp.logical_and(feas_ok, step_ok)
             )
+            # Convergence of the nominal warm-up is not convergence of the
+            # robust problem.  Stopping here skips the first SLS iteration and
+            # returns the nominal branch's zero Phi_x/Phi_u placeholders.
+            # Keep advancing until at least one robust SQP iteration has run.
+            nominal_warmup_iteration = jnp.logical_and(
+                jnp.asarray(bool(sls_config.enable_fastsls)),
+                i < sls_config.max_initial_sqp_iterations,
+            )
+            robust_converged1 = jnp.logical_and(
+                converged1, jnp.logical_not(nominal_warmup_iteration)
+            )
             filter_model_evaluator = filter_model_evaluator_factory(
                 model_evaluator=model_evaluator,
                 constraints=constraints,
@@ -639,7 +651,7 @@ def sqp(
             #     ordered=True,
             # )
 
-            keep_previous = jnp.logical_or(converged1, failed)
+            keep_previous = jnp.logical_or(robust_converged1, failed)
             w_next = lax.select(keep_previous, w, w1)
             y_next = lax.select(keep_previous, y, y1)
             a_next = lax.select(keep_previous, a, a1)
@@ -662,7 +674,7 @@ def sqp(
             )
 
             return (i + 1, X_next, U_next, V_next, w_next, y_next, rho_next, rho_grad_next,
-                    jnp.logical_or(converged, jnp.logical_or(converged1, failed)),
+                    jnp.logical_or(converged, jnp.logical_or(robust_converged1, failed)),
                     backoffs_next, Phi_x_next, Phi_u_next, beta_next, mu_next, Phi_x_I_next, Phi_u_I_next, a_next, b_next, converged_admm_next)
 
         return lax.cond(converged, do_nothing, do_iter, operand=None)

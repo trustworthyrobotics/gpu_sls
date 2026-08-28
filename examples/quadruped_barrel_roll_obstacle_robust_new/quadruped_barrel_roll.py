@@ -575,88 +575,444 @@ def make_barrel_roll_constraints(reference, obstacle_constraints):
 #     disturbance.at_state = disturbance_at_state
 #     return disturbance
 
+# def make_phase_scaled_disturbance(
+#     n,
+#     position_magnitude=0.02,
+#     velocity_magnitude=0.05,
+#     joint_velocity_magnitude=0.05,
+# ):
+#     """
+#     Disturb:
+#         base x, y
+#         base vx, vy
+#         all joint velocities dq
+
+#     Do not disturb:
+#         base z
+#         quaternion
+#         joint angles
+#         base vz
+#         angular velocity
+#         feet
+#         GRFs
+#         phase durations
+#     """
+
+#     nj = config.n_joints
+
+#     # State layout:
+#     #
+#     # [0:3]               base position
+#     # [3:7]               quaternion
+#     # [7:7+nj]            joint angles
+#     # [7+nj:13+nj]        vx, vy, vz, wx, wy, wz
+#     # [13+nj:13+2*nj]     joint velocities dq
+#     # ...
+
+#     vel_start = 7 + nj
+#     joint_vel_start = 13 + nj
+
+#     def disturbance_at_state(x, t):
+#         phase = phase_index(t)
+#         dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
+
+#         diagonal = jnp.zeros(n, dtype=x.dtype)
+
+#         # Horizontal base position.
+#         diagonal = diagonal.at[0].set(
+#             position_magnitude * dt
+#         )
+#         diagonal = diagonal.at[1].set(
+#             position_magnitude * dt
+#         )
+
+#         # Horizontal base velocity.
+#         diagonal = diagonal.at[vel_start + 0].set(
+#             velocity_magnitude * dt
+#         )
+#         diagonal = diagonal.at[vel_start + 1].set(
+#             velocity_magnitude * dt
+#         )
+
+#         # All joint velocities.
+#         # diagonal = diagonal.at[
+#         #     joint_vel_start : joint_vel_start + nj
+#         # ].set(
+#         #     joint_velocity_magnitude * dt
+#         # )
+
+#         return jnp.diag(diagonal)
+
+#     def disturbance(X):
+#         return jax.vmap(disturbance_at_state)(
+#             X,
+#             jnp.arange(X.shape[0]),
+#         )
+
+#     disturbance.at_state = disturbance_at_state
+#     return disturbance
+
 def make_phase_scaled_disturbance(
     n,
     position_magnitude=0.02,
-    velocity_magnitude=0.05,
+    quaternion_magnitude=0.01,
+    joint_position_magnitude=0.02,
+    linear_velocity_magnitude=0.05,
+    angular_velocity_magnitude=0.05,
     joint_velocity_magnitude=0.05,
+    foot_position_magnitude=0.02,
+    grf_magnitude=5.0,
 ):
     """
-    Disturb:
-        base x, y
-        base vx, vy
-        all joint velocities dq
+    Disturb every physical state except the optimized phase durations.
 
-    Do not disturb:
-        base z
-        quaternion
-        joint angles
-        base vz
-        angular velocity
-        feet
-        GRFs
-        phase durations
+    State layout:
+        [0:3]                       base position
+        [3:7]                       quaternion
+        [7:7+nj]                    joint positions
+        [7+nj:10+nj]                base linear velocity
+        [10+nj:13+nj]               base angular velocity
+        [13+nj:13+2*nj]             joint velocities
+        [13+2*nj:13+2*nj+3*nc]      foot positions
+        [GRF_START:GRF_STOP]         GRFs
+        [DURATION_SLICE]             phase durations  <-- NO disturbance
+
+    All disturbance magnitudes are scaled by the physical phase timestep:
+
+        dt = T_phase / N_phase
+
+    so that changing the optimized phase duration changes the discrete-time
+    disturbance consistently.
     """
 
     nj = config.n_joints
+    nc = config.n_contact
 
-    # State layout:
-    #
-    # [0:3]               base position
-    # [3:7]               quaternion
-    # [7:7+nj]            joint angles
-    # [7+nj:13+nj]        vx, vy, vz, wx, wy, wz
-    # [13+nj:13+2*nj]     joint velocities dq
-    # ...
+    # State indices.
+    base_pos_start = 0
+    quat_start = 3
+    joint_pos_start = 7
 
-    vel_start = 7 + nj
+    linear_vel_start = 7 + nj
+    angular_vel_start = 10 + nj
     joint_vel_start = 13 + nj
+
+    foot_start = 13 + 2 * nj
+    foot_stop = foot_start + 3 * nc
 
     def disturbance_at_state(x, t):
         phase = phase_index(t)
-        dt = x[PHYSICAL_N + phase] / SEGMENT_LENGTHS[phase]
+
+        dt = (
+            x[PHYSICAL_N + phase]
+            / SEGMENT_LENGTHS[phase]
+        )
 
         diagonal = jnp.zeros(n, dtype=x.dtype)
 
-        # Horizontal base position.
-        diagonal = diagonal.at[0].set(
-            position_magnitude * dt
-        )
-        diagonal = diagonal.at[1].set(
+        # ---------------------------------------------------------
+        # Base position: x, y, z
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            base_pos_start : base_pos_start + 3
+        ].set(
             position_magnitude * dt
         )
 
-        # Horizontal base velocity.
-        diagonal = diagonal.at[vel_start + 0].set(
-            velocity_magnitude * dt
-        )
-        diagonal = diagonal.at[vel_start + 1].set(
-            velocity_magnitude * dt
+        # ---------------------------------------------------------
+        # Quaternion: qw, qx, qy, qz
+        #
+        # Keep this small because quaternion components are not
+        # independent Euclidean coordinates.
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            quat_start : quat_start + 4
+        ].set(
+            quaternion_magnitude * dt
         )
 
-        # All joint velocities.
-        # diagonal = diagonal.at[
-        #     joint_vel_start : joint_vel_start + nj
-        # ].set(
-        #     joint_velocity_magnitude * dt
-        # )
+        # ---------------------------------------------------------
+        # Joint positions
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            joint_pos_start : joint_pos_start + nj
+        ].set(
+            joint_position_magnitude * dt
+        )
+
+        # ---------------------------------------------------------
+        # Base linear velocity: vx, vy, vz
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            linear_vel_start : linear_vel_start + 3
+        ].set(
+            linear_velocity_magnitude * dt
+        )
+
+        # ---------------------------------------------------------
+        # Base angular velocity: wx, wy, wz
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            angular_vel_start : angular_vel_start + 3
+        ].set(
+            angular_velocity_magnitude * dt
+        )
+
+        # ---------------------------------------------------------
+        # Joint velocities
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            joint_vel_start : joint_vel_start + nj
+        ].set(
+            joint_velocity_magnitude * dt
+        )
+
+        # ---------------------------------------------------------
+        # Foot positions
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            foot_start : foot_stop
+        ].set(
+            foot_position_magnitude * dt
+        )
+
+        # ---------------------------------------------------------
+        # Ground reaction forces
+        # ---------------------------------------------------------
+        diagonal = diagonal.at[
+            GRF_START : GRF_STOP
+        ].set(
+            grf_magnitude * dt
+        )
+
+        # ---------------------------------------------------------
+        # Phase-duration states:
+        #
+        # diagonal[DURATION_SLICE] remains exactly zero.
+        # ---------------------------------------------------------
 
         return jnp.diag(diagonal)
 
     def disturbance(X):
-        return jax.vmap(disturbance_at_state)(
+        return jax.vmap(
+            disturbance_at_state,
+            in_axes=(0, 0),
+        )(
             X,
-            jnp.arange(X.shape[0]),
+            jnp.arange(X.shape[0], dtype=jnp.int32),
         )
 
     disturbance.at_state = disturbance_at_state
+
     return disturbance
-
-
 
 def get_trajectory_tubes(Phi_x):
     """Return the per-node, per-state SLS tube radius."""
     return jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1)
+
+
+def disturbance_response_to_state_history_feedback(
+    Phi_x,
+    Phi_u,
+    physical_n=PHYSICAL_N,
+):
+    """Convert SLS disturbance feedback into state-error-history feedback.
+
+    Tensor convention:
+
+        Phi_x[j, k] = effect of disturbance w_k on state perturbation dx_j
+        Phi_u[j, k] = effect of disturbance w_k on control perturbation du_j
+
+    In this script the terminal Phi_x response row is clipped before this
+    function is called, so the expected shapes are
+
+        Phi_x : (N, N+1, nx, nx)
+        Phi_u : (N, N+1, nu, nx)
+
+    The final disturbance-history column is retained in the stored tensors so
+    their convention is unchanged, but only columns 0,...,N-1 can participate
+    in the N causal controls.  We therefore form the square causal operators
+
+        Rx = Phi_x[:, :N]
+        Ru = Phi_u[:, :N]
+
+    and solve
+
+        K_x Rx = Ru,
+
+    i.e.
+
+        K_x = Ru Rx^{-1}.
+
+    The runtime controller is
+
+        u_k = U_k + sum_{j=0}^k K_x[k,j] (x_j - X_j).
+
+    Duration-state disturbance channels are zero by construction, so the
+    inversion is performed only on the PHYSICAL_N physical-state subspace.
+    """
+
+    Phi_x_np = np.asarray(Phi_x)
+    Phi_u_np = np.asarray(Phi_u)
+
+    if Phi_x_np.ndim != 4 or Phi_u_np.ndim != 4:
+        raise ValueError(
+            "Expected rank-4 SLS response tensors; got "
+            f"Phi_x={Phi_x_np.shape}, Phi_u={Phi_u_np.shape}."
+        )
+
+    N = Phi_u_np.shape[0]
+    history_cols = Phi_u_np.shape[1]
+
+    if Phi_x_np.shape[0] != N:
+        raise ValueError(
+            "Phi_x must have one response row per control after clipping; got "
+            f"Phi_x={Phi_x_np.shape}, Phi_u={Phi_u_np.shape}."
+        )
+
+    if Phi_x_np.shape[1] != history_cols:
+        raise ValueError(
+            "Phi_x and Phi_u must use the same disturbance-history columns; got "
+            f"Phi_x={Phi_x_np.shape}, Phi_u={Phi_u_np.shape}."
+        )
+
+    if history_cols < N:
+        raise ValueError(
+            f"Need at least N={N} disturbance-history columns; got {history_cols}."
+        )
+
+    if Phi_x_np.shape[2] < physical_n or Phi_x_np.shape[3] < physical_n:
+        raise ValueError(
+            f"Phi_x is too small for physical_n={physical_n}: {Phi_x_np.shape}."
+        )
+
+    if Phi_u_np.shape[3] < physical_n:
+        raise ValueError(
+            f"Phi_u is too small for physical_n={physical_n}: {Phi_u_np.shape}."
+        )
+
+    # Keep the requested (N, N+1, ...) tensors externally, but only the first
+    # N disturbance columns can affect the N controls causally.
+    Phi_x_causal = Phi_x_np[:, :N, :physical_n, :physical_n]
+    Phi_u_causal = Phi_u_np[:, :N, :, :physical_n]
+
+    nu = Phi_u_causal.shape[2]
+    K_x = np.zeros((N, N, nu, physical_n), dtype=Phi_u_causal.dtype)
+
+    # Solve K_x Phi_x = Phi_u blockwise.  With Phi(j,k) denoting the response
+    # at time j to disturbance k, causality means Phi[j,k] = 0 for k > j.
+    # For fixed control row k:
+    #
+    #   Phi_u[k,j] = sum_{s=j}^k K_x[k,s] Phi_x[s,j].
+    #
+    # Working backward in j makes all s>j terms available before solving the
+    # right multiplication by Phi_x[j,j].
+    for k in range(N):
+        for j in range(k, -1, -1):
+            rhs = Phi_u_causal[k, j].copy()
+
+            if j < k:
+                rhs -= np.einsum(
+                    "smp,spq->mq",
+                    K_x[k, j + 1 : k + 1],
+                    Phi_x_causal[j + 1 : k + 1, j],
+                )
+
+            diagonal_block = Phi_x_causal[j, j]
+            try:
+                K_x[k, j] = np.linalg.solve(
+                    diagonal_block.T,
+                    rhs.T,
+                ).T
+            except np.linalg.LinAlgError as exc:
+                raise np.linalg.LinAlgError(
+                    "State-history conversion failed because the physical "
+                    f"Phi_x[{j},{j}] block is singular. Its shape is "
+                    f"{diagonal_block.shape}."
+                ) from exc
+
+    # Reconstruction sanity check on the causal physical subspace.
+    reconstructed = np.einsum(
+        "ksmp,sjpq->kjmq",
+        K_x,
+        Phi_x_causal,
+    )
+    reconstruction_error = float(
+        np.max(np.abs(reconstructed - Phi_u_causal))
+    )
+    print(
+        "State-history feedback reconstruction max error: "
+        f"{reconstruction_error:.6e}"
+    )
+
+    return jnp.asarray(K_x)
+
+
+def rollout_state_history_feedback(
+    dynamics,
+    X_nominal,
+    U_nominal,
+    K_x,
+    parameter,
+):
+    """Roll out the nonlinear plant with causal state-perturbation history.
+
+    At control step k the controller has observed dx_0,...,dx_k and applies
+
+        u_k = U_nominal[k] + sum_{j=0}^k K_x[k,j] dx_j,
+
+    with
+
+        dx_j = x_j - X_nominal[j].
+
+    The complete realized perturbation history is retained and returned.
+    """
+
+    N = U_nominal.shape[0]
+    if K_x.shape[0] != N or K_x.shape[1] != N:
+        raise ValueError(
+            f"K_x horizon shape {K_x.shape[:2]} does not match N={N}."
+        )
+
+    x = X_nominal[0]
+    error_history = jnp.zeros_like(X_nominal)
+    error_history = error_history.at[0].set(x - X_nominal[0])
+
+    X_feedback = [x]
+    U_feedback = []
+    feedback_corrections = []
+
+    for k in range(N):
+        observed_errors = error_history[: k + 1, :PHYSICAL_N]
+        delta_u = jnp.einsum(
+            "jmp,jp->m",
+            K_x[k, : k + 1],
+            observed_errors,
+        )
+
+        u = U_nominal[k] + delta_u
+        x_next = dynamics(
+            x,
+            u,
+            jnp.asarray(k, dtype=jnp.int32),
+            parameter,
+        )
+
+        error_history = error_history.at[k + 1].set(
+            x_next - X_nominal[k + 1]
+        )
+
+        X_feedback.append(x_next)
+        U_feedback.append(u)
+        feedback_corrections.append(delta_u)
+        x = x_next
+
+    return (
+        jnp.stack(X_feedback),
+        jnp.stack(U_feedback),
+        error_history,
+        jnp.stack(feedback_corrections),
+    )
 
 
 def rollout_zero_disturbance(dynamics, x0, U, parameter):
@@ -1031,27 +1387,27 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         return
 
     admm_config = ADMMConfig(
-        eps_abs=1.0e-3,
+        eps_abs=6.0e-3,
         eps_rel=1.0e-3,
         rho_max=1.0e6,
-        max_iterations=3000,
+        max_iterations=1000,
         rho_update_frequency=25,
         initial_rho=25.0,
         regularized_rho_update=False,
         num_phases=NUM_PHASES,
     )
     sls_config = SLSConfig(
-        max_sls_iterations=1,
+        max_sls_iterations=2,
         sls_primal_tol=1.0e-2,
-        enable_fastsls=False,
+        enable_fastsls=True,
         initialize_nominal=True,
-        max_initial_sqp_iterations=200,
+        max_initial_sqp_iterations=50,
         warm_start=True,
         rti=False,
         gradient_window=0,
     )
     sqp_config = SQPConfig(
-        max_sqp_iterations=0,
+        max_sqp_iterations=50,
         warm_start=True,
         feas_tol=1.0e-5,
         step_tol=1.0e-5,
@@ -1090,7 +1446,18 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     start = timer()
     result = solve_barrel_roll(mpc, data, x0, reference, parameter)
     X, U = result[:2]
-    Phi_x = result[8]
+    Phi_x_full = result[8]
+    Phi_u = result[9]
+
+    # SLS returns one extra terminal state-response row.  For the feedback
+    # controller, retain one Phi_x row per control while keeping all 51
+    # disturbance-history columns:
+    #
+    #   (51, 51, 67, 67) -> (50, 51, 67, 67)
+    Phi_x = Phi_x_full[: Phi_u.shape[0], ...]
+    print(f"Clipped Phi_x: {Phi_x_full.shape} -> {Phi_x.shape}")
+    print(f"Phi_u shape: {Phi_u.shape}")
+
     converged_admm = result[-1]
     X.block_until_ready()
     solve_time = timer() - start
@@ -1161,6 +1528,7 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Open-loop nonlinear rollout, retained as the original diagnostic.
     X_rollout = rollout_zero_disturbance(mpc.dynamics, X[0], U, parameter)
     X_rollout.block_until_ready()
     rollout_plot_path = output_dir / "quadruped_barrel_roll_zero_rollout_vs_tubes.png"
@@ -1177,6 +1545,44 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         f"{float(np.max(rollout_deviation)):.6e}"
     )
 
+    # Convert the SLS disturbance-feedback policy
+    #
+    #   du_k = sum_j Phi_u[k,j] w_j
+    #
+    # into a causal state-history policy
+    #
+    #   du_k = sum_s K_x[k,s] (x_{s+1} - X_{s+1}),
+    #   K_x = Phi_u Phi_x^{-1}
+    #
+    # on the physical-state subspace.
+    K_x_history = disturbance_response_to_state_history_feedback(Phi_x, Phi_u)
+    (
+        X_feedback_rollout,
+        U_feedback_rollout,
+        x_perturbation_history,
+        feedback_corrections,
+    ) = rollout_state_history_feedback(
+        mpc.dynamics,
+        X,
+        U,
+        K_x_history,
+        parameter,
+    )
+    X_feedback_rollout.block_until_ready()
+
+    max_feedback_state_error = float(
+        jnp.max(jnp.abs(x_perturbation_history[:, :PHYSICAL_N]))
+    )
+    max_feedback_torque_correction = float(jnp.max(jnp.abs(feedback_corrections)))
+    print(
+        "Maximum state-history-feedback rollout perturbation: "
+        f"{max_feedback_state_error:.6e}"
+    )
+    print(
+        "Maximum state-history-feedback torque correction: "
+        f"{max_feedback_torque_correction:.6e}"
+    )
+
     result_path = output_dir / "quadruped_barrel_roll_obstacle_min_time.npz"
     np.savez(
         result_path,
@@ -1185,6 +1591,14 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         X_zero_disturbance_rollout=np.asarray(X_rollout),
         zero_rollout_deviation=np.asarray(rollout_deviation),
         trajectory_tubes=np.asarray(trajectory_tubes),
+        Phi_x=np.asarray(Phi_x),
+        Phi_x_full=np.asarray(Phi_x_full),
+        Phi_u=np.asarray(Phi_u),
+        K_x_history=np.asarray(K_x_history),
+        X_state_feedback_rollout=np.asarray(X_feedback_rollout),
+        U_state_feedback_rollout=np.asarray(U_feedback_rollout),
+        x_perturbation_history=np.asarray(x_perturbation_history),
+        feedback_corrections=np.asarray(feedback_corrections),
         phase_names=np.asarray(PHASE_NAMES),
         phase_end_steps=np.asarray(PHASE_END_STEPS),
         phase_times=phase_times,
