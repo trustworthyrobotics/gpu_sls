@@ -34,6 +34,8 @@ class GenericMPC:
         X_in,
         U_in,
         shift: int = 1,
+        Q_bar: jnp.ndarray | None = None,
+        R_bar: jnp.ndarray | None = None,
     ):
         self.sls_config = sls_config
         self.sqp_config = sqp_config
@@ -41,6 +43,20 @@ class GenericMPC:
         self.config = config
         self.shift = shift
         self.obstacles = obstacles
+
+        if Q_bar is None:
+            Q_bar = jnp.broadcast_to(
+                jnp.eye(config.n, dtype=X_in.dtype),
+                (config.N + 1, config.n, config.n),
+            )
+        if R_bar is None:
+            R_bar = jnp.broadcast_to(
+                jnp.eye(config.nu, dtype=U_in.dtype),
+                (config.N, config.nu, config.nu),
+            )
+
+        self.Q_bar = jnp.asarray(Q_bar)
+        self.R_bar = jnp.asarray(R_bar)
 
         L = sls_config.gradient_window
 
@@ -252,6 +268,8 @@ class GenericMPC:
             self.Phi_x_I_ws, self.Phi_u_I_ws,
             self.a, self.b,
             self.converged_admm,
+            self.Q_bar,
+            self.R_bar,
         )
 
         self.converged_admm = converged_admm

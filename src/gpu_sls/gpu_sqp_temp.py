@@ -11,7 +11,7 @@ from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.optimizers import (
     parallel_filter_line_search,
 )
 from gpu_sls.gpu_admm import ADMMConfig
-from gpu_sls.hpipm import constrained_solve
+from gpu_sls.fatrop import constrained_solve
 from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu, tightening_from_nominal_state
 
 

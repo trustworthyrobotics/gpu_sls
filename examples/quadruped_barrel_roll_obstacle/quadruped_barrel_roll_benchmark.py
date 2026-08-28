@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from timeit import default_timer as timer
 import os
-os.environ["JAX_PLATFORMS"] = "cpu"
+# os.environ["JAX_PLATFORMS"] = "cpu"
 # os.environ["XLA_CLIENT_MEM_FRAC"] = "1.0"
 
 # Configure paths and headless MuJoCo before importing JAX/MuJoCo.

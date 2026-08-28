@@ -369,7 +369,8 @@ def compute_search_direction(
     h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws,
     Phi_x_I_ws, Phi_u_I_ws,
     a, b,
-    sqp_iteration
+    sqp_iteration,
+    Q_bar, R_bar,
 ):
     T = U.shape[0]
     nx = X.shape[1]
@@ -481,8 +482,20 @@ def sqp(
     w, y, rho, rho_grad,
     obstacles,
     h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, 
-    a, b, converged_admm_prev
+    a, b, converged_admm_prev,
+    Q_bar=None, R_bar=None,
 ):
+    if Q_bar is None:
+        Q_bar = jnp.broadcast_to(
+            jnp.eye(X_in.shape[-1], dtype=X_in.dtype),
+            (X_in.shape[0], X_in.shape[-1], X_in.shape[-1]),
+        )
+    if R_bar is None:
+        R_bar = jnp.broadcast_to(
+            jnp.eye(U_in.shape[-1], dtype=U_in.dtype),
+            (U_in.shape[0], U_in.shape[-1], U_in.shape[-1]),
+        )
+
     _cost = partial(cost, W, reference)
     if hessian_approx is not None:
         _hessian_approx = partial(hessian_approx, W, reference)
@@ -522,7 +535,8 @@ def sqp(
                 sqp_config.lm_regularization,
                 x0, X_curr, U_curr, V_curr, c,
                 w0, y0, rho0, rho_grad0,
-                h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a0, b0, i
+                h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a0, b0, i,
+                Q_bar, R_bar,
             )
 
             direction_finite = (

@@ -37,7 +37,7 @@ config.update(
 # -----------------------------
 MASS = 1.0
 GRAVITY = 9.81
-E_MAG = 2.0
+E_MAG = 2.5
 JX = 0.02
 JY = 0.02
 JZ = 0.04
@@ -484,7 +484,7 @@ def build_controller(
     NUM_PHASES = len(WAYPOINT_STEPS)
     n = 12 + NUM_PHASES
     nu = 4
-    TIME_WEIGHT = 0.5
+    TIME_WEIGHT = 5.0
 
     # -----------------------------
     # Cost weights
@@ -569,15 +569,18 @@ def build_controller(
         eps_abs=1e-2,
         eps_rel=1e-2,
         rho_max=1e6,
-        max_iterations=1000,
+        max_iterations=3000,
         rho_update_frequency=25,
         initial_rho=1.0,
         regularized_rho_update=False,
         num_phases=NUM_PHASES,
     )
 
-    Q_bar = jnp.broadcast_to(jnp.eye(n), (N +1, n, n)).at[..., 1, 1].set(5.0)
-    R_bar = jnp.broadcast_to(jnp.eye(nu) * 0.5, (N, nu, nu))
+    # Q_bar = jnp.broadcast_to(jnp.eye(n), (N +1, n, n)).at[..., 1, 1].set(1000).at[..., 7, 7].set(0.001)
+    # Q_bar = Q_bar + 1e-6 * jnp.eye(n)[None, :, :]
+    # R_bar = jnp.broadcast_to(jnp.eye(nu) * 0.5, (N, nu, nu))
+    Q_bar = jnp.broadcast_to(jnp.eye(n), (N +1, n, n))
+    R_bar = jnp.broadcast_to(jnp.eye(nu), (N, nu, nu))
 
     sls_cfg = SLSConfig(
         max_sls_iterations=1,
@@ -587,7 +590,7 @@ def build_controller(
         max_initial_sqp_iterations=50,
         warm_start=True,
         rti=False,
-        gradient_window=0,
+        gradient_window=10,
     )
 
     sqp_cfg = SQPConfig(
@@ -612,6 +615,8 @@ def build_controller(
         shift=1,
         X_in=X_IN,
         U_in=jnp.zeros((cfg.N, cfg.nu), dtype=DTYPE).at[:, 0].set(T_hover),
+        Q_bar=Q_bar,
+        R_bar=R_bar,
     )
     return controller
 
@@ -623,7 +628,8 @@ def plot_top_down_trajectory(
     Phi_x=None,
     E_mag=0.05,
     disturbance_field: DisturbanceFieldParams = DISTURBANCE_FIELD,
-    tube_stride=2,
+    tube_stride=1,
+    min_time=None,
     save_path="trajectory_topdown.png",
 ):
     import numpy as np
@@ -937,9 +943,15 @@ def plot_top_down_trajectory(
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
 
-    ax.set_title(
-        "Top-Down Trajectory, Disturbance Field, and SLS Tube"
-    )
+    if min_time is not None:
+        ax.set_title(
+            f"Total Min Time: {float(min_time):.3f} s\n"
+            "Top-Down Trajectory, Disturbance Field, and SLS Tube"
+        )
+    else:
+        ax.set_title(
+            "Top-Down Trajectory, Disturbance Field, and SLS Tube"
+        )
 
     # ax.axis("equal")
     ax.set_aspect("equal", adjustable="box")
@@ -1067,6 +1079,24 @@ def main():
     print("Phase Times:", phase_times)
     print("Computed Total Min Time:", min_time)
 
+    # -----------------------------
+    # Save optimized trajectory
+    # -----------------------------
+    trajectory_path = "multiphase_trajectory.npz"
+    np.savez(
+        trajectory_path,
+        X=np.asarray(X_pred),
+        U=np.asarray(U_pred),
+        phase_times=np.asarray(phase_times),
+        min_time=np.asarray(min_time),
+        waypoint_steps=np.asarray(WAYPOINT_STEPS),
+        waypoint_centers=np.asarray(WAYPOINT_CENTERS),
+        waypoint_half_widths=np.asarray(WAYPOINT_HALF_WIDTHS),
+        segment_lengths=np.asarray(SEGMENT_LENGTHS),
+        reference=np.asarray(reference),
+    )
+    print(f"Saved optimized trajectory to: {trajectory_path}")
+
 
     visualize_trajectory_and_gates(
         X=X_pred,
@@ -1086,6 +1116,7 @@ def main():
         E_mag=E_MAG,
         disturbance_field=DISTURBANCE_FIELD,
         tube_stride=2,
+        min_time=min_time,
         save_path="trajectory_topdown.png",
     )
 
