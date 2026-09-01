@@ -30,7 +30,7 @@ import numpy as np
 NPZ_PATH = Path(
     "/home/jeff/trustworthroboticsgroup/ICRA2026/min_time/"
     "gpu_sls/examples/quadruped_barrel_roll_obstacle_robust_new/"
-    "quadruped_barrel_roll_random_disturbance_feedback_rollouts.npz"
+    "disturbance_rollouts.npz"
 )
 
 OUTPUT_PATH = (

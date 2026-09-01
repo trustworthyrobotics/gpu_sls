@@ -654,11 +654,11 @@ def make_barrel_roll_constraints(reference, obstacle_constraints):
 
 def make_phase_scaled_disturbance(
     n,
-    position_magnitude=0.02,
+    position_magnitude=0.1,
     quaternion_magnitude=0.01,
     joint_position_magnitude=0.02,
-    linear_velocity_magnitude=0.05,
-    angular_velocity_magnitude=0.05,
+    linear_velocity_magnitude=0.1,
+    angular_velocity_magnitude=0.2,
     joint_velocity_magnitude=0.05,
     foot_position_magnitude=0.02,
     grf_magnitude=5.0,

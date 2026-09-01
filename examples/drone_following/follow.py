@@ -399,7 +399,19 @@ def tracking_stage_cost(x, u, xref, uref):
     )
 
 
-def tracking_terminal_cost(x, xref):
+def tracking_terminal_cost(x, xref, motion_weight=1.0):
+    """
+    Terminal tracking cost.
+
+    motion_weight = 1:
+        Normal full-state terminal tracking.
+
+    motion_weight = 0:
+        Track only terminal position/orientation.  This is used when the
+        fixed MPC horizon extends past the end of the offline trajectory so
+        the artificial end padding does not make the vehicle brake simply to
+        match the final reference velocity/rates.
+    """
     dpos = x[0:3] - xref[0:3]
     dang = x[3:6] - xref[3:6]
     dvel = x[6:9] - xref[6:9]
@@ -411,12 +423,15 @@ def tracking_terminal_cost(x, xref):
         + Q_ANG[2] * (1.0 - ca.cos(dang[2]))
     )
 
-    base = (
+    pose_cost = (
         Q_POS[0] * dpos[0] ** 2
         + Q_POS[1] * dpos[1] ** 2
         + Q_POS[2] * dpos[2] ** 2
         + angle_cost
-        + Q_VEL[0] * dvel[0] ** 2
+    )
+
+    motion_cost = (
+        Q_VEL[0] * dvel[0] ** 2
         + Q_VEL[1] * dvel[1] ** 2
         + Q_VEL[2] * dvel[2] ** 2
         + Q_RATE[0] * drate[0] ** 2
@@ -424,7 +439,9 @@ def tracking_terminal_cost(x, xref):
         + Q_RATE[2] * drate[2] ** 2
     )
 
-    return TERMINAL_MULTIPLIER * base
+    return TERMINAL_MULTIPLIER * (
+        pose_cost + motion_weight * motion_cost
+    )
 
 
 # ============================================================
@@ -489,6 +506,19 @@ def build_fatrop_mpc(horizon):
         for _ in range(H)
     ]
 
+    # 1 for a real offline trajectory interval, 0 for fixed-horizon padding
+    # beyond the end of the trajectory.
+    stage_active = [
+        opti.parameter()
+        for _ in range(H)
+    ]
+
+    # Full terminal velocity/rate tracking when the prediction horizon lies
+    # inside the offline trajectory.  Set to zero when the fixed horizon runs
+    # past the final node, so the end of the saved trajectory does not create
+    # an artificial braking objective.
+    terminal_motion_weight = opti.parameter()
+
     def add_local_constraint(stage, expr, lb, ub):
         n_expr = int(expr.numel())
 
@@ -552,7 +582,10 @@ def build_fatrop_mpc(horizon):
                 U_MAX,
             )
 
-            objective += tracking_stage_cost(
+            # IMPORTANT: padded stages beyond the offline trajectory have
+            # stage_active[j] = 0, so they contribute exactly zero tracking
+            # cost and therefore cannot make the vehicle brake early.
+            objective += stage_active[j] * tracking_stage_cost(
                 xj,
                 U[j],
                 X_ref[j],
@@ -563,6 +596,7 @@ def build_fatrop_mpc(horizon):
             objective += tracking_terminal_cost(
                 xj,
                 X_ref[j],
+                motion_weight=terminal_motion_weight,
             )
 
     opti.minimize(objective)
@@ -589,6 +623,8 @@ def build_fatrop_mpc(horizon):
         "X_ref": X_ref,
         "U_ref": U_ref,
         "dt_ref": dt_ref,
+        "stage_active": stage_active,
+        "terminal_motion_weight": terminal_motion_weight,
         "objective": objective,
         "H": H,
     }
@@ -740,12 +776,25 @@ def local_reference_window(
     horizon,
 ):
     """
-    Extract/pad a fixed-size local reference window.
+    Extract a fixed-size local reference window without allowing padding
+    beyond the final offline node to alter the preceding MPC behavior.
 
-    Near the final node:
-      - X reference is held at X_final
-      - U reference is hover
-      - dt is held at the final optimized dt
+    Real trajectory intervals:
+        active = 1
+        dt     = optimized offline dt
+        cost   = normal tracking cost
+
+    Intervals beyond the final trajectory node:
+        active = 0
+        dt     = 0
+        cost   = 0
+
+    Because dt = 0 on padded intervals,
+
+        x[j+1] = x[j]
+
+    and because active = 0, those intervals exert no tracking pressure on
+    the earlier controls.  The fixed FATROP problem size is preserved.
     """
     H = int(horizon)
     N = len(U_plan)
@@ -760,17 +809,23 @@ def local_reference_window(
         dtype=float,
     )
 
-    dt_ref = np.empty(
+    dt_ref = np.zeros(
         H,
         dtype=float,
     )
 
+    stage_active = np.zeros(
+        H,
+        dtype=float,
+    )
+
+    # State reference is still padded with the final state for a sensible
+    # warm start.  Padded stage costs are masked out below.
     for j in range(H + 1):
         idx = min(
             k + j,
             N,
         )
-
         X_ref[j] = X_plan[idx]
 
     for j in range(H):
@@ -779,14 +834,33 @@ def local_reference_window(
         if idx < N:
             U_ref[j] = U_plan[idx]
             dt_ref[j] = dt_plan[idx]
+            stage_active[j] = 1.0
         else:
+            # This is not a real part of the trajectory.  Keep a harmless
+            # control reference for the warm start, but freeze dynamics and
+            # completely remove the stage from the tracking objective.
             U_ref[j] = np.array(
                 [T_HOVER, 0.0, 0.0, 0.0],
                 dtype=float,
             )
-            dt_ref[j] = dt_plan[-1]
+            dt_ref[j] = 0.0
+            stage_active[j] = 0.0
 
-    return X_ref, U_ref, dt_ref
+    # If the fixed MPC horizon extends beyond the saved trajectory, do not
+    # ask the artificial terminal stage to match final velocity/rates.  It
+    # still tracks final position/orientation, so the finish remains spatially
+    # meaningful without imposing a stop merely because the file ends.
+    terminal_motion_weight = (
+        1.0 if (k + H) <= N else 0.0
+    )
+
+    return (
+        X_ref,
+        U_ref,
+        dt_ref,
+        stage_active,
+        terminal_motion_weight,
+    )
 
 
 # ============================================================
@@ -799,6 +873,8 @@ def solve_mpc_step(
     X_ref_np,
     U_ref_np,
     dt_ref_np,
+    stage_active_np,
+    terminal_motion_weight_np,
     X_guess=None,
     U_guess=None,
 ):
@@ -834,6 +910,15 @@ def solve_mpc_step(
             mpc["dt_ref"][j],
             float(dt_ref_np[j]),
         )
+        opti.set_value(
+            mpc["stage_active"][j],
+            float(stage_active_np[j]),
+        )
+
+    opti.set_value(
+        mpc["terminal_motion_weight"],
+        float(terminal_motion_weight_np),
+    )
 
     # Warm start.
     if X_guess is None:
@@ -1230,6 +1315,8 @@ def run_tracking(
             X_ref,
             U_ref,
             dt_ref,
+            stage_active,
+            terminal_motion_weight,
         ) = local_reference_window(
             X_plan=X_plan,
             U_plan=U_plan,
@@ -1277,6 +1364,8 @@ def run_tracking(
                 X_ref_np=X_ref,
                 U_ref_np=U_ref,
                 dt_ref_np=dt_ref,
+                stage_active_np=stage_active,
+                terminal_motion_weight_np=terminal_motion_weight,
                 X_guess=X_guess,
                 U_guess=U_guess,
             )

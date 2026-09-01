@@ -37,7 +37,7 @@ class ADMMConfig:
     initial_rho: int = 1.0
     regularized_rho_update: bool = False
     num_phases: int = 1
-    slack_weight: float = 1e4
+    slack_weight: float = 1e3
 
     def tree_flatten(self):
         children = (
