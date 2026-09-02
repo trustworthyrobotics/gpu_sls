@@ -452,7 +452,8 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
                        obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
                        beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray,
                        Phi_x_I_ws: jnp.ndarray, Phi_u_I_ws: jnp.ndarray,
-                       a_init: jnp.ndarray, b_init: jnp.ndarray):
+                       a_init: jnp.ndarray, b_init: jnp.ndarray,
+                       slack_weight=None):
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
@@ -560,29 +561,33 @@ def sls_solve_gpu(cfg, sls_config: SLSConfig, disturbance_fn, Q: jnp.ndarray, q:
                 (0, 0),
             ),
         )
-        X_windows = make_state_windows(primal_pos, L)
-
-        Jh_window = jax.vmap(
-            lambda Xk, Pxk, Puk, Ck, Dk: jax.jacfwd(
-                lambda W: tightening_stage_window(
-                    W,
-                    Pxk,
-                    Puk,
-                    Ck,
-                    Dk,
-                    disturbance_fn,
-                )
-            )(Xk)
-        )(
-            X_windows,
-            Phi_x_window,
-            Phi_u_window,
-            C_box,
-            D_box,
-        )
+        if L != 0:
+            X_windows = make_state_windows(primal_pos, L)
+            Jh_window = jax.vmap(
+                lambda Xk, Pxk, Puk, Ck, Dk: jax.jacfwd(
+                    lambda W: tightening_stage_window(
+                        W,
+                        Pxk,
+                        Puk,
+                        Ck,
+                        Dk,
+                        disturbance_fn,
+                    )
+                )(Xk)
+            )(
+                X_windows,
+                Phi_x_window,
+                Phi_u_window,
+                C_box,
+                D_box,
+            )
+        else:
+            Jh_window = jnp.zeros((T + 1, C_box.shape[1], sls_config.gradient_window, nx))
 
         x_curr, u_curr, v_curr, w, y, rho, rho_grad, mu, a, b, converged_admm = constrained_solve(
-            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho, rho_grad, Jh_window, a, b, L 
+            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all,
+            w, y, rho, rho_grad, Jh_window, a, b, L,
+            slack_weight=slack_weight,
         )
         metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
         mu_nominal = mu[: , :num_regular_constraints]

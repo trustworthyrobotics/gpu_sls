@@ -36,7 +36,7 @@ config.update(
 # -----------------------------
 MASS = 1.0
 GRAVITY = 9.81
-E_MAG = 15.0
+E_MAG = 10.0
 JX = 0.02
 JY = 0.02
 JZ = 0.04
@@ -45,7 +45,7 @@ J_INV = jnp.diag(jnp.array([1.0 / JX, 1.0 / JY, 1.0 / JZ], dtype=DTYPE))
 
 NUM_RANDOM = 5
 NUM_ADV = 26
-
+E_MAG_MODEL = 0.0
 
 # -----------------------------
 # Shared disturbance-field parameters
@@ -963,6 +963,10 @@ def build_controller(
         initial_rho=1.0,
         regularized_rho_update=False,
         num_phases=NUM_PHASES,
+        enable_slack=True,
+        dynamic_slack=True,
+        slack_weight_start=1e2,
+        slack_weight_end=1e5,
     )
 
     # Q_bar = jnp.broadcast_to(jnp.eye(n), (N +1, n, n)).at[..., 1, 1].set(1000).at[..., 7, 7].set(0.001)
@@ -1604,7 +1608,7 @@ def main():
     #   center + offset*n   (behind / outgoing side)
     #
     # for every physical gate.
-    GATE_TRANSITION_OFFSET = 0.30
+    GATE_TRANSITION_OFFSET = 0.55
 
     # Oriented box around each pre/post transition point.
     #
@@ -1616,7 +1620,7 @@ def main():
     # Therefore local half-widths [u, v, n] are:
     #   [0.40, 0.15, 0.10]
     TRANSITION_WAYPOINT_HALF_WIDTHS = jnp.array(
-        [0.40, 0.15, 0.10],
+        [0.50, 0.5, 0.40],
         dtype=DTYPE,
     )
 

@@ -10,7 +10,11 @@ from matplotlib.patches import Rectangle
 from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.optimizers import (
     parallel_filter_line_search,
 )
-from gpu_sls.gpu_admm import ADMMConfig, constrained_solve
+from gpu_sls.gpu_admm import (
+    ADMMConfig,
+    constrained_solve,
+    slack_weight_for_iteration,
+)
 from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu, tightening_from_nominal_state
 
 
@@ -199,6 +203,54 @@ class SQPConfig:
     def tree_unflatten(cls, aux, children):
         return cls(*children)
 
+
+def _slack_weight_for_sqp_iteration(
+    admm_config: ADMMConfig,
+    sls_config: SLSConfig,
+    sqp_config: SQPConfig,
+    sqp_iteration,
+    dtype,
+):
+    """Schedule slack within nominal and robust SQP phases."""
+    has_nominal_phase = (
+        sls_config.enable_fastsls
+        and sls_config.max_initial_sqp_iterations > 0
+    )
+    if has_nominal_phase:
+        nominal_phase = sqp_iteration < sls_config.max_initial_sqp_iterations
+        phase_iteration = lax.select(
+            nominal_phase,
+            sqp_iteration,
+            sqp_iteration - sls_config.max_initial_sqp_iterations,
+        )
+        phase_iterations = lax.select(
+            nominal_phase,
+            jnp.asarray(
+                sls_config.max_initial_sqp_iterations,
+                dtype=sqp_iteration.dtype,
+            ),
+            jnp.asarray(
+                sqp_config.max_sqp_iterations,
+                dtype=sqp_iteration.dtype,
+            ),
+        )
+    else:
+        phase_iteration = sqp_iteration
+        phase_iterations = jnp.asarray(
+            (
+                sqp_config.max_sqp_iterations
+                + sls_config.max_initial_sqp_iterations
+            ),
+            dtype=sqp_iteration.dtype,
+        )
+
+    return slack_weight_for_iteration(
+        admm_config,
+        phase_iteration,
+        phase_iterations,
+        dtype=dtype,
+    )
+
 @partial(jit, static_argnums=(0, 1, 2))
 def model_evaluator_helper_min_time(
     cost,
@@ -246,6 +298,7 @@ def filter_model_evaluator_factory(
     D_box: jnp.ndarray,
     eps_abs: float,
     backoffs,
+    L,
 ):
     """Build a line-search evaluator with state-dependent tightenings.
 
@@ -273,14 +326,16 @@ def filter_model_evaluator_factory(
         # Original nonlinear nominal constraints.
         g_base = vectorize(constraints)(X, U_pad, t)
 
-        h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
+        if L != 0:
+            h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
+        else:
+            h_ct_trial = backoffs
 
         n_tight = h_ct_trial.shape[1]
         # eps_abs = 0
         g_base_tight = (
             g_base[:, :n_tight]
             + h_ct_trial
-            # + backoffs
             + eps_abs
         )
 
@@ -370,6 +425,7 @@ def compute_search_direction(
     Phi_x_I_ws, Phi_u_I_ws,
     a, b,
     sqp_iteration,
+    slack_weight,
     Q_bar, R_bar,
 ):
     T = U.shape[0]
@@ -443,6 +499,7 @@ def compute_search_direction(
         Jh = jnp.zeros((T + 1, nc, sls_config.gradient_window, nx))
         dX, dU, dV, w1, y1, rho1, rho_grad1, _, a1, b1, converged_admm = constrained_solve(
             admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, rho_grad, Jh, a, b, sls_config.gradient_window, just_nominal=True,
+            slack_weight=slack_weight,
         )
         backoffs = jnp.zeros((T + 1, nc - n_obs))
         Phi_x   = jnp.zeros((T + 1, T + 1, nx, nx))
@@ -457,6 +514,7 @@ def compute_search_direction(
             Q, q, R, r, M, A, B, c,
             C_all, D_all, f_all, w, y, rho, rho_grad,
             Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a, b,
+            slack_weight,
         )
         return dX, dU, dV, w1, y1, rho1, rho_grad1, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a1, b1, converged_admm
 
@@ -496,7 +554,7 @@ def sqp(
             (U_in.shape[0], U_in.shape[-1], U_in.shape[-1]),
         )
 
-    _cost = partial(cost, W, reference)
+    _cost = partial(cost, W, reference, parameter=parameter)
     if hessian_approx is not None:
         _hessian_approx = partial(hessian_approx, W, reference)
     else:
@@ -519,7 +577,7 @@ def sqp(
             )
             # warm_flag = jnp.logical_and(warm_flag, jnp.array(i != sls_config.max_initial_sqp_iterations))
             # Turn this off? seems to be more optimal
-            w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
+            # w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
             w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
             a0 = lax.select(jnp.array(False), a, jnp.zeros_like(a))
@@ -528,6 +586,19 @@ def sqp(
             b0 = lax.select(warm_flag, b, jnp.zeros_like(b))
             rho0 = lax.select(warm_flag, rho, jnp.asarray(admm_config.initial_rho, dtype=rho.dtype))
             h_ct_ws = backoffs
+            slack_weight = _slack_weight_for_sqp_iteration(
+                admm_config,
+                sls_config,
+                sqp_config,
+                i,
+                X_curr.dtype,
+            )
+            if admm_config.enable_slack and admm_config.dynamic_slack:
+                jax.debug.print(
+                    "Slack schedule: SQP iteration {} weight={:.3e}",
+                    i + 1,
+                    slack_weight,
+                )
             dX, dU, dV, q, r, w1, y1, rho1, rho_grad1, backoffs1, Phi_x1, Phi_u1, betaN, muN, Phi_x_I_next, Phi_u_I_next, a1, b1, converged_admm_new = compute_search_direction(
                 sls_config, admm_config,
                 _cost, _dynamics, _hessian_approx,
@@ -537,6 +608,7 @@ def sqp(
                 x0, X_curr, U_curr, V_curr, c,
                 w0, y0, rho0, rho_grad0,
                 h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a0, b0, i,
+                slack_weight,
                 Q_bar, R_bar,
             )
 
@@ -608,6 +680,7 @@ def sqp(
                 D_box=D_all,
                 backoffs=backoffs1,
                 eps_abs=admm_config.eps_abs,
+                L=sls_config.gradient_window,
             )
             current_cost, current_c_filter = filter_model_evaluator(X_curr, U_curr)
 

@@ -45,7 +45,7 @@ import numpy as np
 from mujoco import mjx
 from mujoco.mjx._src import math
 
-import config_go2 as config
+import config_go2_rti as config
 import mpc_utils as barrel_mpc_utils
 import gpu_sls.legged_mpc as mpc_wrapper
 from gpu_sls.gpu_admm import ADMMConfig
@@ -60,7 +60,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # -----------------------------------------------------------------------------
 # Online MPC dimensions / limits.
 # -----------------------------------------------------------------------------
-TRACK_HORIZON = 20
+TRACK_HORIZON = 15
 PLAN_N = 50
 PHYSICAL_N = 13 + 2 * config.n_joints + 6 * config.n_contact
 
@@ -84,7 +84,12 @@ MAX_HORIZON_TIME = TRACK_HORIZON * MAX_DT
 
 # Tracking-vs-speed tradeoff.  The summed stage time term is exactly
 # TIME_WEIGHT * T because each of H stages contributes T/H.
-TIME_WEIGHT = 1.0e3
+TIME_WEIGHT = 1.0e2
+
+# First MPC update: solve the short-horizon NLP to convergence (or this cap).
+# Every subsequent update uses exactly one SQP step, i.e. RTI.
+INITIAL_FULL_SQP_STEPS = 100
+RTI_SQP_STEPS = 1
 
 # Same physical disturbance rates as the robust planner, scaled by optimized dt.
 DIST_POSITION = 0.10
@@ -220,7 +225,7 @@ def tracking_dynamics(model, mjx_model, contact_id, body_id):
     return dynamics
 
 
-def tracking_cost(W, reference, x, u, t):
+def tracking_cost(W, reference, x, u, t, *, parameter):
     """Follow the saved path while minimizing the current horizon duration T."""
 
     nj = config.n_joints
@@ -714,7 +719,7 @@ def main(
     # One free final state coordinate = one short-horizon duration T.
     admm_config = ADMMConfig(
         eps_abs=1e-1,
-        eps_rel=1e-3,
+        eps_rel=1e-1,
         rho_max=1.0e6,
         max_iterations=400,
         rho_update_frequency=25,
@@ -722,6 +727,12 @@ def main(
         regularized_rho_update=False,
         num_phases=1,
     )
+    # Use two solver wrappers with identical problem data:
+    #   * full_mpc: first receding-horizon update, up to 100 SQP iterations
+    #   * rti_mpc:  all later updates, exactly one SQP iteration
+    #
+    # Keeping the dimensions/problem definition identical lets the converged first
+    # solution and SLS/ADMM workspace warm-start the RTI loop directly.
     sls_config = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1.0e-2,
@@ -732,25 +743,38 @@ def main(
         rti=False,
         gradient_window=0,
     )
-    sqp_config = SQPConfig(
-        max_sqp_iterations=1,
+    full_sqp_config = SQPConfig(
+        max_sqp_iterations=INITIAL_FULL_SQP_STEPS,
         warm_start=True,
         feas_tol=1.0e-5,
         step_tol=1.0e-5,
         line_search=False,
-        lm_regularization=5.0e-2,
+        lm_regularization=1.0e-2,
+    )
+    rti_sqp_config = SQPConfig(
+        max_sqp_iterations=RTI_SQP_STEPS,
+        warm_start=True,
+        feas_tol=1.0e-5,
+        step_tol=1.0e-5,
+        line_search=False,
+        lm_regularization=1.0e-2,
     )
 
-    mpc = mpc_wrapper.MPCWrapper(
-        config,
+    wrapper_kwargs = dict(
         sls_config=sls_config,
-        sqp_config=sqp_config,
         admm_config=admm_config,
         constraints=constraints,
         obstacles=jnp.zeros((0, 3), dtype=config.initial_state.dtype),
         disturbance=disturbance,
     )
-    data = mpc.make_data()
+    full_mpc = mpc_wrapper.MPCWrapper(
+        config, sqp_config=full_sqp_config, **wrapper_kwargs
+    )
+    rti_mpc = mpc_wrapper.MPCWrapper(
+        config, sqp_config=rti_sqp_config, **wrapper_kwargs
+    )
+    full_data = full_mpc.make_data()
+    rti_data = rti_mpc.make_data()
 
     first_reference, first_X_ref, first_U_ref = make_reference_window(
         X_plan, U_plan, node_dts, 0
@@ -765,7 +789,7 @@ def main(
             jnp.asarray(0, dtype=jnp.int32),
         ).shape
         dynamics_shape = jax.eval_shape(
-            mpc.dynamics,
+            rti_mpc.dynamics,
             first_X_ref[0],
             jnp.asarray(U_plan[0]),
             jnp.asarray(0, dtype=jnp.int32),
@@ -804,7 +828,7 @@ def main(
     x = first_X_ref[0]
     X_guess = first_X_ref.at[0].set(x)
     U_guess = first_U_ref
-    workspace = workspace_from_data(data)
+    workspace = workspace_from_data(full_data)
 
     rollout_X_aug = [np.asarray(x)]
     rollout_U = []
@@ -818,10 +842,18 @@ def main(
     optimized_horizon_times = []
     applied_dts = []
 
-    def solve_step(x0, ref, param, Xg, Ug, ws):
-        return solve_rti_step(mpc, data, x0, ref, param, Xg, Ug, ws)
+    def solve_full_step(x0, ref, param, Xg, Ug, ws):
+        return solve_rti_step(
+            full_mpc, full_data, x0, ref, param, Xg, Ug, ws
+        )
 
-    solve_step = jax.jit(solve_step)
+    def solve_rti_update(x0, ref, param, Xg, Ug, ws):
+        return solve_rti_step(
+            rti_mpc, rti_data, x0, ref, param, Xg, Ug, ws
+        )
+
+    solve_full_step = jax.jit(solve_full_step)
+    solve_rti_update = jax.jit(solve_rti_update)
     key = jax.random.PRNGKey(seed)
 
     for k in range(n_steps):
@@ -835,8 +867,12 @@ def main(
         x = x.at[T_INDEX].set(X_guess[0, T_INDEX])
         X_guess = X_guess.at[0, :PHYSICAL_N].set(x[:PHYSICAL_N])
 
+        # The first update is a genuine full SQP solve.  Once that trajectory is
+        # converged, switch permanently to one-SQP-step RTI updates.
+        solver = solve_full_step if k == 0 else solve_rti_update
+
         start = timer()
-        result = solve_step(
+        result = solver(
             x,
             reference,
             parameter,
@@ -863,7 +899,7 @@ def main(
         # Apply only the first optimized stage.  On the next measurement the
         # horizon shifts one saved path node and T is optimized again.
         current_x = x.at[T_INDEX].set(T_opt)
-        x = mpc.dynamics(
+        x = rti_mpc.dynamics(
             current_x,
             u,
             jnp.asarray(0, dtype=jnp.int32),
@@ -907,8 +943,9 @@ def main(
                 x,
             )
 
+        solve_label = "FULL" if k == 0 else "RTI "
         print(
-            f"RTI {k:02d}: solve={elapsed * 1e3:8.3f} ms  "
+            f"{solve_label} {k:02d}: solve={elapsed * 1e3:8.3f} ms  "
             f"T={optimized_horizon_times[-1]:.5f} s  "
             f"dt={applied_dts[-1] * 1e3:7.3f} ms  "
             f"pos_err={pe:.4f} m  rot_err={oe:.2f} deg  "

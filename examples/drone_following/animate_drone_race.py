@@ -727,11 +727,11 @@ def make_animation(
         handles.append(gate_handle)
         labels.append("Physical gate")
 
-    ax.legend(
-        handles,
-        labels,
-        loc="upper right",
-    )
+    # ax.legend(
+    #     handles,
+    #     labels,
+    #     loc="upper right",
+    # )
 
     title = ax.set_title("")
 

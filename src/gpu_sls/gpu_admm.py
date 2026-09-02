@@ -38,6 +38,10 @@ class ADMMConfig:
     regularized_rho_update: bool = False
     num_phases: int = 1
     slack_weight: float = 1e3
+    dynamic_slack: bool = False
+    slack_weight_start: float = 1e2
+    slack_weight_end: float = 1e5
+    enable_slack: bool = True
 
     def tree_flatten(self):
         children = (
@@ -52,12 +56,46 @@ class ADMMConfig:
             self.regularized_rho_update,
             self.num_phases,
             self.slack_weight,
+            self.dynamic_slack,
+            self.slack_weight_start,
+            self.slack_weight_end,
+            self.enable_slack,
         )
         return children, None
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         return cls(*children)
+
+
+def slack_weight_for_iteration(
+    cfg: ADMMConfig,
+    iteration,
+    phase_iterations,
+    dtype=jnp.float32,
+):
+    """Return the slack penalty for a zero-based SQP phase iteration.
+
+    Dynamic penalties are geometrically spaced, which gives an even ramp in
+    log space.  For example, a 50-iteration phase with endpoints 1e2 and 1e5
+    produces approximately 1e2, 2.95e3, and 1e5 at iterations 1, 25, and 50.
+    A one-iteration phase uses slack_weight_start.
+    """
+    if not cfg.dynamic_slack:
+        return jnp.asarray(cfg.slack_weight, dtype=dtype)
+
+    start = jnp.asarray(cfg.slack_weight_start, dtype=dtype)
+    end = jnp.asarray(cfg.slack_weight_end, dtype=dtype)
+    phase_iterations = jnp.asarray(phase_iterations, dtype=dtype)
+    last_iteration = jnp.maximum(phase_iterations - 1.0, 0.0)
+    iteration = jnp.clip(
+        jnp.asarray(iteration, dtype=dtype), 0.0, last_iteration
+    )
+    progress = iteration / jnp.maximum(last_iteration, 1.0)
+    return jnp.exp(
+        jnp.log(start) + progress * (jnp.log(end) - jnp.log(start))
+    )
+
 
 def _shift_down(x, step):
     pad = jnp.zeros((step,) + x.shape[1:], dtype=x.dtype)
@@ -587,6 +625,7 @@ def project(
     rho_grad: float,
     window_mask: jnp.ndarray,
     slack_weight: float,
+    enable_slack: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Slack-augmented projection for
@@ -597,6 +636,9 @@ def project(
     with quadratic slack penalty
 
         0.5 * slack_weight * ||s||^2.
+
+    If enable_slack is false, the projection enforces the inequality as a
+    hard constraint and returns zero slack.
 
     The slack is analytically eliminated in the proximal projection, so it
     does not increase the LQR state/control dimension.
@@ -609,10 +651,17 @@ def project(
 
     num_grad_terms = jnp.sum(window_mask, axis=1)
 
+    effective_slack_weight = jnp.where(
+        enable_slack,
+        slack_weight,
+        jnp.asarray(jnp.inf, dtype=z_bar.dtype),
+    )
+    inverse_slack_weight = 1.0 / effective_slack_weight
+
     denominator = (
         1.0 / rho
         + num_grad_terms / rho_grad
-        + 1.0 / slack_weight
+        + inverse_slack_weight
     )
 
     mu = jnp.maximum(
@@ -628,7 +677,7 @@ def project(
     )
     z_grad_new = window_mask[:, :, None] * z_grad_new
 
-    slack = mu / slack_weight
+    slack = mu * inverse_slack_weight
 
     return z_bar_new, z_grad_new, slack
 
@@ -650,10 +699,19 @@ def previous_state_windows(
 
     return x_window, valid
 
-def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, rho_grad, Jh, a, b, L, just_nominal=False):
+def constrained_solve(
+    cfg: ADMMConfig,
+    Q, q, R, r, M, A, B, c, C, D, f,
+    w, y, rho, rho_grad, Jh, a, b, L,
+    just_nominal=False,
+    slack_weight=None,
+):
     # Runtime JAX boolean. Keep this dynamic (do not make it a static JIT arg)
     # so callers can switch between nominal initialization and robust solves.
     just_nominal = jnp.asarray(just_nominal, dtype=jnp.bool_)
+    if slack_weight is None:
+        slack_weight = cfg.slack_weight
+    slack_weight = jnp.asarray(slack_weight, dtype=Q.dtype)
 
     rho_max = cfg.rho_max
     T = A.shape[0] + 1
@@ -711,22 +769,28 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         )
 
         def nominal_projection(_):
-            # Soft nominal projection:
+            # Nominal inequality projection with optional slack:
             #
             #   w <= f + s,  s >= 0
             #
-            # with 0.5 * slack_weight * ||s||^2.
+            # When enabled, slack costs 0.5 * slack_weight * ||s||^2.
             v = z_bar + y_bar
             violation = jnp.maximum(v - f, 0.0)
 
+            effective_slack_weight = jnp.where(
+                cfg.enable_slack,
+                slack_weight,
+                jnp.asarray(jnp.inf, dtype=z_bar.dtype),
+            )
+            inverse_slack_weight = 1.0 / effective_slack_weight
             denominator = (
                 1.0 / rho
-                + 1.0 / cfg.slack_weight
+                + inverse_slack_weight
             )
 
             mu = violation / denominator
             w_new = v - mu / rho
-            slack_new = mu / cfg.slack_weight
+            slack_new = mu * inverse_slack_weight
 
             # During nominal initialization, disable the gradient split.
             z_grad = jnp.zeros_like(a_prev)
@@ -746,7 +810,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
                 rho,
                 rho_grad,
                 window_mask,
-                cfg.slack_weight,
+                slack_weight,
+                cfg.enable_slack,
             )
 
             b_new = (
@@ -1049,10 +1114,11 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     mu = rho_final * y_bar
 
     jax.debug.print(
-        "Slack: max={:.3e} mean={:.3e} weight={:.3e}",
+        "Slack: enabled={} max={:.3e} mean={:.3e} weight={:.3e}",
+        cfg.enable_slack,
         jnp.max(slack_final),
         jnp.mean(slack_final),
-        cfg.slack_weight,
+        slack_weight,
     )
 
         # ---------------------------------------------------------
