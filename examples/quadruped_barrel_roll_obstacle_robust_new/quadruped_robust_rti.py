@@ -45,7 +45,7 @@ import numpy as np
 from mujoco import mjx
 from mujoco.mjx._src import math
 
-import config_go2_rti as config
+import config_go2 as config
 import mpc_utils as barrel_mpc_utils
 import gpu_sls.legged_mpc as mpc_wrapper
 from gpu_sls.gpu_admm import ADMMConfig
@@ -60,7 +60,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # -----------------------------------------------------------------------------
 # Online MPC dimensions / limits.
 # -----------------------------------------------------------------------------
-TRACK_HORIZON = 15
+TRACK_HORIZON = 20
 PLAN_N = 50
 PHYSICAL_N = 13 + 2 * config.n_joints + 6 * config.n_contact
 
@@ -84,7 +84,7 @@ MAX_HORIZON_TIME = TRACK_HORIZON * MAX_DT
 
 # Tracking-vs-speed tradeoff.  The summed stage time term is exactly
 # TIME_WEIGHT * T because each of H stages contributes T/H.
-TIME_WEIGHT = 1.0e2
+TIME_WEIGHT = 1.0e3
 
 # First MPC update: solve the short-horizon NLP to convergence (or this cap).
 # Every subsequent update uses exactly one SQP step, i.e. RTI.
@@ -719,7 +719,7 @@ def main(
     # One free final state coordinate = one short-horizon duration T.
     admm_config = ADMMConfig(
         eps_abs=1e-1,
-        eps_rel=1e-1,
+        eps_rel=1e-2,
         rho_max=1.0e6,
         max_iterations=400,
         rho_update_frequency=25,
@@ -824,7 +824,8 @@ def main(
     if feasible is False:
         print("WARNING: planner NPZ marks the offline trajectory as infeasible.")
 
-    n_steps = plan_n if max_steps is None else min(plan_n, max_steps)
+    # n_steps = plan_n if max_steps is None else min(plan_n, max_steps)
+    n_steps = 80
     x = first_X_ref[0]
     X_guess = first_X_ref.at[0].set(x)
     U_guess = first_U_ref
@@ -1024,7 +1025,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output",
         type=Path,
-        default=DIR_PATH / "quadruped_barrel_roll_robust_rti_singleT_rollout.npz",
+        default=DIR_PATH / "quadruped_barrel_roll_robust_rti_rollout.npz",
         help="Closed-loop single-T robust RTI rollout NPZ.",
     )
     parser.add_argument(

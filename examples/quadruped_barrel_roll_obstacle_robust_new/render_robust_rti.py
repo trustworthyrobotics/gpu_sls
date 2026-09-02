@@ -34,7 +34,7 @@ import numpy as np
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "rti.npz"
+DEFAULT_INPUT = SCRIPT_DIR / "quadruped_barrel_roll_robust_rti_rollout.npz"
 DEFAULT_OBSTACLE_CENTER = np.array([0.0, -0.30, 0.08], dtype=np.float64)
 DEFAULT_OBSTACLE_SIZE = np.array([0.80, 0.05, 0.16], dtype=np.float64)
 
@@ -158,9 +158,58 @@ def load_rti_trajectory(
                 f"got {states.shape}."
             )
 
-        if "node_times" not in result:
-            raise ValueError(f"{filename} does not contain node_times.")
-        node_times = np.asarray(result["node_times"], dtype=np.float64).reshape(-1)
+        # RTI rollouts and offline references use different physical clocks.
+        # Current tracker outputs save:
+        #   X_rollout / X_rollout_augmented -> executed_node_times
+        #   X_reference                    -> offline_node_times
+        # Keep support for older files that used a generic node_times key.
+        preferred_timing_keys = []
+        if state_key in ("X_rollout", "X_rollout_augmented"):
+            preferred_timing_keys.extend(["executed_node_times", "node_times"])
+        elif state_key == "X_reference":
+            preferred_timing_keys.extend(["offline_node_times", "node_times"])
+        else:
+            preferred_timing_keys.extend(
+                ["node_times", "executed_node_times", "offline_node_times"]
+            )
+
+        node_times = None
+        timing_key = None
+        for key in preferred_timing_keys:
+            if key not in result:
+                continue
+            candidate = np.asarray(result[key], dtype=np.float64).reshape(-1)
+            if candidate.size == states.shape[0]:
+                node_times = candidate
+                timing_key = key
+                break
+
+        # Final fallback for rollout files: reconstruct the node clock directly
+        # from the optimized first-stage dt applied at every MPC update.
+        if node_times is None and "applied_dts" in result:
+            applied_dts = np.asarray(result["applied_dts"], dtype=np.float64).reshape(-1)
+            if applied_dts.size + 1 == states.shape[0]:
+                node_times = np.concatenate(
+                    [np.array([0.0], dtype=np.float64), np.cumsum(applied_dts)]
+                )
+                timing_key = "reconstructed_from_applied_dts"
+
+        if node_times is None:
+            available_timing = [
+                key
+                for key in (
+                    "node_times",
+                    "executed_node_times",
+                    "offline_node_times",
+                    "applied_dts",
+                )
+                if key in result
+            ]
+            raise ValueError(
+                f"Could not find a timing array compatible with {state_key!r} "
+                f"({states.shape[0]} states) in {filename}. "
+                f"Available timing keys: {available_timing}"
+            )
 
         source_trajectory = (
             _npz_scalar_string(result["source_trajectory"])
@@ -168,7 +217,7 @@ def load_rti_trajectory(
             else None
         )
 
-        metadata: dict[str, object] = {}
+        metadata: dict[str, object] = {"timing_key": timing_key}
         if "disturbance_injected" in result:
             metadata["disturbance_injected"] = bool(
                 np.asarray(result["disturbance_injected"]).reshape(()).item()
@@ -418,9 +467,9 @@ def render_video(
         stderr=subprocess.PIPE,
     )
 
-    # node_times are absolute physical times from the offline optimized plan.
-    # Shift them to zero so truncated RTI runs also render with the correct
-    # physical duration.
+    # node_times are the physical clock associated with the selected state array:
+    # executed RTI time for X_rollout, offline plan time for X_reference.
+    # Shift to zero so either representation renders with the correct duration.
     render_times = node_times - node_times[0]
     duration = float(render_times[-1])
     frame_count = max(2, int(np.ceil(duration * fps)) + 1)
@@ -564,6 +613,8 @@ def main() -> None:
     if source_path is not None:
         print(f"Offline source trajectory: {source_path}")
     print(f"Duration: {duration:.6f} s")
+    if "timing_key" in metadata:
+        print(f"Timing source: {metadata['timing_key']}")
     print(f"Obstacle center/size: {obstacle_center} / {obstacle_size} m")
 
     if "horizon" in metadata:
