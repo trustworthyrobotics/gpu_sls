@@ -957,8 +957,8 @@ def build_controller(
     admm_cfg = ADMMConfig(
         eps_abs=1e-2,
         eps_rel=1e-2,
-        rho_max=1e6,
-        max_iterations=3000,
+        rho_max=1e4,
+        max_iterations=1000,
         rho_update_frequency=25,
         initial_rho=1.0,
         regularized_rho_update=False,
@@ -980,7 +980,7 @@ def build_controller(
         sls_primal_tol=1e-2,
         enable_fastsls=False,
         initialize_nominal=True,
-        max_initial_sqp_iterations=50,
+        max_initial_sqp_iterations=0,
         warm_start=True,
         rti=False,
         gradient_window=0,
@@ -989,7 +989,7 @@ def build_controller(
     sqp_cfg = SQPConfig(
         max_sqp_iterations=100,
         warm_start=True,
-        feas_tol=1e-10,
+        feas_tol=1e-1,
         step_tol=10,
         line_search=True,
         lm_regularization=1e-2,

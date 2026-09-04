@@ -33,7 +33,7 @@ config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 #   1. Load the optimized minimum-time GPU-SLS/JAX trajectory.
 #   2. Keep its optimized phase times fixed.
 #   3. First MPC call: 50 nominal SQP + 50 SLS SQP iterations.
-#   4. Rebuild once as a 1-SQP RTI controller seeded by that solution.
+#   4. Rebuild once as a short warm-started SQP controller seeded by that solution.
 #   5. At each trajectory node:
 #        - set current measured state x_k
 #        - set local X/U reference window
@@ -75,7 +75,9 @@ DT_IDX = 12
 TRACK_NX = 13
 
 # First MPC solve: 50 nominal SQP iterations, then 50 SLS-enabled SQP iterations.
-# Subsequent MPC solves: one SQP iteration per control update (RTI).
+# Subsequent MPC solves: a few warm-started SQP iterations per control update.
+# One iteration was not enough to re-establish dynamic feasibility during the
+# aggressive pitch reversal near plan node 90.
 GPU_SLS_INITIAL_NOMINAL_SQP_ITERS = 50
 GPU_SLS_INITIAL_SLS_SQP_ITERS = 50
 GPU_SLS_INITIAL_TOTAL_SQP_ITERS = (
@@ -87,21 +89,34 @@ GPU_SLS_ADMM_MAX_ITERS = 100
 
 COLLISION_TOL = 1e-2
 
-DEFAULT_MPC_HORIZON = 30
+DEFAULT_MPC_HORIZON = 20
 DEFAULT_PROGRESS_SEARCH_WINDOW = 15
 DEFAULT_GOAL_TOL = 0.362
-DEFAULT_MAX_CONTROL_STEPS_MULTIPLIER = 1
+# Disturbances and nearest-point progress can require more controller updates
+# than the nominal plan has intervals.  This also matches the CLI help text.
+DEFAULT_MAX_CONTROL_STEPS_MULTIPLIER = 3
 
 # Disturbance-model settings
 # DISTURBANCE_MAG controls the retained state-dependent vy uncertainty channel.
-# E_MAG_MODEL controls the XYZ position uncertainty and the actual gate-directed
-# rollout adversary.
+# E_MAG_MODEL controls the XY position uncertainty and the actual gate-directed
+# rollout adversary. The z-position disturbance is identically zero.
 DISTURBANCE_MAG = 15.0
-E_MAG_MODEL = 0.3
+E_MAG_MODEL = 0.05
 
 T_HOVER = MASS * GRAVITY
 T_MAX = 2.0 * T_HOVER
 TAU_MAX = 10.0
+
+# ZYX Euler angles are singular at pitch = +/- pi/2.  The saved trajectory
+# stays inside this limit (its maximum pitch is about 84 degrees), so keeping a
+# small margin does not alter the reference but prevents unbounded tan/sec
+# terms in the dynamics and their Jacobians.
+PITCH_SINGULARITY_MARGIN = np.deg2rad(5.0)
+PITCH_MAX = np.pi / 2.0 - PITCH_SINGULARITY_MARGIN
+
+# The QP uses soft constraints, so independently validate the control that is
+# about to be sent to the simulated plant.
+CONTROL_BOUND_TOL = 5e-2
 
 
 # ------------------------------------------------------------
@@ -111,8 +126,8 @@ TAU_MAX = 10.0
 # trajectory-planning weights. The online problem is now a
 # reference tracking problem, not a minimum-time problem.
 # ------------------------------------------------------------
-Q_POS = np.array([100.0, 100.0, 100.0])
-Q_ANG = np.array([20.0, 20.0, 10.0])
+Q_POS = np.array([10.0, 10.0, 10.0])
+Q_ANG = np.array([5.0, 5.0, 5.0])
 Q_VEL = np.array([10.0, 10.0, 10.0])
 Q_RATE = np.array([1.0, 1.0, 1.0])
 
@@ -127,7 +142,7 @@ TERMINAL_MULTIPLIER = 1.0
 X_MAX = np.array([
     15.0, 15.0, 15.0,
     np.pi / 2.0,
-    np.pi / 2.0,
+    PITCH_MAX,
     10.0 * np.pi,
     5.0, 5.0, 5.0,
     8.0, 8.0, 8.0,
@@ -150,8 +165,9 @@ U_MAX = np.array(
 # ============================================================
 # State-dependent vy uncertainty field retained in the robust MPC model.
 #
-# The actual closed-loop plant adversary is defined below by E[0:3]: it
-# perturbs XYZ toward the closest physical gate bar using E_MAG_MODEL.
+# The actual closed-loop plant adversary is defined below in the XY position
+# subspace: it perturbs x/y toward the closest physical gate bar using
+# E_MAG_MODEL, while the z-position disturbance is always zero.
 # This spatial-scale function is still used by the robust vy channel and
 # by the diagnostic background plot.
 # ============================================================
@@ -212,9 +228,10 @@ def rotation_matrix_np(phi, theta, psi):
 
 
 def euler_angle_rates_matrix_np(phi, theta):
+    theta_safe = np.clip(theta, -PITCH_MAX, PITCH_MAX)
     sphi, cphi = np.sin(phi), np.cos(phi)
-    tth = np.tan(theta)
-    cth = np.cos(theta)
+    tth = np.tan(theta_safe)
+    cth = np.cos(theta_safe)
 
     return np.array([
         [1.0, sphi * tth, cphi * tth],
@@ -557,20 +574,22 @@ def plant_step(
     dt,
     gate_bar_geometry,
 ):
-    """One actual closed-loop step with an adversarial E[0:3] disturbance.
+    """One actual closed-loop step with an adversarial XY position disturbance.
 
     The robust model defines
 
-        E_k[0,0] = E_k[1,1] = E_k[2,2] = dt * E_MAG_MODEL.
+        E_k[0,0] = E_k[1,1] = dt * E_MAG_MODEL,
+        E_k[2,2] = 0.
 
-    We choose w_xyz with ||w_xyz||_2 = 1 in the direction of the closest
-    inflated gate bar and apply
+    First find the 3-D direction toward the closest inflated gate bar, then
+    project that direction into the XY plane and renormalize it. The applied
+    position perturbation is therefore
 
-        delta_p = E_k[0:3,0:3] @ w_xyz
-                = dt * E_MAG_MODEL * w_xyz.
+        delta_p = dt * E_MAG_MODEL * [w_x, w_y, 0],
 
-    All other disturbance-vector components are zero, so the full disturbance
-    vector still satisfies ||w||_2 <= 1.
+    with ||[w_x, w_y]||_2 = 1 whenever the XY projection is nonzero. Thus the
+    z-position is never directly disturbed and the disturbance remains inside
+    the unit-2-norm uncertainty set.
     """
     x = np.asarray(x, dtype=float)
     x_next = x + dt * quadrotor_xdot_np(x, u)
@@ -586,13 +605,29 @@ def plant_step(
         gate_bar_geometry,
     )
 
-    position_delta = dt * E_MAG_MODEL * w_xyz
+    # Project the closest-bar direction into XY and renormalize so the
+    # adversary uses its full allowed magnitude in x/y, with exactly zero z.
+    w_xy_norm = np.linalg.norm(w_xyz[:2])
+    if w_xy_norm > 1e-12:
+        disturbance_direction = np.array([
+            w_xyz[0] / w_xy_norm,
+            w_xyz[1] / w_xy_norm,
+            0.0,
+        ], dtype=float)
+    else:
+        disturbance_direction = np.zeros(3, dtype=float)
+
+    position_delta = dt * E_MAG_MODEL * disturbance_direction
     x_next[:3] += position_delta
+
+    spatial_scale = disturbance_spatial_scale(x[0], x[1])
+    vy_delta = dt * DISTURBANCE_MAG * spatial_scale
+    x_next[7] += vy_delta
 
     return (
         x_next,
         position_delta,
-        w_xyz,
+        disturbance_direction,
         closest_distance,
         closest_gate_idx,
         closest_bar_idx,
@@ -628,9 +663,10 @@ def rotation_matrix_jax(phi, theta, psi):
 
 
 def euler_angle_rates_matrix_jax(phi, theta):
+    theta_safe = jnp.clip(theta, -PITCH_MAX, PITCH_MAX)
     sphi, cphi = jnp.sin(phi), jnp.cos(phi)
-    tth = jnp.tan(theta)
-    cth = jnp.cos(theta)
+    tth = jnp.tan(theta_safe)
+    cth = jnp.cos(theta_safe)
     return jnp.array([
         [1.0, sphi * tth, cphi * tth],
         [0.0, cphi, -sphi],
@@ -880,10 +916,10 @@ def make_tracking_disturbance(n, disturbance_mag):
             dt * mag * spatial_scale
         )
 
-        # XYZ position uncertainty matching the rollout adversary.
+        # XY position uncertainty matching the rollout adversary.
+        # There is intentionally no z-position uncertainty term.
         E_k = E_k.at[0, 0].set(dt * E_MAG_MODEL)
         E_k = E_k.at[1, 1].set(dt * E_MAG_MODEL)
-        E_k = E_k.at[2, 2].set(dt * E_MAG_MODEL)
 
         # E_k[DT_IDX, :] and E_k[:, DT_IDX] remain zero: dt is deterministic.
         return E_k
@@ -928,7 +964,8 @@ def build_gpu_sls_mpc(
         50 nominal SQP iterations followed by 50 SLS-enabled SQP iterations.
 
     solver_mode == "rti":
-        no nominal initialization and exactly one SQP iteration per MPC update.
+        no nominal initialization and a small fixed number of SQP iterations
+        per MPC update.
     """
     H = int(horizon)
 
@@ -991,13 +1028,14 @@ def build_gpu_sls_mpc(
     admm_cfg = ADMMConfig(
         eps_abs=1e-2,
         eps_rel=1e-2,
-        rho_max=1e4,
+        rho_max=1e2,
         max_iterations=GPU_SLS_ADMM_MAX_ITERS,
         rho_update_frequency=25,
         initial_rho=1.0,
         regularized_rho_update=False,
         slack_weight=1e4,
         enable_slack=False,
+        scale_max=2.0,
     )
 
     q_diag = jnp.concatenate([
@@ -1019,12 +1057,14 @@ def build_gpu_sls_mpc(
         max_initial_sqp_iterations=max_initial_sqp_iterations,
         warm_start=True,
         rti=rti,
-        gradient_window=0,
+        gradient_window=5,
     )
 
     sqp_cfg = SQPConfig(
         max_sqp_iterations=max_sqp_iterations,
         warm_start=True,
+        # Keep the one-time initializer running through its requested nominal
+        # and robust phases.  Online solves execute their small fixed budget.
         feas_tol=1e-6,
         step_tol=10,
         line_search=line_search,
@@ -1173,6 +1213,15 @@ def local_reference_window(
     """
     H = int(horizon)
     N = len(U_plan)
+
+    if N < 1:
+        raise ValueError("The offline plan must contain at least one control interval.")
+
+    # Node N has no outgoing control interval.  If progress matching reaches N
+    # before the goal tolerance is satisfied, keep the MPC rooted at N - 1.
+    # Otherwise its model receives an all-zero dt horizon while the plant still
+    # advances using dt_plan[N - 1], destroying the warm-start consistency.
+    k = int(np.clip(k, 0, N - 1))
 
     X_ref = np.empty(
         (H + 1, NX),
@@ -1442,12 +1491,22 @@ def solve_mpc_step(
         jax.block_until_ready(Phi_x),
         dtype=float,
     )
-    terminal_phi_x = Phi_x_np[-1]  # [disturbance_time, state, disturbance]
-    terminal_tube_halfwidth = np.sum(
-        np.linalg.norm(terminal_phi_x, axis=-1),
-        axis=0,
-    )
-    terminal_xyz_halfwidth = terminal_tube_halfwidth[:3]
+    if not np.all(np.isfinite(Phi_x_np)):
+        raise RuntimeError("SLS response Phi_x contains NaN or Inf.")
+
+    # Coordinate-wise robust tube half-width at EVERY prediction node.
+    #
+    # Phi_x[k, j, i, :] maps the j-th unit-2-norm disturbance into state
+    # coordinate i at prediction node k. Summing the row 2-norms over all
+    # disturbance times gives the exact coordinate-wise Minkowski-sum
+    # half-width used for plotting an axis-aligned tube around X_pred.
+    tube_halfwidth = np.sum(
+        np.linalg.norm(Phi_x_np, axis=-1),
+        axis=1,
+    )  # [prediction_node, state]
+    tube_xyz_halfwidth = tube_halfwidth[:, :3]
+
+    terminal_xyz_halfwidth = tube_xyz_halfwidth[-1]
     terminal_xyz_radius_bound = float(
         np.linalg.norm(terminal_xyz_halfwidth)
     )
@@ -1469,6 +1528,20 @@ def solve_mpc_step(
         dtype=float,
     )
 
+    if not np.all(np.isfinite(X_pred_np)):
+        raise RuntimeError("MPC produced NaN or Inf in its predicted state trajectory.")
+    if not np.all(np.isfinite(U_pred_np)):
+        raise RuntimeError("MPC produced NaN or Inf in its predicted control trajectory.")
+
+    u0_np = U_pred_np[0]
+    if np.any(u0_np < U_MIN - CONTROL_BOUND_TOL) or np.any(
+        u0_np > U_MAX + CONTROL_BOUND_TOL
+    ):
+        raise RuntimeError(
+            "MPC rejected an out-of-bounds first control: "
+            f"u0={u0_np}, bounds=[{U_MIN}, {U_MAX}]."
+        )
+
     objective = compute_tracking_objective_np(
         X_pred_np,
         U_pred_np,
@@ -1478,10 +1551,15 @@ def solve_mpc_step(
         terminal_motion_weight_np,
     )
 
-    # Return the full 13-D predicted trajectory so it can seed the RTI solver.
+    if not np.isfinite(objective):
+        raise RuntimeError("MPC produced a nonfinite tracking objective.")
+
+    # Return the full nominal prediction and its XYZ robust tube so the online
+    # rollout can save both for later trajectory/tube visualization.
     return (
         X_pred_np,
         U_pred_np,
+        tube_xyz_halfwidth,
         objective,
         solve_time,
     )
@@ -1604,13 +1682,14 @@ def run_tracking(
 ):
     """Closed-loop GPU-SLS tracking with a gate-directed XYZ adversary.
 
-    At each real plant step, the adversary chooses the unit disturbance vector
-    in the XYZ position subspace that points toward the closest inflated gate
-    bar.  The applied perturbation is exactly
+    At each real plant step, the adversary finds the direction toward the
+    closest inflated gate bar, projects that direction into the XY plane, and
+    applies
 
-        delta_p = dt * E_MAG_MODEL * w_xyz,
+        delta_p = dt * E_MAG_MODEL * [w_x, w_y, 0],
 
-    matching E[0:3, 0:3] in ``make_tracking_disturbance``.
+    matching the x/y position channels in ``make_tracking_disturbance``. The
+    z-position disturbance is identically zero.
 
     Collision checking is DISCRETE-TIME ONLY: after each plant step, only the
     resulting position x_{k+1}[:3] is checked against the inflated gate bars.
@@ -1665,6 +1744,25 @@ def run_tracking(
     fallback_used = np.zeros(
         max_control_steps,
         dtype=bool,
+    )
+
+    # Save the online nominal MPC prediction and robust XYZ tube at every
+    # controller step. Entries remain NaN when that step falls back because no
+    # accepted MPC solution exists for that frame.
+    X_mpc_nominal_history = np.full(
+        (max_control_steps, horizon + 1, TRACK_NX),
+        np.nan,
+        dtype=float,
+    )
+    U_mpc_nominal_history = np.full(
+        (max_control_steps, horizon, NU),
+        np.nan,
+        dtype=float,
+    )
+    tube_xyz_halfwidth_history = np.full(
+        (max_control_steps, horizon + 1, 3),
+        np.nan,
+        dtype=float,
     )
 
     # Actual discrete position perturbation applied at each rollout step.
@@ -1759,11 +1857,11 @@ def run_tracking(
     print(f"Goal tolerance: {goal_tol:.3f} m")
     print(f"Max controller steps: {max_control_steps}")
     print(
-        "Plant adversary: XYZ position disturbance toward closest gate bar"
+        "Plant adversary: XY position disturbance toward closest gate bar (z delta = 0)"
     )
     print(
         f"E_MAG_MODEL: {E_MAG_MODEL:.6f}  "
-        "(delta_p = dt * E_MAG_MODEL * w_xyz, ||w_xyz||_2 <= 1)"
+        "(delta_p = dt * E_MAG_MODEL * [w_x, w_y, 0], ||w_xy||_2 <= 1)"
     )
     print(
         f"Robust-model state-dependent vy magnitude: {disturbance_mag}"
@@ -1775,7 +1873,7 @@ def run_tracking(
         f"{GPU_SLS_INITIAL_SLS_SQP_ITERS} SLS SQP iterations"
     )
     print(
-        f"Subsequent MPC solves: RTI, {GPU_SLS_RTI_SQP_ITERS} SQP iteration per step"
+        f"Subsequent MPC solves: RTI, {GPU_SLS_RTI_SQP_ITERS} SQP iterations per step"
     )
     print("=====================================================")
 
@@ -1822,6 +1920,11 @@ def run_tracking(
             reached_goal = True
             break
 
+        # There is no interval N.  Keep optimizing the last real interval if
+        # nearest-point matching reaches the final node before the vehicle is
+        # actually within the goal tolerance.
+        mpc_progress_idx = min(progress_idx, N - 1)
+
         (
             X_ref,
             U_ref,
@@ -1832,22 +1935,20 @@ def run_tracking(
             X_plan=X_plan,
             U_plan=U_plan,
             dt_plan=dt_plan,
-            k=progress_idx,
+            k=mpc_progress_idx,
             horizon=horizon,
         )
 
         dt_apply = float(
-            dt_plan[
-                min(
-                    progress_idx,
-                    N - 1,
-                )
-            ]
+            dt_plan[mpc_progress_idx]
         )
 
         reset_warm_start = (
             control_step > 0
-            and (progress_idx - previous_reference_progress) != 1
+            and (
+                mpc_progress_idx
+                - min(previous_reference_progress, N - 1)
+            ) != 1
         )
 
         X_aug_ref, _stage_parameter = build_augmented_local_reference(
@@ -1881,6 +1982,7 @@ def run_tracking(
             (
                 X_mpc,
                 U_mpc,
+                tube_xyz_halfwidth,
                 objective,
                 solve_time,
             ) = solve_mpc_step(
@@ -1894,9 +1996,14 @@ def run_tracking(
                 reset_warm_start=reset_warm_start,
             )
 
-            u_apply = U_mpc[0]
+            # Remove harmless line-search roundoff at an active box bound.  Any
+            # material violation was rejected in solve_mpc_step above.
+            u_apply = np.clip(U_mpc[0], U_MIN, U_MAX)
             objective_history[control_step] = objective
             solve_times[control_step] = solve_time
+            X_mpc_nominal_history[control_step] = X_mpc
+            U_mpc_nominal_history[control_step] = U_mpc
+            tube_xyz_halfwidth_history[control_step] = tube_xyz_halfwidth
 
             if control_step == 0:
                 initial_full_solve_time = solve_time
@@ -1915,18 +2022,29 @@ def run_tracking(
 
                 print(
                     f"Initial full solve completed in {1000.0 * solve_time:.3f} ms. "
-                    "Switching permanently to 1-SQP RTI updates."
+                    "Switching permanently to "
+                    f"{GPU_SLS_RTI_SQP_ITERS}-SQP RTI updates."
                 )
 
         except RuntimeError as error:
             print(
                 f"\nMPC solve failed at controller step "
                 f"{control_step}; using offline feedforward "
-                f"control at progress node {progress_idx}."
+                f"control at progress node {mpc_progress_idx}."
             )
             print(error)
             u_apply = U_ref[0].copy()
             fallback_used[control_step] = True
+
+            # controller.run() updates its internal warm start before the
+            # validation above.  Reset it so a rejected trajectory cannot
+            # poison every subsequent RTI solve.
+            X_reset = X_aug_ref.copy()
+            X_reset[0, :NX] = x_current
+            controller.reset(
+                jnp.asarray(X_reset, dtype=DTYPE),
+                jnp.asarray(U_ref, dtype=DTYPE),
+            )
 
             if control_step == 0:
                 # The full initializer failed. Continue the experiment in RTI mode
@@ -1943,15 +2061,18 @@ def run_tracking(
                     disturbance_mag=disturbance_mag,
                     solver_mode="rti",
                 )
-                print("Initial full solve failed; continuing with 1-SQP RTI mode.")
+                print(
+                    "Initial full solve failed; continuing with "
+                    f"{GPU_SLS_RTI_SQP_ITERS}-SQP RTI mode."
+                )
 
         previous_reference_progress = progress_idx
         U_closed_loop[control_step] = u_apply
         dt_applied_history[control_step] = dt_apply
 
         # ----------------------------------------------------
-        # Apply E[0:3] adversarial disturbance toward the nearest
-        # inflated gate bar. Collision is checked only at the resulting
+        # Apply the XY-only adversarial position disturbance toward the
+        # nearest inflated gate bar. Collision is checked only at the resulting
         # discrete state; motion between nodes is intentionally ignored.
         # ----------------------------------------------------
         (
@@ -1968,6 +2089,12 @@ def run_tracking(
             dt=dt_apply,
             gate_bar_geometry=gate_bar_geometry,
         )
+
+        if not np.all(np.isfinite(x_current)):
+            raise FloatingPointError(
+                "Plant state became nonfinite after controller step "
+                f"{control_step}; u={u_apply}, dt={dt_apply}."
+            )
 
         disturbance_xyz_history[control_step] = disturbance_xyz
         disturbance_direction_history[control_step] = disturbance_direction
@@ -2082,6 +2209,9 @@ def run_tracking(
     # from timing statistics.
     solve_times = solve_times[1:num_control_steps]
     fallback_used = fallback_used[:num_control_steps]
+    X_mpc_nominal_history = X_mpc_nominal_history[:num_control_steps]
+    U_mpc_nominal_history = U_mpc_nominal_history[:num_control_steps]
+    tube_xyz_halfwidth_history = tube_xyz_halfwidth_history[:num_control_steps]
     disturbance_xyz_history = disturbance_xyz_history[:num_control_steps]
     disturbance_direction_history = disturbance_direction_history[:num_control_steps]
     closest_obstacle_distance_history = closest_obstacle_distance_history[:num_control_steps]
@@ -2191,6 +2321,9 @@ def run_tracking(
             else np.nan
         ),
         "fallback_used": fallback_used,
+        "X_mpc_nominal_history": X_mpc_nominal_history,
+        "U_mpc_nominal_history": U_mpc_nominal_history,
+        "tube_xyz_halfwidth_history": tube_xyz_halfwidth_history,
         "pos_errors": pos_errors,
         "state_errors": state_errors,
         "disturbance_xyz_history": disturbance_xyz_history,
@@ -2789,6 +2922,12 @@ def main():
         ),
         objective_history=result["objective_history"],
         fallback_used=result["fallback_used"],
+        # Per-controller-step nominal MPC predictions and coordinate-wise
+        # robust XYZ tube half-widths. Shapes are respectively
+        # [steps, H+1, 13], [steps, H, 4], and [steps, H+1, 3].
+        X_mpc_nominal_history=result["X_mpc_nominal_history"],
+        U_mpc_nominal_history=result["U_mpc_nominal_history"],
+        tube_xyz_halfwidth_history=result["tube_xyz_halfwidth_history"],
         mpc_horizon=np.array(args.horizon),
         disturbance_mag=np.array(
             args.disturbance_mag

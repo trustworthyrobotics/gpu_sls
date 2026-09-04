@@ -11,9 +11,10 @@ import numpy as np
 
 
 # ============================================================
-# Animate FATROP MPC tracking result
+# Animate GPU-SLS MPC tracking result, including the online nominal
+# prediction and the robust SLS position tube at every MPC update.
 #
-# Expected NPZ keys from fatrop_drone_racing_mpc_tracker.py:
+# Expected NPZ keys from the GPU-SLS tracker:
 #   X_closed_loop
 #   U_closed_loop
 #   X_plan
@@ -24,8 +25,20 @@ import numpy as np
 #   pos_errors
 #   mpc_horizon
 #   disturbance_mag
+#   X_mpc_nominal_history
+#   tube_xyz_halfwidth_history
 #
-# Optional:
+# X_mpc_nominal_history has shape
+#     [controller_step, prediction_node, state]
+# and tube_xyz_halfwidth_history has shape
+#     [controller_step, prediction_node, xyz].
+#
+# The saved tube values are coordinate-wise half-widths.  In this top-down
+# animation, each prediction node is therefore rendered as an axis-aligned
+# XY rectangle centered at the nominal predicted position.  This preserves
+# the meaning of the saved bounds instead of approximating them by ellipses.
+#
+# Optional / backward-compatible:
 #   X_mpc_predictions
 #   waypoint_axis_u
 #   waypoint_normals
@@ -38,9 +51,8 @@ import numpy as np
 #
 # If explicit gate geometry is absent, it is reconstructed from consecutive
 # [pre_gate, post_gate] waypoint pairs using the planner's gate convention.
-#
-# If X_mpc_predictions is not present, the animation shows the
-# moving OFFLINE reference window corresponding to the MPC horizon.
+# If nominal prediction history is absent, the animation falls back to the
+# moving offline reference window.
 # ============================================================
 
 
@@ -407,16 +419,63 @@ def make_animation(
         )
 
 
-    X_mpc_predictions = result.get(
-        "X_mpc_predictions",
+    # --------------------------------------------------
+    # Saved online nominal predictions and robust tubes
+    # --------------------------------------------------
+    # Prefer the new GPU-SLS history key.  Keep support for older renderer
+    # files that used X_mpc_predictions.
+    X_mpc_nominal_history = result.get(
+        "X_mpc_nominal_history",
+        result.get("X_mpc_predictions", None),
+    )
+
+    tube_xyz_halfwidth_history = result.get(
+        "tube_xyz_halfwidth_history",
         None,
     )
 
-    if X_mpc_predictions is not None:
-        X_mpc_predictions = np.asarray(
-            X_mpc_predictions,
+    if X_mpc_nominal_history is not None:
+        X_mpc_nominal_history = np.asarray(
+            X_mpc_nominal_history,
             dtype=float,
         )
+        if X_mpc_nominal_history.ndim != 3:
+            raise ValueError(
+                "X_mpc_nominal_history must have shape "
+                "[controller_step, prediction_node, state]."
+            )
+        if X_mpc_nominal_history.shape[2] < 2:
+            raise ValueError(
+                "X_mpc_nominal_history must contain at least x/y state coordinates."
+            )
+
+    if tube_xyz_halfwidth_history is not None:
+        tube_xyz_halfwidth_history = np.asarray(
+            tube_xyz_halfwidth_history,
+            dtype=float,
+        )
+        if tube_xyz_halfwidth_history.ndim != 3:
+            raise ValueError(
+                "tube_xyz_halfwidth_history must have shape "
+                "[controller_step, prediction_node, xyz]."
+            )
+        if tube_xyz_halfwidth_history.shape[2] < 2:
+            raise ValueError(
+                "tube_xyz_halfwidth_history must contain at least x/y half-widths."
+            )
+        if X_mpc_nominal_history is None:
+            raise ValueError(
+                "tube_xyz_halfwidth_history is present, but the corresponding "
+                "X_mpc_nominal_history is missing."
+            )
+        if (
+            tube_xyz_halfwidth_history.shape[0] != X_mpc_nominal_history.shape[0]
+            or tube_xyz_halfwidth_history.shape[1] != X_mpc_nominal_history.shape[1]
+        ):
+            raise ValueError(
+                "tube_xyz_halfwidth_history and X_mpc_nominal_history must agree "
+                "in controller-step and prediction-node dimensions."
+            )
 
     fig, ax = plt.subplots(
         figsize=(9, 8)
@@ -675,9 +734,41 @@ def make_animation(
         "-o",
         markersize=3,
         linewidth=2.0,
-        label="Current MPC horizon",
+        label="Online nominal MPC trajectory",
         zorder=6,
     )
+
+    # One dynamic rectangle per prediction node.  The saved SLS tube is a
+    # coordinate-wise bound, so the top-down XY cross-section at node j is
+    #
+    #   [x_nom - r_x, x_nom + r_x] x [y_nom - r_y, y_nom + r_y].
+    #
+    # Fallback controller steps are stored as NaN by the tracker; those boxes
+    # are simply hidden for that frame.
+    if X_mpc_nominal_history is not None:
+        max_prediction_nodes = X_mpc_nominal_history.shape[1]
+    else:
+        max_prediction_nodes = horizon + 1
+
+    tube_rectangles = []
+    for j in range(max_prediction_nodes):
+        tube_box = Rectangle(
+            (0.0, 0.0),
+            0.0,
+            0.0,
+            fill=True,
+            alpha=0.16,
+            linewidth=0.8,
+            label=(
+                "Robust SLS tube (XY coordinate bounds)"
+                if j == 0
+                else "_nolegend_"
+            ),
+            zorder=4,
+        )
+        tube_box.set_visible(False)
+        ax.add_patch(tube_box)
+        tube_rectangles.append(tube_box)
 
     current_marker, = ax.plot(
         [],
@@ -875,8 +966,14 @@ def make_animation(
             current_time
         )
 
-        # Horizon/reference information changes only when an MPC solve occurs.
-        k_controller = k0
+        # Horizon/tube information changes only when an MPC solve occurs.
+        # At the terminal closed-loop state there is no new solve, so retain
+        # the last completed controller update instead of falling back to the
+        # offline reference window.
+        k_controller = min(
+            k0,
+            max(N_closed - 1, 0),
+        )
 
         progress_idx = int(
             progress_idx_history[
@@ -932,28 +1029,35 @@ def make_animation(
             [X_plan[progress_idx, 1]],
         )
 
+        # Hide the previous frame's tube boxes before drawing the current one.
+        for tube_box in tube_rectangles:
+            tube_box.set_visible(False)
+
+        nominal_drawn = False
+        pred_full = None
+
         if (
-            X_mpc_predictions is not None
-            and k_controller < X_mpc_predictions.shape[0]
+            X_mpc_nominal_history is not None
+            and k_controller < X_mpc_nominal_history.shape[0]
         ):
-            pred = X_mpc_predictions[
-                k_controller
-            ]
+            pred_full = X_mpc_nominal_history[k_controller]
 
             finite_rows = np.all(
-                np.isfinite(pred[:, :2]),
+                np.isfinite(pred_full[:, :2]),
                 axis=1,
             )
 
-            pred = pred[
-                finite_rows
-            ]
+            if np.any(finite_rows):
+                pred_visible = pred_full[finite_rows]
+                horizon_line.set_data(
+                    pred_visible[:, 0],
+                    pred_visible[:, 1],
+                )
+                nominal_drawn = True
 
-            horizon_line.set_data(
-                pred[:, 0],
-                pred[:, 1],
-            )
-        else:
+        if not nominal_drawn:
+            # Backward-compatible behavior for old files or fallback steps with
+            # no accepted MPC solution saved at this controller update.
             horizon_end = min(
                 progress_idx + horizon,
                 N_plan,
@@ -969,6 +1073,42 @@ def make_animation(
                     1,
                 ],
             )
+
+        # Draw the robust XY tube cross-section at every nominal prediction
+        # node.  Each rectangle is centered at the saved nominal (x, y) and
+        # uses the exact saved coordinate half-widths (r_x, r_y).
+        if (
+            nominal_drawn
+            and tube_xyz_halfwidth_history is not None
+            and k_controller < tube_xyz_halfwidth_history.shape[0]
+        ):
+            tube_step = tube_xyz_halfwidth_history[k_controller]
+            num_tube_nodes = min(
+                len(tube_rectangles),
+                pred_full.shape[0],
+                tube_step.shape[0],
+            )
+
+            for j in range(num_tube_nodes):
+                center_xy = pred_full[j, :2]
+                halfwidth_xy = tube_step[j, :2]
+
+                if (
+                    np.all(np.isfinite(center_xy))
+                    and np.all(np.isfinite(halfwidth_xy))
+                    and np.all(halfwidth_xy >= 0.0)
+                ):
+                    hx = float(halfwidth_xy[0])
+                    hy = float(halfwidth_xy[1])
+
+                    tube_box = tube_rectangles[j]
+                    tube_box.set_xy((
+                        float(center_xy[0] - hx),
+                        float(center_xy[1] - hy),
+                    ))
+                    tube_box.set_width(2.0 * hx)
+                    tube_box.set_height(2.0 * hy)
+                    tube_box.set_visible(True)
 
         error0 = float(
             pos_errors[
@@ -994,8 +1134,8 @@ def make_animation(
         )
 
         title.set_text(
-            "Online FATROP MPC Tracking\n"
-            f"controller step {k_controller:03d}/{N_closed:03d}   "
+            "Online GPU-SLS MPC Tracking with Robust Tube\n"
+            f"controller step {k_controller:03d}/{max(N_closed - 1, 0):03d}   "
             f"progress {progress_idx:03d}/{N_plan:03d}\n"
             f"time {current_time:.3f}/{total_execution_time:.3f} s   "
             f"position error {error:.3f} m   "
@@ -1007,6 +1147,7 @@ def make_animation(
             horizon_line,
             current_marker,
             reference_marker,
+            *tube_rectangles,
             title,
         )
 
@@ -1057,8 +1198,8 @@ def make_animation(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Animate the offline FATROP trajectory and "
-            "online FATROP MPC rollout."
+            "Animate the offline trajectory, online GPU-SLS nominal MPC "
+            "prediction, closed-loop rollout, and robust SLS tubes."
         )
     )
 
@@ -1067,16 +1208,16 @@ def parse_args():
         nargs="?",
         default="multiphase_trajectory_tracking.npz",
         help=(
-            "Tracking NPZ from fatrop_drone_racing_mpc_tracker.py"
+            "Tracking NPZ from the GPU-SLS MPC tracker"
         ),
     )
 
     parser.add_argument(
         "--output",
-        default="fatrop_mpc_tracking.mp4",
+        default="gpu_sls_mpc_tracking_tubes.mp4",
         help=(
             "Output .mp4 or .gif "
-            "(default: fatrop_mpc_tracking.mp4)"
+            "(default: gpu_sls_mpc_tracking_tubes.mp4)"
         ),
     )
 

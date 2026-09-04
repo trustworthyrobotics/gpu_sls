@@ -42,6 +42,8 @@ class ADMMConfig:
     slack_weight_start: float = 1e2
     slack_weight_end: float = 1e5
     enable_slack: bool = True
+    scale_min: float = 0.5
+    scale_max: float = 1.5
 
     def tree_flatten(self):
         children = (
@@ -60,6 +62,8 @@ class ADMMConfig:
             self.slack_weight_start,
             self.slack_weight_end,
             self.enable_slack,
+            self.scale_min,
+            self.scale_max,
         )
         return children, None
 
@@ -435,8 +439,10 @@ def adaptive_rho_update(
     *,
     rho_min=1e-4,
     rho_max=1e5,
-    scale_min=0.75,
-    scale_max=1.2,
+    scale_min=0.5,
+    scale_max=1.5,
+    # scale_min=0.75,
+    # scale_max=1.2,
     eps=1e-12,
 ):
     rd_safe = jnp.maximum(rd_norm, eps)
@@ -471,12 +477,16 @@ def rho_update_scaled_duals(
     rho,
     y,
     rho_max,
+    scale_min,
+    scale_max,
 ):
     rho_new, updated = adaptive_rho_update(
         rp_norm,
         rd_norm,
         rho,
         rho_max=rho_max,
+        scale_min=scale_min,
+        scale_max=scale_max,
     )
 
     scale = rho / rho_new
@@ -885,6 +895,8 @@ def constrained_solve(
                 rho,
                 y_new,
                 rho_max,
+                cfg.scale_min,
+                cfg.scale_max,
             )
             if L > 0:
                 def update_gradient_rho(_):
@@ -894,6 +906,8 @@ def constrained_solve(
                         rho_grad,
                         b_new,
                         rho_max,
+                        cfg.scale_min,
+                        cfg.scale_max,
                     )
 
                 def skip_gradient_rho(_):

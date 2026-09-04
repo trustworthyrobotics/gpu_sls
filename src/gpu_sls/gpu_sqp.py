@@ -572,12 +572,11 @@ def sqp(
         def do_iter(_):
             g, c = model_evaluator(X_curr, U_curr)
             feas = jnp.max(jnp.abs(c))
-            warm_flag = jnp.logical_and(
-                jnp.array(bool(sqp_config.warm_start)), converged_admm
-            )
+            # converged_admm = True
+            warm_flag = jnp.logical_and(jnp.array(bool(sqp_config.warm_start)), converged_admm)
             # warm_flag = jnp.logical_and(warm_flag, jnp.array(i != sls_config.max_initial_sqp_iterations))
             # Turn this off? seems to be more optimal
-            # w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
+            w0   = lax.select(jnp.array(False), w, jnp.zeros_like(w))
             w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
             a0 = lax.select(jnp.array(False), a, jnp.zeros_like(a))
