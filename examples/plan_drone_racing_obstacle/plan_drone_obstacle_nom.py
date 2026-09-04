@@ -989,7 +989,7 @@ def build_controller(
     sqp_cfg = SQPConfig(
         max_sqp_iterations=100,
         warm_start=True,
-        feas_tol=1e-1,
+        feas_tol=5e-2,
         step_tol=10,
         line_search=True,
         lm_regularization=1e-2,
@@ -1870,7 +1870,15 @@ def main():
         reference,
         jnp.zeros((N, nu), dtype=DTYPE).at[:, 0].set(T_hover),
     )
-
+    import time
+    start = time.perf_counter()
+    u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
+        x0=x0,
+        reference=reference,
+        parameter=parameter,
+    )
+    end = time.perf_counter()
+    print("Solve time:", end - start)
     phase_times = X_pred[0, 12:]
     min_time = jnp.sum(phase_times)
 
