@@ -965,7 +965,7 @@ def build_controller(
         num_phases=NUM_PHASES,
         enable_slack=True,
         dynamic_slack=True,
-        slack_weight_start=1e2,
+        slack_weight_start=1e3,
         slack_weight_end=1e5,
     )
 
@@ -987,7 +987,7 @@ def build_controller(
     )
 
     sqp_cfg = SQPConfig(
-        max_sqp_iterations=100,
+        max_sqp_iterations=50,
         warm_start=True,
         feas_tol=5e-2,
         step_tol=10,
@@ -1892,7 +1892,7 @@ def main():
     # -----------------------------
     # Save optimized trajectory
     # -----------------------------
-    trajectory_path = "multiphase_trajectory.npz"
+    trajectory_path = "multiphase_trajectory_nom.npz"
 
     np.savez(
         trajectory_path,
