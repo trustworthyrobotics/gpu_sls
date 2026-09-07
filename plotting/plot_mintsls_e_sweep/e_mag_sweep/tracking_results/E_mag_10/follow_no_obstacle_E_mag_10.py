@@ -87,21 +87,20 @@ GPU_SLS_INITIAL_TOTAL_SQP_ITERS = (
 GPU_SLS_RTI_SQP_ITERS = 1
 GPU_SLS_ADMM_MAX_ITERS = 100
 
-COLLISION_TOL = 1e-3
 
 DEFAULT_MPC_HORIZON = 20
 DEFAULT_PROGRESS_SEARCH_WINDOW = 15
 DEFAULT_GOAL_TOL = 0.362
 # Disturbances and nearest-point progress can require more controller updates
 # than the nominal plan has intervals.  This also matches the CLI help text.
-DEFAULT_MAX_CONTROL_STEPS_MULTIPLIER = 3
+DEFAULT_MAX_CONTROL_STEPS_MULTIPLIER = 2
 
 # Disturbance-model settings
 # DISTURBANCE_MAG controls the retained state-dependent vy uncertainty channel.
 # E_MAG_MODEL controls the XY position uncertainty and the actual gate-directed
 # rollout adversary. The z-position disturbance is identically zero.
-DISTURBANCE_MAG = 15.0
-E_MAG_MODEL = 0.05
+DISTURBANCE_MAG = 10
+E_MAG_MODEL = 0.0
 
 T_HOVER = MASS * GRAVITY
 T_MAX = 2.0 * T_HOVER
@@ -276,9 +275,9 @@ def quadrotor_xdot_np(x, u):
 def build_gate_bar_geometry_np(plan):
     """Build the exact inflated four-bar gate geometry used by the MPC.
 
-    The MPC treats the drone center as a point and inflates each gate bar by
-    ``drone_radius``.  The rollout adversary and collision checker use the same
-    geometry so planning and simulation agree on what constitutes a collision.
+    The drone center is treated as a point and each gate bar is inflated by
+    ``drone_radius``.  This geometry is retained only to define the direction
+    of the gate-directed rollout adversary and for visualization/diagnostics.
     """
     required = (
         "gate_centers",
@@ -290,7 +289,7 @@ def build_gate_bar_geometry_np(plan):
     if not all(plan.get(k) is not None for k in required):
         raise ValueError(
             "Physical gate geometry is required for the gate-directed "
-            "adversarial disturbance and collision checking."
+            "adversarial disturbance."
         )
 
     gate_centers = np.asarray(plan["gate_centers"], dtype=float)
@@ -363,6 +362,7 @@ def build_gate_bar_geometry_np(plan):
     normals = np.repeat(gate_normals[:, None, :], 4, axis=1)
 
     return {
+        "gate_centers": gate_centers,
         "centers": centers,
         "half_sizes": half_sizes,
         "axis_u": axis_u,
@@ -377,7 +377,7 @@ def nearest_gate_bar_direction_np(pos, gate_bar_geometry, eps=1e-12):
 
     Distance is measured to the surface/volume of each *inflated oriented box*,
     not merely to its center.  Therefore the selected obstacle is the same
-    physical object used by the MPC collision constraints.
+    physical gate-bar geometry used to aim the rollout adversary.
     """
     pos = np.asarray(pos, dtype=float).reshape(3)
     centers = gate_bar_geometry["centers"]
@@ -412,8 +412,8 @@ def nearest_gate_bar_direction_np(pos, gate_bar_geometry, eps=1e-12):
     closest_point = closest_world[gate_idx, bar_idx].copy()
 
     if distance <= eps:
-        # We are already touching/inside the inflated obstacle.  The collision
-        # checker will terminate the rollout, so do not manufacture a direction.
+        # We are already touching/inside the inflated gate-bar volume, so there
+        # is no unique direction toward it; return zero rather than manufacture one.
         direction = np.zeros(3, dtype=float)
     else:
         direction = toward[gate_idx, bar_idx] / distance
@@ -421,217 +421,91 @@ def nearest_gate_bar_direction_np(pos, gate_bar_geometry, eps=1e-12):
     return direction, distance, int(gate_idx), int(bar_idx), closest_point
 
 
-def _segment_obb_hit_fraction_np(
-    p0,
-    p1,
-    center,
-    axis_u,
-    axis_v,
-    normal,
-    half_size,
-    eps=1e-12,
-):
-    """Return first segment/OBB hit fraction in [0,1], or None if no hit."""
-    p0 = np.asarray(p0, dtype=float).reshape(3)
-    p1 = np.asarray(p1, dtype=float).reshape(3)
-    center = np.asarray(center, dtype=float).reshape(3)
-    half_size = np.asarray(half_size, dtype=float).reshape(3)
-
-    d0 = p0 - center
-    d1 = p1 - center
-    q0 = np.array(
-        [
-            np.dot(d0, axis_u),
-            np.dot(d0, axis_v),
-            np.dot(d0, normal),
-        ],
-        dtype=float,
-    )
-    q1 = np.array(
-        [
-            np.dot(d1, axis_u),
-            np.dot(d1, axis_v),
-            np.dot(d1, normal),
-        ],
-        dtype=float,
-    )
-
-    dq = q1 - q0
-    t_enter = 0.0
-    t_exit = 1.0
-
-    for i in range(3):
-        lo = -half_size[i]
-        hi = half_size[i]
-
-        if abs(dq[i]) <= eps:
-            if q0[i] < lo or q0[i] > hi:
-                return None
-            continue
-
-        t1 = (lo - q0[i]) / dq[i]
-        t2 = (hi - q0[i]) / dq[i]
-        if t1 > t2:
-            t1, t2 = t2, t1
-
-        t_enter = max(t_enter, t1)
-        t_exit = min(t_exit, t2)
-        if t_enter > t_exit:
-            return None
-
-    if t_exit < 0.0 or t_enter > 1.0:
-        return None
-
-    return float(max(0.0, t_enter))
-
-
-def check_gate_collision_np(p0, p1, gate_bar_geometry):
-    """Check the swept drone-center segment against every inflated gate bar."""
-    centers = gate_bar_geometry["centers"]
-    half_sizes = gate_bar_geometry["half_sizes"]
-    axis_u = gate_bar_geometry["axis_u"]
-    axis_v = gate_bar_geometry["axis_v"]
-    normals = gate_bar_geometry["normals"]
-
-    best_hit = None
-    best_gate = -1
-    best_bar = -1
-
-    for gate_idx in range(centers.shape[0]):
-        for bar_idx in range(centers.shape[1]):
-            hit_fraction = _segment_obb_hit_fraction_np(
-                p0,
-                p1,
-                centers[gate_idx, bar_idx],
-                axis_u[gate_idx, bar_idx],
-                axis_v[gate_idx, bar_idx],
-                normals[gate_idx, bar_idx],
-                half_sizes[gate_idx, bar_idx],
-            )
-
-            if hit_fraction is not None and (
-                best_hit is None or hit_fraction < best_hit
-            ):
-                best_hit = hit_fraction
-                best_gate = gate_idx
-                best_bar = bar_idx
-
-    return best_hit is not None, best_gate, best_bar, best_hit
-
-
-def check_gate_point_collision_np(pos, gate_bar_geometry, tol=0.0):
-    """Check only the current discrete drone-center position against gate bars.
-
-    Unlike ``check_gate_collision_np``, this does NOT inspect the motion segment
-    between consecutive rollout states. A collision is reported only when the
-    discrete state itself lies inside (or on) one of the inflated oriented
-    gate-bar boxes.
-    """
-    pos = np.asarray(pos, dtype=float).reshape(3)
-
-    centers = gate_bar_geometry["centers"]
-    half_sizes = gate_bar_geometry["half_sizes"]
-    axis_u = gate_bar_geometry["axis_u"]
-    axis_v = gate_bar_geometry["axis_v"]
-    normals = gate_bar_geometry["normals"]
-
-    best_gate = -1
-    best_bar = -1
-    best_margin = -np.inf
-
-    for gate_idx in range(centers.shape[0]):
-        for bar_idx in range(centers.shape[1]):
-            delta = pos - centers[gate_idx, bar_idx]
-
-            q = np.array(
-                [
-                    np.dot(delta, axis_u[gate_idx, bar_idx]),
-                    np.dot(delta, axis_v[gate_idx, bar_idx]),
-                    np.dot(delta, normals[gate_idx, bar_idx]),
-                ],
-                dtype=float,
-            )
-
-            # For a point inside an OBB, every local coordinate satisfies
-            # |q_i| <= half_size_i.  Define positive penetration margin as
-            # the minimum remaining half-size across local axes.
-            margins = half_sizes[gate_idx, bar_idx] - np.abs(q)
-            penetration_margin = float(np.min(margins))
-
-            if penetration_margin > float(tol):
-                if best_gate < 0 or penetration_margin > best_margin:
-                    best_gate = gate_idx
-                    best_bar = bar_idx
-                    best_margin = penetration_margin
-
-    collision = best_gate >= 0
-    return collision, best_gate, best_bar, best_margin if collision else np.nan
-
-
 def plant_step(
     x,
     u,
     dt,
     gate_bar_geometry,
+    last_gate_idx,
 ):
-    """One actual closed-loop step with an adversarial XY position disturbance.
+    """One actual closed-loop step with an XY velocity disturbance.
 
-    The robust model defines
+    The disturbance acts on vx and vy and points AWAY from the most recently
+    passed physical gate.  Let p_g be that gate center and p be the drone
+    position.  The XY uncertainty direction is
 
-        E_k[0,0] = E_k[1,1] = dt * E_MAG_MODEL,
-        E_k[2,2] = 0.
+        d_xy = p_xy - p_g,xy
+        w_xy = d_xy / ||d_xy||_2,
 
-    First find the 3-D direction toward the closest inflated gate bar, then
-    project that direction into the XY plane and renormalize it. The applied
-    position perturbation is therefore
+    whenever d_xy is nonzero.  Therefore ||w_xy||_2 = 1 in the nondegenerate
+    case and ||w_xy||_2 = 0 at the gate center, so ||w||_2 <= 1 always.
 
-        delta_p = dt * E_MAG_MODEL * [w_x, w_y, 0],
+    The state-dependent velocity perturbation is
 
-    with ||[w_x, w_y]||_2 = 1 whenever the XY projection is nonzero. Thus the
-    z-position is never directly disturbed and the disturbance remains inside
-    the unit-2-norm uncertainty set.
+        delta_v_xy = dt * DISTURBANCE_MAG * spatial_scale(px, py) * w_xy.
+
+    No direct position or z-velocity disturbance is applied.
     """
+    last_gate_idx = 4
     x = np.asarray(x, dtype=float)
     x_next = x + dt * quadrotor_xdot_np(x, u)
 
-    (
-        w_xyz,
-        closest_distance,
-        closest_gate_idx,
-        closest_bar_idx,
-        closest_point,
-    ) = nearest_gate_bar_direction_np(
-        x[:3],
-        gate_bar_geometry,
+    gate_centers = np.asarray(
+        gate_bar_geometry["gate_centers"],
+        dtype=float,
     )
 
-    # Project the closest-bar direction into XY and renormalize so the
-    # adversary uses its full allowed magnitude in x/y, with exactly zero z.
-    w_xy_norm = np.linalg.norm(w_xyz[:2])
-    if w_xy_norm > 1e-12:
-        disturbance_direction = np.array([
-            w_xyz[0] / w_xy_norm,
-            w_xyz[1] / w_xy_norm,
-            0.0,
-        ], dtype=float)
+    if gate_centers.ndim != 2 or gate_centers.shape[1] != 3:
+        raise ValueError(
+            "gate_bar_geometry['gate_centers'] must have shape (num_gates, 3)."
+        )
+
+    last_gate_idx = int(np.clip(last_gate_idx, 0, len(gate_centers) - 1))
+    last_gate_center = gate_centers[last_gate_idx]
+
+    # Direction from the last gate center to the current drone position.
+    # This is the geometric direction AWAY from the gate in the XY plane.
+    away_xy = x[:2] - last_gate_center[:2]
+    away_norm = float(np.linalg.norm(away_xy))
+
+    if away_norm > 1e-12:
+        w_xy = away_xy / away_norm
     else:
-        disturbance_direction = np.zeros(3, dtype=float)
+        w_xy = np.zeros(2, dtype=float)
 
-    position_delta = dt * E_MAG_MODEL * disturbance_direction
-    x_next[:3] += position_delta
+    # Numerical safeguard: enforce ||w||_2 <= 1 even under roundoff.
+    w_norm = float(np.linalg.norm(w_xy))
+    if w_norm > 1.0:
+        w_xy = w_xy / w_norm
 
-    spatial_scale = disturbance_spatial_scale(x[0], x[1])
-    vy_delta = dt * DISTURBANCE_MAG * spatial_scale
-    x_next[7] += vy_delta
+    disturbance_direction = np.array(
+        [w_xy[0], w_xy[1], 0.0],
+        dtype=float,
+    )
+
+    # No direct position disturbance.
+    position_delta = np.zeros(3, dtype=float)
+
+    # State-dependent disturbance magnitude shared by vx and vy through one
+    # normalized 2-D uncertainty vector.  The TOTAL XY magnitude is therefore
+    # bounded by dt * DISTURBANCE_MAG * spatial_scale, not sqrt(2) times it.
+    spatial_scale = float(disturbance_spatial_scale(x[0], x[1]))
+    disturbance_magnitude = dt * DISTURBANCE_MAG * spatial_scale
+    velocity_delta_xy = disturbance_magnitude * w_xy
+
+    x_next[6] += dt * DISTURBANCE_MAG * spatial_scale / 2 / (2**0.5)
+    x_next[7] += dt * DISTURBANCE_MAG * spatial_scale / (2**0.5)
+
+    gate_distance_xy = float(np.linalg.norm(away_xy))
 
     return (
         x_next,
         position_delta,
         disturbance_direction,
-        closest_distance,
-        closest_gate_idx,
-        closest_bar_idx,
-        closest_point,
+        gate_distance_xy,
+        last_gate_idx,
+        -1,
+        last_gate_center.copy(),
     )
 
 
@@ -997,31 +871,21 @@ def build_gpu_sls_mpc(
         u_ref=jnp.array([T_HOVER, 0.0, 0.0, 0.0], dtype=DTYPE),
     )
 
-    constraints = [make_tracking_state_constraints()]
-    constraints.append(
+    # Online MPC constraints: physical-state bounds + control bounds only.
+    # Gate/bar obstacle constraints are intentionally NOT included in the solve.
+    # Gate geometry is retained elsewhere only to aim the rollout disturbance
+    # and for visualization; it has no effect on the MPC optimization.
+    constraints = [
+        make_tracking_state_constraints(),
         make_control_box_constraints(
             jnp.asarray(U_MIN, dtype=DTYPE),
             jnp.asarray(U_MAX, dtype=DTYPE),
-        )
-    )
-
-    if _has_gate_geometry(plan):
-        constraints.append(
-            make_tracking_gate_frame_constraints(
-                plan["gate_centers"],
-                plan["gate_normals"],
-                plan["gate_axis_u"],
-                plan["gate_axis_v"],
-                plan["gate_opening_half_widths"],
-                bar_thickness=plan.get("gate_bar_thickness", 0.10),
-                gate_depth=plan.get("gate_depth", 0.10),
-                drone_radius=plan.get("drone_radius", 0.10),
-            )
-        )
-    else:
-        print("WARNING: physical gate geometry missing; online gate-obstacle constraints disabled.")
+        ),
+    ]
 
     constraints_all = combine_constraints(*constraints)
+
+    # GenericMPC obstacle interface is intentionally empty.
     obstacles = jnp.zeros((0, 3), dtype=DTYPE)
     disturbance = make_tracking_disturbance(TRACK_NX, disturbance_mag)
 
@@ -1034,9 +898,9 @@ def build_gpu_sls_mpc(
         initial_rho=1.0,
         regularized_rho_update=False,
         slack_weight=1e4,
-        enable_slack=False,
+        enable_slack=True,
         scale_max=2.0,
-        num_phases=0,
+        # num_phases=0, # This is weird
     )
 
     q_diag = jnp.concatenate([
@@ -1681,20 +1545,17 @@ def run_tracking(
     goal_tol=DEFAULT_GOAL_TOL,
     max_control_steps=None,
 ):
-    """Closed-loop GPU-SLS tracking with a gate-directed XYZ adversary.
+    """Closed-loop GPU-SLS tracking with an XY velocity adversary.
 
-    At each real plant step, the adversary finds the direction toward the
-    closest inflated gate bar, projects that direction into the XY plane, and
-    applies
+    At each real plant step, the disturbance points in the XY direction away
+    from the most recently passed physical gate, uses a normalized uncertainty
+    direction with ||w||_2 <= 1, and applies
 
-        delta_p = dt * E_MAG_MODEL * [w_x, w_y, 0],
+        delta_v_xy = dt * DISTURBANCE_MAG * spatial_scale(px, py) * w_xy.
 
-    matching the x/y position channels in ``make_tracking_disturbance``. The
-    z-position disturbance is identically zero.
-
-    Collision checking is DISCRETE-TIME ONLY: after each plant step, only the
-    resulting position x_{k+1}[:3] is checked against the inflated gate bars.
-    The segment between x_k and x_{k+1} is intentionally ignored.
+    No direct position or z-velocity disturbance is applied. Gate geometry is
+    used only to define the away-from-gate direction. The rollout does not
+    perform collision detection and never terminates because of gates.
     """
     X_plan = plan["X_plan"]
     U_plan = plan["U_plan"]
@@ -1702,7 +1563,16 @@ def run_tracking(
     N = plan["N"]
 
     gate_bar_geometry = build_gate_bar_geometry_np(plan)
-    bar_names = gate_bar_geometry["bar_names"]
+
+    # Each physical gate has a pre- and post-gate waypoint.  A gate counts as
+    # "passed" once monotonic trajectory progress reaches its post-gate step.
+    waypoint_steps = np.asarray(plan["waypoint_steps"], dtype=int).reshape(-1)
+    post_gate_steps = waypoint_steps[1::2]
+    num_gates = len(gate_bar_geometry["gate_centers"])
+    if len(post_gate_steps) != num_gates:
+        raise ValueError(
+            "Expected exactly two waypoint steps (pre/post) per physical gate."
+        )
 
     if progress_search_window < 1:
         raise ValueError(
@@ -1831,21 +1701,6 @@ def run_tracking(
     progress_idx_history[0] = progress_idx
     nearest_distance_history[0] = nearest_distance
 
-    # Catch an invalid initial condition before solving anything.
-    (
-        collision_detected,
-        collision_gate_index,
-        collision_bar_index,
-        collision_penetration,
-    ) = check_gate_point_collision_np(
-        x_current[:3],
-        gate_bar_geometry,
-        tol=COLLISION_TOL,
-    )
-    collision_fraction = None
-    collision_step = -1
-    if collision_detected:
-        collision_step = 0
 
     print(
         "\n================ GPU-SLS MPC TRACKING ==============="
@@ -1867,7 +1722,7 @@ def run_tracking(
     print(
         f"Robust-model state-dependent vy magnitude: {disturbance_mag}"
     )
-    print("Gate-bar collision checking: discrete states only (no swept-segment check)")
+    print("Gate-bar collision detection: DISABLED")
     print(
         "First MPC solve: "
         f"{GPU_SLS_INITIAL_NOMINAL_SQP_ITERS} nominal SQP + "
@@ -1882,16 +1737,7 @@ def run_tracking(
     reached_goal = False
     previous_reference_progress = progress_idx
 
-    if collision_detected:
-        print(
-            "\nCOLLISION at initial state: "
-            f"gate={collision_gate_index + 1}, "
-            f"bar={bar_names[collision_bar_index]}"
-        )
-
     for control_step in range(max_control_steps):
-        if collision_detected:
-            break
 
         (
             progress_idx,
@@ -2072,10 +1918,22 @@ def run_tracking(
         dt_applied_history[control_step] = dt_apply
 
         # ----------------------------------------------------
-        # Apply the XY-only adversarial position disturbance toward the
-        # nearest inflated gate bar. Collision is checked only at the resulting
-        # discrete state; motion between nodes is intentionally ignored.
+        # Apply the state-dependent XY VELOCITY disturbance in the direction
+        # pointing away from the most recently passed physical gate.
+        #
+        # Before Gate 1 has been passed, use Gate 1 as the reference gate.
+        # Thereafter use the most recent gate whose post-gate waypoint has
+        # been reached by monotonic trajectory progress.
         # ----------------------------------------------------
+        last_gate_idx = int(
+            np.searchsorted(
+                post_gate_steps,
+                progress_idx,
+                side="right",
+            ) - 1
+        )
+        last_gate_idx = int(np.clip(last_gate_idx, 0, num_gates - 1))
+
         (
             x_current,
             disturbance_xyz,
@@ -2089,6 +1947,7 @@ def run_tracking(
             u=u_apply,
             dt=dt_apply,
             gate_bar_geometry=gate_bar_geometry,
+            last_gate_idx=last_gate_idx,
         )
 
         if not np.all(np.isfinite(x_current)):
@@ -2106,30 +1965,6 @@ def run_tracking(
 
         num_control_steps = control_step + 1
         X_closed_loop[num_control_steps] = x_current
-
-        (
-            collision_detected,
-            collision_gate_index,
-            collision_bar_index,
-            collision_penetration,
-        ) = check_gate_point_collision_np(
-            x_current[:3],
-            gate_bar_geometry,
-            tol=COLLISION_TOL,
-        )
-        collision_fraction = None
-
-        if collision_detected:
-            collision_step = control_step
-            print(
-                f"\nCOLLISION at controller step {control_step}: "
-                f"gate={collision_gate_index + 1}, "
-                f"bar={bar_names[collision_bar_index]}, "
-                f"discrete_state_only=True, "
-                f"penetration_margin={collision_penetration:.6f} m"
-            )
-            # State is already stored above; terminate immediately.
-            break
 
         (
             next_progress_idx,
@@ -2164,7 +1999,6 @@ def run_tracking(
         else:
             solve_string = " fallback"
 
-        bar_name = bar_names[closest_bar_idx]
         print(
             f"MPC {control_step:03d}: "
             f"progress={progress_idx:03d}/{N:03d}  "
@@ -2175,7 +2009,7 @@ def run_tracking(
             f"dxyz=[{disturbance_xyz[0]:+.4f},"
             f"{disturbance_xyz[1]:+.4f},"
             f"{disturbance_xyz[2]:+.4f}]  "
-            f"target=G{closest_gate_idx + 1}:{bar_name}  "
+            f"away_from=G{closest_gate_idx + 1}  "
             f"obs_dist={closest_obstacle_distance:.4f} m  "
             f"|u|={np.linalg.norm(u_apply):.3f}"
         )
@@ -2187,21 +2021,6 @@ def run_tracking(
             reached_goal = True
             break
 
-    # If collision occurred after applying a step, progress for the final state
-    # has not yet been filled.  Match it once for diagnostics only.
-    if collision_detected and num_control_steps > 0:
-        (
-            collision_progress_idx,
-            collision_nearest_distance,
-        ) = find_monotonic_progress_index(
-            x_current=x_current,
-            X_plan=X_plan,
-            previous_progress_idx=progress_idx,
-            search_window=progress_search_window,
-        )
-        progress_idx = collision_progress_idx
-        progress_idx_history[num_control_steps] = progress_idx
-        nearest_distance_history[num_control_steps] = collision_nearest_distance
 
     X_closed_loop = X_closed_loop[:num_control_steps + 1]
     U_closed_loop = U_closed_loop[:num_control_steps]
@@ -2250,10 +2069,13 @@ def run_tracking(
         np.isfinite(solve_times[1:])
     ]
 
+    rollout_duration = float(np.sum(dt_applied_history))
+
     print(
         "\n================ TRACKING RESULT ====================="
     )
     print(f"Reached final goal: {reached_goal}")
+    print(f"Rollout duration [s]: {rollout_duration:.6f}")
     print(f"Controller steps executed: {num_control_steps}")
     print(
         f"Final progress index: "
@@ -2296,12 +2118,7 @@ def run_tracking(
         f"Fallback controls used: "
         f"{np.sum(fallback_used)}"
     )
-    print(f"Obstacle collision: {collision_detected}")
-    if collision_detected:
-        print(f"Collision controller step: {collision_step}")
-        print(f"Collision gate: {collision_gate_index + 1}")
-        print(f"Collision bar: {bar_names[collision_bar_index]}")
-    elif not reached_goal:
+    if not reached_goal:
         print(
             "WARNING: maximum controller steps reached "
             "before satisfying the final goal tolerance."
@@ -2339,18 +2156,6 @@ def run_tracking(
         "X_progress_reference": X_progress_reference,
         "reached_goal": reached_goal,
         "num_control_steps": num_control_steps,
-        "collision_detected": collision_detected,
-        "collision_step": collision_step,
-        "collision_gate_index": collision_gate_index,
-        "collision_bar_index": collision_bar_index,
-        # Retained for backward compatibility. Swept-segment collision
-        # checking is disabled, so there is no segment hit fraction.
-        "collision_fraction": np.nan,
-        "collision_penetration": (
-            float(collision_penetration)
-            if collision_detected
-            else np.nan
-        ),
     }
 
 
@@ -2757,7 +2562,7 @@ def parse_args():
     parser.add_argument(
         "input",
         nargs="?",
-        default="multiphase_trajectory.npz",
+        default="multiphase_trajectory_dist.npz",
         help=(
             "Offline GPU-SLS trajectory NPZ "
             "(default: multiphase_trajectory.npz)"
@@ -2969,24 +2774,6 @@ def main():
         ),
         num_control_steps=np.array(
             result["num_control_steps"]
-        ),
-        collision_detected=np.array(
-            result["collision_detected"]
-        ),
-        collision_step=np.array(
-            result["collision_step"]
-        ),
-        collision_gate_index=np.array(
-            result["collision_gate_index"]
-        ),
-        collision_bar_index=np.array(
-            result["collision_bar_index"]
-        ),
-        collision_fraction=np.array(
-            result["collision_fraction"]
-        ),
-        collision_penetration=np.array(
-            result["collision_penetration"]
         ),
         progress_search_window=np.array(
             args.progress_search_window

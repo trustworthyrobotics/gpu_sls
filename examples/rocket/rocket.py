@@ -276,7 +276,7 @@ def dynamics(x: jnp.ndarray, u: jnp.ndarray, t: jnp.ndarray, *, parameter: Any) 
     dtau = parameter
     return rocket_6dof_step(x, u, dtau * x[-1])
 
-def cost(W, reference, x, u, t):
+def cost(W, reference, x, u, t,*, parameter):
     """
     W =
     [wpx, wpy, wpz,
@@ -632,6 +632,8 @@ def main(*, gradient_window: int = 0, output_dir: Path | str = Path(".")):
         rho_update_frequency=25,
         initial_rho=1e-2,
         regularized_rho_update=False,
+        enable_slack=False,
+        slack_weight=1e3,
     )
 
     sls_cfg = SLSConfig(
@@ -816,6 +818,9 @@ def main(*, gradient_window: int = 0, output_dir: Path | str = Path(".")):
     np.savez(
         output_dir / "rocket_result.npz",
         plan=plan_np,
+        X=np.asarray(X_pred),
+        Phi_x=np.asarray(Phi_x),
+        Phi_u=np.asarray(Phi_u),
         controls=np.asarray(U_pred),
         lower=np.asarray(lower),
         upper=np.asarray(upper),

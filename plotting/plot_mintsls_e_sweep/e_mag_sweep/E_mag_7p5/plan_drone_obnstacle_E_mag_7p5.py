@@ -36,7 +36,7 @@ config.update(
 # -----------------------------
 MASS = 1.0
 GRAVITY = 9.81
-E_MAG = 15.0
+E_MAG = 7.5
 JX = 0.02
 JY = 0.02
 JZ = 0.04
@@ -985,14 +985,14 @@ def build_controller(
         sls_primal_tol=1e-2,
         enable_fastsls=True,
         initialize_nominal=True,
-        max_initial_sqp_iterations=20,
+        max_initial_sqp_iterations=50,
         warm_start=True,
         rti=False,
         gradient_window=10,
     )
 
     sqp_cfg = SQPConfig(
-        max_sqp_iterations=30,
+        max_sqp_iterations=100,
         warm_start=True,
         feas_tol=1e-10,
         step_tol=10,
@@ -1876,15 +1876,7 @@ def main():
         reference,
         jnp.zeros((N, nu), dtype=DTYPE).at[:, 0].set(T_hover),
     )
-    import time
-    start = time.perf_counter()
-    u0, X_pred, U_pred, V_pred, backoffs, Phi_x, Phi_u = controller.run(
-        x0=x0,
-        reference=reference,
-        parameter=parameter,
-    )
-    end = time.perf_counter()
-    print("Solve time:", end - start)
+
     phase_times = X_pred[0, 12:]
     min_time = jnp.sum(phase_times)
 
