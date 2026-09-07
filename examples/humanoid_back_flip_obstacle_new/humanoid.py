@@ -37,25 +37,17 @@ from gpu_sls.gpu_sls import SLSConfig
 from gpu_sls.gpu_sqp import SQPConfig
 import mpx.utils.sim as sim_utils
 
-cache_dir = Path.home() / ".cache" / "jax_gpu_sls"
-cache_dir.mkdir(parents=True, exist_ok=True)
-
-jax.config.update(
-    "jax_compilation_cache_dir",
-    str(cache_dir),
-)
-jax.config.update(
-    "jax_persistent_cache_min_entry_size_bytes",
-    -1,
-)
-jax.config.update(
-    "jax_persistent_cache_min_compile_time_secs",
-    0,
-)
-jax.config.update(
-    "jax_persistent_cache_enable_xla_caches",
-    "all",
-)
+compilation_cache_enabled = False
+compilation_cache_enabled = os.environ.get(
+    "JAX_ENABLE_COMPILATION_CACHE", "true"
+).lower() not in {"0", "false", "no", "off"}
+if compilation_cache_enabled:
+    cache_dir = Path.home() / ".cache" / "jax_gpu_sls"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", str(cache_dir))
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 
 CONTACT_POSITION_GAIN = 200.0
 CONTACT_VELOCITY_GAIN = 30.0
@@ -326,7 +318,7 @@ def min_time_backflip_dynamics(model, mjx_model, contact_id, body_id):
     return dynamics
 
 
-def min_time_backflip_cost(W, reference, x, u, t):
+def min_time_backflip_cost(W, reference, x, u, t, *, parameter):
     nj = config.n_joints
     p, quat_raw = x[:3], x[3:7]
     quat = safe_normalize_quaternion(quat_raw)
@@ -992,6 +984,8 @@ def main(*, dry_run_only=False, output_dir=DIR_PATH):
         eps_abs=1.0e-2, eps_rel=5.0e-3, rho_max=1.0e4,
         max_iterations=400, rho_update_frequency=25, initial_rho=1.0,
         regularized_rho_update=False, num_phases=NUM_PHASES,
+        enable_slack=False,
+        slack_weight=1e4,
     )
     sls_config = SLSConfig(
         max_sls_iterations=1, sls_primal_tol=1.0e-2,

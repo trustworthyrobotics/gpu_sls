@@ -1580,7 +1580,7 @@ def main():
     # Physical gate centers
     # --------------------------------------------------
     GATE_CENTERS = np.array([
-            [ 3.5,  -1.0, 1.0],
+            [ 4.0,  -1.0, 1.0],
             [ 3.0,   7.0, 1.0],
             [-3.5,   5.0, 1.0],
             [-1.0,  3.0, 1.0],
@@ -1665,7 +1665,7 @@ def main():
     # --------------------------------------------------
     GATE_1_ANGLE_DEG = 0.0
     GATE_2_ANGLE_DEG = 40.0
-    GATE_3_ANGLE_DEG = -50.0
+    GATE_3_ANGLE_DEG = -40.0
     GATE_4_ANGLE_DEG = -20.0
     GATE_5_ANGLE_DEG = 0.0
 

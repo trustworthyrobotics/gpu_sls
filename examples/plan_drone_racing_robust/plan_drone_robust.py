@@ -455,6 +455,7 @@ def make_min_time_disturbance(
             dt * E_mag * spatial_scale
         )
 
+
         return E_k
 
     def disturbance(X: jnp.ndarray) -> jnp.ndarray:
