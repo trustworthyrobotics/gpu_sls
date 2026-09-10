@@ -16,6 +16,12 @@ from gpu_sls.gpu_admm import (
     slack_weight_for_iteration,
 )
 from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu, tightening_from_nominal_state
+from gpu_sls.trust_region import (
+    filter_reduction_ratios,
+    project_direction,
+    scaled_step_norm,
+    update_radius,
+)
 
 
 from pathlib import Path
@@ -187,6 +193,17 @@ class SQPConfig:
     warm_start: bool = True
     line_search: bool = True
     lm_regularization: float = 0.0
+    adaptive_trust_region: bool = False
+    trust_region_initial_radius: float = 1.0
+    trust_region_min_radius: float = 1e-4
+    trust_region_max_radius: float = 100.0
+    trust_region_accept_ratio: float = 0.1
+    trust_region_shrink_threshold: float = 0.25
+    trust_region_expand_threshold: float = 0.75
+    trust_region_shrink_factor: float = 0.25
+    trust_region_expand_factor: float = 2.0
+    trust_region_boundary_fraction: float = 0.8
+    trust_region_damping: float = 1e-2
 
     def tree_flatten(self):
         children = (
@@ -196,6 +213,17 @@ class SQPConfig:
             self.warm_start,
             self.line_search,
             self.lm_regularization,
+            self.adaptive_trust_region,
+            self.trust_region_initial_radius,
+            self.trust_region_min_radius,
+            self.trust_region_max_radius,
+            self.trust_region_accept_ratio,
+            self.trust_region_shrink_threshold,
+            self.trust_region_expand_threshold,
+            self.trust_region_shrink_factor,
+            self.trust_region_expand_factor,
+            self.trust_region_boundary_fraction,
+            self.trust_region_damping,
         )
         return children, None
 
@@ -326,10 +354,11 @@ def filter_model_evaluator_factory(
         # Original nonlinear nominal constraints.
         g_base = vectorize(constraints)(X, U_pad, t)
 
-        if L != 0:
-            h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
-        else:
-            h_ct_trial = backoffs
+        # if L != 0:
+        #     h_ct_trial = tightening_from_nominal_state(disturbance_fn, X, Phi_x_I, Phi_u_I, C_box, D_box)
+        # else:
+        #     h_ct_trial = backoffs
+        h_ct_trial = backoffs
 
         n_tight = h_ct_trial.shape[1]
         # eps_abs = 0
@@ -564,7 +593,7 @@ def sqp(
     model_evaluator = partial(model_evaluator_helper_min_time, _cost, _dynamics, admm_config.num_phases, x0)
 
     def body(i, carry):
-        i, X_curr, U_curr, V_curr, w, y, rho, rho_grad0, converged, backoffs, Phi_x, Phi_u, beta_ws, mu_w, Phi_x_I_ws, Phi_u_I_ws, a, b, converged_admm = carry
+        i, X_curr, U_curr, V_curr, w, y, rho, rho_grad0, converged, backoffs, Phi_x, Phi_u, beta_ws, mu_w, Phi_x_I_ws, Phi_u_I_ws, a, b, converged_admm, trust_radius = carry
 
         def do_nothing(_):
             return carry
@@ -593,23 +622,83 @@ def sqp(
                 X_curr.dtype,
             )
             if admm_config.enable_slack and admm_config.dynamic_slack:
-                jax.debug.print(
-                    "Slack schedule: SQP iteration {} weight={:.3e}",
-                    i + 1,
-                    slack_weight,
+                # jax.debug.print(
+                #     "Slack schedule: SQP iteration {} weight={:.3e}",
+                #     i + 1,
+                #     slack_weight,
+                # )
+                pass
+
+            use_trust_region = jnp.asarray(
+                bool(sqp_config.adaptive_trust_region)
+            )
+            robust_phase_start = (
+                jnp.asarray(bool(sls_config.enable_fastsls))
+                & (i == sls_config.max_initial_sqp_iterations)
+                & (sls_config.max_initial_sqp_iterations > 0)
+            )
+            initial_trust_radius = jnp.clip(
+                jnp.asarray(
+                    sqp_config.trust_region_initial_radius,
+                    dtype=X_curr.dtype,
+                ),
+                sqp_config.trust_region_min_radius,
+                sqp_config.trust_region_max_radius,
+            )
+            iteration_trust_radius = lax.select(
+                robust_phase_start,
+                initial_trust_radius,
+                trust_radius,
+            )
+
+            # A radius reduction must change the next QP direction, not just
+            # rescale the same non-descent direction. This LM term is zero at
+            # and above the initial radius, then grows as the radius shrinks.
+            radius_damping = (
+                jnp.asarray(
+                    sqp_config.trust_region_damping,
+                    dtype=X_curr.dtype,
                 )
+                * jnp.maximum(
+                    initial_trust_radius / iteration_trust_radius - 1.0,
+                    0.0,
+                )
+            )
+            radius_damping = lax.select(
+                use_trust_region,
+                radius_damping,
+                jnp.asarray(0.0, dtype=X_curr.dtype),
+            )
+            effective_lm_regularization = (
+                jnp.asarray(
+                    sqp_config.lm_regularization,
+                    dtype=X_curr.dtype,
+                )
+                + radius_damping
+            )
+
             dX, dU, dV, q, r, w1, y1, rho1, rho_grad1, backoffs1, Phi_x1, Phi_u1, betaN, muN, Phi_x_I_next, Phi_u_I_next, a1, b1, converged_admm_new = compute_search_direction(
                 sls_config, admm_config,
                 _cost, _dynamics, _hessian_approx,
                 constraints, disturbance,
                 obstacles,
-                sqp_config.lm_regularization,
+                effective_lm_regularization,
                 x0, X_curr, U_curr, V_curr, c,
                 w0, y0, rho0, rho_grad0,
                 h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, Phi_x_I_ws, Phi_u_I_ws, a0, b0, i,
                 slack_weight,
                 Q_bar, R_bar,
             )
+
+            # Give every QP backend the same scale-aware trust-region
+            # semantics without changing its public interface.
+            raw_step_norm = scaled_step_norm(dX, dU, X_curr, U_curr)
+            dX_tr, dU_tr, dV_tr, _, _ = project_direction(
+                dX, dU, dV, X_curr, U_curr, iteration_trust_radius
+            )
+            dX = lax.select(use_trust_region, dX_tr, dX)
+            dU = lax.select(use_trust_region, dU_tr, dU)
+            dV = lax.select(use_trust_region, dV_tr, dV)
 
             direction_finite = (
                 jnp.all(jnp.isfinite(dX))
@@ -642,7 +731,7 @@ def sqp(
 
             feas_ok = feas <= sqp_config.feas_tol
             step_ok = step <= sqp_config.step_tol * (1.0 + z_norm)
-            jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
+            # jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
             T = U_curr.shape[0]
             U_curr_pad = jnp.pad(U_curr, ((0, 1), (0, 0)))
             t_curr = jnp.arange(T + 1)
@@ -707,12 +796,93 @@ def sqp(
                 & jnp.all(jnp.isfinite(U_next))
                 & jnp.all(jnp.isfinite(V_next))
             )
-            failed = jnp.logical_not(
+            nonfinite = jnp.logical_not(
                 jnp.logical_and(direction_finite, candidate_finite)
             )
-            X_next = lax.select(failed, X_curr, X_next)
-            U_next = lax.select(failed, U_curr, U_next)
-            V_next = lax.select(failed, V_curr, V_next)
+
+            # Compare the true nonlinear/filter merit change against its
+            # first-order prediction along the candidate step.
+            trial_dX = X_next - X_curr
+            trial_dU = U_next - U_curr
+            trial_cost, trial_c_filter = filter_model_evaluator(
+                X_next, U_next
+            )
+            (_, _), (model_cost_change, model_c_change) = jax.jvp(
+                filter_model_evaluator,
+                (X_curr, U_curr),
+                (trial_dX, trial_dU),
+            )
+            (
+                cost_ratio,
+                feas_ratio,
+                actual_cost_reduction,
+                _predicted_cost_reduction,
+                actual_feas_reduction,
+                _predicted_feas_reduction,
+                valid_cost_prediction,
+                valid_feas_prediction,
+            ) = filter_reduction_ratios(
+                current_cost,
+                current_c_filter,
+                trial_cost,
+                trial_c_filter,
+                model_cost_change,
+                model_c_change,
+            )
+            cost_accepted = (
+                valid_cost_prediction
+                & (actual_cost_reduction > 0.0)
+                & (cost_ratio >= sqp_config.trust_region_accept_ratio)
+            )
+            feas_accepted = (
+                valid_feas_prediction
+                & (actual_feas_reduction > 0.0)
+                & (feas_ratio >= sqp_config.trust_region_accept_ratio)
+            )
+            trust_accepted = cost_accepted | feas_accepted
+            trust_accepted = jnp.logical_or(
+                jnp.logical_not(use_trust_region), trust_accepted
+            )
+            trust_ratio = jnp.maximum(
+                jnp.where(cost_accepted, cost_ratio, -jnp.inf),
+                jnp.where(feas_accepted, feas_ratio, -jnp.inf),
+            )
+            accepted_step_norm = scaled_step_norm(
+                trial_dX, trial_dU, X_curr, U_curr
+            )
+            trust_radius_next = update_radius(
+                iteration_trust_radius,
+                trust_ratio,
+                accepted_step_norm,
+                trust_accepted,
+                sqp_config.trust_region_min_radius,
+                sqp_config.trust_region_max_radius,
+                sqp_config.trust_region_shrink_threshold,
+                sqp_config.trust_region_expand_threshold,
+                sqp_config.trust_region_shrink_factor,
+                sqp_config.trust_region_expand_factor,
+                sqp_config.trust_region_boundary_fraction,
+            )
+            trust_radius_next = lax.select(
+                use_trust_region, trust_radius_next, trust_radius
+            )
+            trust_rejected = use_trust_region & ~trust_accepted
+            keep_nominal = nonfinite | trust_rejected
+            X_next = lax.select(keep_nominal, X_curr, X_next)
+            U_next = lax.select(keep_nominal, U_curr, U_next)
+            V_next = lax.select(keep_nominal, V_curr, V_next)
+
+            if sqp_config.adaptive_trust_region:
+                jax.debug.print(
+                    "TR {} radius={:.3e} step={:.3e}/{:.3e} "
+                    "ratio={:.3e} accepted={}",
+                    i,
+                    iteration_trust_radius,
+                    accepted_step_norm,
+                    raw_step_norm,
+                    trust_ratio,
+                    trust_accepted,
+                )
 
             # jax.debug.callback(
             #     save_sqp_xz_step_plot,
@@ -723,7 +893,7 @@ def sqp(
             #     ordered=True,
             # )
 
-            keep_previous = jnp.logical_or(robust_converged1, failed)
+            keep_previous = jnp.logical_or(robust_converged1, keep_nominal)
             w_next = lax.select(keep_previous, w, w1)
             y_next = lax.select(keep_previous, y, y1)
             a_next = lax.select(keep_previous, a, a1)
@@ -742,18 +912,25 @@ def sqp(
                 keep_previous, Phi_u_I_ws, Phi_u_I_next
             )
             converged_admm_next = lax.select(
-                failed, converged_admm, converged_admm_new
+                keep_nominal, converged_admm, converged_admm_new
             )
 
             return (i + 1, X_next, U_next, V_next, w_next, y_next, rho_next, rho_grad_next,
-                    jnp.logical_or(converged, jnp.logical_or(robust_converged1, failed)),
-                    backoffs_next, Phi_x_next, Phi_u_next, beta_next, mu_next, Phi_x_I_next, Phi_u_I_next, a_next, b_next, converged_admm_next)
+                    jnp.logical_or(converged, jnp.logical_or(robust_converged1, nonfinite)),
+                    backoffs_next, Phi_x_next, Phi_u_next, beta_next, mu_next, Phi_x_I_next, Phi_u_I_next, a_next, b_next, converged_admm_next, trust_radius_next)
 
         return lax.cond(converged, do_nothing, do_iter, operand=None)
 
     backoffs0 = h_ct_ws
-    carry0 = (0, X_in, U_in, V_in, w, y, rho, rho_grad, jnp.array(False), backoffs0, Phi_x_ws, Phi_u_ws, beta_ws, mu_ws, Phi_x_I_ws, Phi_u_I_ws, a, b, converged_admm_prev)
-    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, rho_grad_out, converged, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_out, b_out, converged_admm = lax.fori_loop(
+    trust_radius0 = jnp.clip(
+        jnp.asarray(
+            sqp_config.trust_region_initial_radius, dtype=X_in.dtype
+        ),
+        sqp_config.trust_region_min_radius,
+        sqp_config.trust_region_max_radius,
+    )
+    carry0 = (0, X_in, U_in, V_in, w, y, rho, rho_grad, jnp.array(False), backoffs0, Phi_x_ws, Phi_u_ws, beta_ws, mu_ws, Phi_x_I_ws, Phi_u_I_ws, a, b, converged_admm_prev, trust_radius0)
+    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, rho_grad_out, converged, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_out, b_out, converged_admm, _trust_radius = lax.fori_loop(
         0, sqp_config.max_sqp_iterations + sls_config.max_initial_sqp_iterations, body, carry0,
     )
     return X_out, U_out, V_out, w_out, y_out, rho_out, rho_grad_out, backoffs, Phi_x, Phi_u, betaN, muN, Phi_x_I, Phi_u_I, a_out, b_out, converged_admm
